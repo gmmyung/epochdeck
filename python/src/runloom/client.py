@@ -382,6 +382,39 @@ class RunloomClient:
             params["after"] = after
         return self._request("GET", f"/api/v1/runs/{run_id}/history", params=params)
 
+    def chart_history(
+        self,
+        run_id: str,
+        *,
+        keys: list[str],
+        max_buckets: int | None = None,
+        step_min: int | None = None,
+        step_max: int | None = None,
+    ) -> dict[str, Any]:
+        params: list[tuple[str, str | int]] = [("key", key) for key in keys]
+        if max_buckets is not None:
+            params.append(("max_buckets", max_buckets))
+        if step_min is not None:
+            params.append(("step_min", step_min))
+        if step_max is not None:
+            params.append(("step_max", step_max))
+        return self._request(
+            "GET",
+            f"/api/v1/runs/{quote(run_id, safe='')}/chart-history",
+            params=params,
+        )
+
+    def overlay_chart_history(
+        self,
+        project: str,
+        query: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/projects/{quote(project, safe='')}/chart-history/query",
+            json=query,
+        )
+
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         response = self._client.request(method, path, **kwargs)
         self._raise_for_status(response)

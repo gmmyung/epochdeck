@@ -15,6 +15,10 @@ export type ChartPreferences = {
 const MAX_CACHED_CHART_PREFERENCES = 512;
 const preferences = new Map<string, ChartPreferences>();
 
+export function chartPreferenceIdentity(project: string, metric: string): string {
+  return JSON.stringify([project, metric]);
+}
+
 export function readChartPreferences(identity: string): ChartPreferences | undefined {
   const value = preferences.get(identity);
   if (!value) return undefined;

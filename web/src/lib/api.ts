@@ -40,6 +40,7 @@ export type History = {
 export type ChartMetricHistory = {
   source_points: number;
   bucket: number[];
+  last_x: number[];
   last_step: number[];
   last_timestamp_ms: number[];
   minimum: number[];
@@ -65,6 +66,36 @@ export type ChartHistoryViewport = {
 export type ChartHistoryOptions = {
   maxBuckets?: number;
   viewport?: ChartHistoryViewport;
+  signal?: AbortSignal;
+};
+
+export type ComparisonAlignment = "step" | "relative_step" | "elapsed_time";
+
+export type ComparisonChartSeriesRequest = {
+  run_id: string;
+  key: string;
+};
+
+export type ComparisonChartSeries = ChartMetricHistory & {
+  run_id: string;
+  key: string;
+  last_x: number[];
+};
+
+export type ComparisonChartHistory = {
+  project: string;
+  alignment: ComparisonAlignment;
+  x_min: number | null;
+  x_max: number | null;
+  bucket_count: number;
+  runs: Array<{ run_id: string; source_last_sequence: number | null }>;
+  series: ComparisonChartSeries[];
+};
+
+export type ComparisonChartHistoryOptions = {
+  alignment: ComparisonAlignment;
+  maxBuckets?: number;
+  viewport?: { minimum: number; maximum: number };
   signal?: AbortSignal;
 };
 
@@ -334,8 +365,54 @@ export function getChartHistory(
   );
 }
 
+export function getComparisonChartHistory(
+  project: string,
+  series: ComparisonChartSeriesRequest[],
+  options: ComparisonChartHistoryOptions,
+): Promise<ComparisonChartHistory> {
+  return requestJson<ComparisonChartHistory>(
+    `/api/v1/projects/${encodeURIComponent(project)}/chart-history/query`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        series,
+        alignment: options.alignment,
+        max_buckets: options.maxBuckets ?? 1_000,
+        ...(options.viewport ? { viewport: options.viewport } : {}),
+      }),
+      signal: options.signal,
+    },
+  );
+}
+
+export function comparisonSeriesHistory(
+  response: ComparisonChartHistory,
+  runId: string,
+  key: string,
+): ChartHistory | undefined {
+  const series = response.series.find(
+    (candidate) => candidate.run_id === runId && candidate.key === key,
+  );
+  if (!series) return undefined;
+  return {
+    run_id: runId,
+    step_min: response.x_min,
+    step_max: response.x_max,
+    bucket_count: response.bucket_count,
+    source_points: series.source_points,
+    source_last_sequence:
+      response.runs.find((candidate) => candidate.run_id === runId)?.source_last_sequence ?? null,
+    metrics: { [key]: series },
+  };
+}
+
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(path, { signal });
+  return requestJson<T>(path, { signal });
+}
+
+async function requestJson<T>(path: string, init: RequestInit): Promise<T> {
+  const response = await fetch(path, init);
   if (!response.ok) {
     throw new Error(`Runloom request failed with HTTP ${response.status}`);
   }

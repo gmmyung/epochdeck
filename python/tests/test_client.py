@@ -50,6 +50,46 @@ def test_history_selects_full_resolution_or_sampled_contract() -> None:
     assert dict(requests[1].url.params) == {"keys": "loss", "max_points": "500"}
 
 
+def test_chart_clients_use_bounded_single_and_multi_run_contracts() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"series": []})
+
+    overlay = {
+        "alignment": "relative_step",
+        "viewport": {"minimum": 0, "maximum": 10_000},
+        "max_buckets": 512,
+        "series": [
+            {"run_id": "run-1", "key": "train/loss"},
+            {"run_id": "run-2", "key": "train/loss"},
+        ],
+    }
+    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+        client.chart_history(
+            "run/id",
+            keys=["train/loss", "reward"],
+            max_buckets=512,
+            step_min=100,
+            step_max=200,
+        )
+        client.overlay_chart_history("robot learning", overlay)
+
+    assert requests[0].method == "GET"
+    assert requests[0].url.path == "/api/v1/runs/run/id/chart-history"
+    assert list(requests[0].url.params.multi_items()) == [
+        ("key", "train/loss"),
+        ("key", "reward"),
+        ("max_buckets", "512"),
+        ("step_min", "100"),
+        ("step_max", "200"),
+    ]
+    assert requests[1].method == "POST"
+    assert requests[1].url.path == "/api/v1/projects/robot learning/chart-history/query"
+    assert json.loads(requests[1].read()) == overlay
+
+
 def test_document_updates_use_explicit_patch_contracts() -> None:
     requests: list[httpx.Request] = []
 

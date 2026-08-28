@@ -77,7 +77,10 @@ nested dictionaries flattened with `/`, explicit or automatic steps, durable
 local spooling, resumable batch delivery, Parquet persistence, and bounded
 column-projected history. Dashboard charts scan only requested columns and use
 bounded exact min/max/last buckets that preserve source spikes without deleting
-raw samples; settled step viewports are re-aggregated for zoom detail.
+raw samples; settled viewports are re-aggregated for zoom detail. Project
+comparisons overlay sparse series from up to 32 selected runs on a shared
+absolute-step, relative-step, or elapsed-time lattice. They retain fixed
+per-run sequence watermarks and never interpolate missing metrics.
 Background compaction transparently reduces immutable segment
 counts without changing logical revisions or history results. Config supports
 controlled shallow updates, and summaries support

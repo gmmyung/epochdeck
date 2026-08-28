@@ -31,6 +31,8 @@ a conflict.
   columns across the run and returns a bounded min/max representation.
 - `GET /runs/{run_id}/chart-history?key=loss&max_buckets=1000` returns exact
   per-bucket minimum, maximum, and last values for chart rendering.
+- `POST /projects/{project}/chart-history/query` places requested series from
+  multiple runs on one bounded comparison axis.
 
 Batch sequence and canonical request digest form the idempotency contract. An
 identical replay succeeds as a duplicate; reusing a sequence for different
@@ -73,6 +75,7 @@ The response is columnar and keeps sparse metrics independent:
     "loss": {
       "source_points": 9998,
       "bucket": [0, 1],
+      "last_x": [9, 19],
       "last_step": [9, 19],
       "last_timestamp_ms": [1710000000009, 1710000000019],
       "minimum": [0.82, 0.71],
@@ -87,12 +90,74 @@ Each metric's arrays are aligned and omit buckets in which that metric has no
 value. `minimum` and `maximum` are the exact extrema of every source value for
 that metric in the bucket. `last` is selected by greatest run sequence even
 when steps repeat or move backward; `last_step` and `last_timestamp_ms` come
-from that same point. The bucket index is
+from that same point. `last_x` equals `last_step` on this absolute-step
+endpoint. The bucket index is
 `floor((step - step_min) * bucket_count / (step_max - step_min + 1))`.
 The dashboard draws Band directly from `minimum`/`maximum` and may smooth the
 `last` trend column; it must not construct a rolling envelope from sampled
 points. `source_points` at the top level counts rows containing any requested
 metric, while each metric reports its own non-null source count.
+
+Multi-run charts send one project-scoped JSON request:
+
+```json
+{
+  "series": [
+    {"run_id": "019c...", "key": "loss"},
+    {"run_id": "019d...", "key": "loss"}
+  ],
+  "alignment": "relative_step",
+  "max_buckets": 1000,
+  "viewport": {"minimum": 0, "maximum": 10000}
+}
+```
+
+`alignment` is `step`, `relative_step`, or `elapsed_time`. Step uses each raw
+run step. Relative step subtracts the minimum step containing any requested
+metric for each run, and elapsed time subtracts the equivalent per-run minimum
+timestamp in milliseconds. The optional inclusive viewport is expressed in
+the selected aligned unit. Requests contain 1 to 32 unique `(run_id, key)`
+series from at most 32 runs, at most 2,000 buckets, and at most 20,000 requested
+series-bucket cells. Every run must belong to the path project.
+
+The response returns one shared `x_min`, `x_max`, and `bucket_count`, fixed
+per-run `source_last_sequence` watermarks, and sparse series:
+
+```json
+{
+  "project": "robotics",
+  "alignment": "relative_step",
+  "x_min": 0,
+  "x_max": 10000,
+  "bucket_count": 1000,
+  "runs": [
+    {"run_id": "019c...", "source_last_sequence": 12000},
+    {"run_id": "019d...", "source_last_sequence": 9000}
+  ],
+  "series": [{
+    "run_id": "019c...",
+    "key": "loss",
+    "source_points": 9998,
+    "bucket": [0, 1],
+    "last_x": [9, 19],
+    "last_step": [109, 119],
+    "last_timestamp_ms": [1710000000009, 1710000000019],
+    "minimum": [0.82, 0.71],
+    "maximum": [1.14, 0.93],
+    "last": [0.88, 0.74]
+  }]
+}
+```
+
+All series use the same bucket lattice. Empty buckets and missing metrics are
+omitted rather than interpolated or zero-filled. Each occupied bucket retains
+exact source minimum and maximum values and selects `last`, `last_x`, raw
+`last_step`, and `last_timestamp_ms` from the greatest sequence. The server
+groups requested columns by run, scans against one snapshot barrier and fixed
+per-run watermarks, caches exact per-key axis extents (including missing
+metrics) by watermark, and caches individual aggregate series with watermark,
+origin, and lattice-aware keys. Both caches have independent explicit entry and
+byte bounds; aggregate series additionally have a cell bound.
 
 ## Monitoring
 

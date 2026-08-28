@@ -87,6 +87,27 @@ a bounded worker permit, and cache keys scoped to per-run revisions. Response
 budgets are not retention quotas; clients can request additional metrics or
 pages without losing stored data.
 
+Project comparison queries group requested columns by run and freeze one
+sequence watermark per run under the metric snapshot barrier. Absolute step,
+per-run relative step, and per-run elapsed milliseconds map onto one shared
+bucket lattice; sparse series never acquire interpolated points. A bounded
+2,048-entry/2-MiB per-key LRU reuses exact axis extents at an unchanged
+first/last sequence watermark, including cached missing metrics, so natural
+range replays can resolve the shared lattice without another storage scan. A
+separate bounded per-series LRU reuses exact aggregates when a run's watermark,
+alignment origin, viewport, and lattice are unchanged. Its 512-entry,
+250,000-cell, and 32-MiB limits are independent eviction bounds, not history
+retention limits.
+
+The dashboard derives deterministic request groups from the selected runs and
+the union metric catalog. Full-range and viewport refreshes reuse the same
+group, so alignment origins and bucket lattices do not depend on scroll timing.
+Only 24 Canvas charts are instantiated per page, at most four chart requests
+are physically in flight, and offscreen histories leave component state. A
+separate browser LRU is independently capped at 12 responses, 40,000 occupied
+cells, and 4 MiB of estimated column payload.
+See [ADR 0013](adr/0013-multi-run-chart-comparison.md).
+
 ### Media, artifacts, and traces
 
 Media and artifact bytes live in a content-addressed store rooted separately
@@ -174,8 +195,10 @@ is retained through terminal stream-error delivery.
 Live charts compare per-run metric revisions and request a fresh bounded
 aggregate when a revision changes. They do not append raw deltas to existing
 buckets because later sequence values can update an older step bucket. The
-dashboard never requests complete histories for chart rendering. See
-[ADR 0012](adr/0012-exact-bucket-chart-history.md).
+dashboard can select multiple project runs and render every requested metric on
+the same server-defined lattice. It never requests complete histories for chart
+rendering. See [ADR 0012](adr/0012-exact-bucket-chart-history.md) and
+[ADR 0013](adr/0013-multi-run-chart-comparison.md).
 
 ## Storage layout
 

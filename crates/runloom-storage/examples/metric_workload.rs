@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use runloom_protocol::{IngestBatchRequest, MetricPoint, ProjectId, RunId};
 use runloom_storage::{
-    ChartHistorySampler, ChartStepExtentScanner, CompactionSource, MetricStore, SegmentSource,
+    ChartAxisExtentScanner, ChartCoordinate, ChartHistorySampler, ChartSamplingSpec,
+    ChartStepExtentScanner, CompactionSource, MetricStore, SegmentSource,
 };
 use tempfile::tempdir;
 
@@ -137,6 +138,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("chart benchmark aggregate violated its bounded exactness contract".into());
     }
 
+    let comparison_keys = (0..metric_count.min(8))
+        .map(|metric| format!("metric_{metric}"))
+        .collect::<Vec<_>>();
+    let comparison_started = Instant::now();
+    let mut comparison_extent = ChartAxisExtentScanner::new(&comparison_keys, 1, rows as u64)?;
+    comparison_extent.read_segments(&store, &segments, &cancelled)?;
+    let comparison_extent = comparison_extent
+        .finish()
+        .ok_or("comparison benchmark produced no requested metric values")?;
+    let comparison_buckets = 2_000.min(20_000 / comparison_keys.len());
+    let mut comparison_sampler = ChartHistorySampler::new_aligned(
+        run_id,
+        &comparison_keys,
+        ChartSamplingSpec {
+            first_sequence: 1,
+            last_sequence: rows as u64,
+            coordinate: ChartCoordinate::RelativeStep {
+                origin: comparison_extent.step_minimum,
+            },
+            x_min: 0,
+            x_max: comparison_extent.step_maximum - comparison_extent.step_minimum,
+            max_buckets: comparison_buckets,
+        },
+    )?;
+    comparison_sampler.read_segments(&store, &segments, &cancelled)?;
+    let comparison = comparison_sampler.finish();
+    let comparison_elapsed = comparison_started.elapsed();
+    if comparison.metrics.len() != comparison_keys.len()
+        || comparison
+            .metrics
+            .values()
+            .any(|series| series.source_points != rows as u64)
+        || comparison
+            .metrics
+            .values()
+            .map(|series| series.bucket.len())
+            .sum::<usize>()
+            > 20_000
+    {
+        return Err("comparison benchmark violated its series or cell budget".into());
+    }
+
     let viewport_width = rows.min(512) as u64;
     let viewport_min = (rows as u64 - viewport_width) / 2;
     let viewport_max = viewport_min + viewport_width - 1;
@@ -200,6 +243,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chart_aggregate_elapsed.as_secs_f64(),
         chart.source_points,
         chart_series.bucket.len()
+    );
+    println!(
+        "comparison_chart_seconds={:.3} series={} cells={} alignment=relative_step",
+        comparison_elapsed.as_secs_f64(),
+        comparison.metrics.len(),
+        comparison
+            .metrics
+            .values()
+            .map(|series| series.bucket.len())
+            .sum::<usize>()
     );
     println!(
         "chart_viewport_seconds={:.3} source_points={} decoded_rows={} row_groups_read={} row_groups_pruned={}",

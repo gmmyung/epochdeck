@@ -3,8 +3,10 @@
 
   import {
     blobUrl,
+    comparisonSeriesHistory,
     getAlerts,
     getChartHistory,
+    getComparisonChartHistory,
     getHealth,
     getMetricKeys,
     getProjects,
@@ -17,6 +19,7 @@
     type Alert,
     type ChartHistory,
     type ChartHistoryViewport,
+    type ComparisonChartHistory,
     type Health,
     type Project,
     type Report,
@@ -28,10 +31,32 @@
   } from "./lib/api";
   import {
     chartViewportKey as viewportKey,
-    metricChartRequestKey as metricRequestKey,
     normalizeChartViewport as normalizedViewport,
   } from "./lib/chart-request";
-  import { CHART_BUCKET_BUDGET, ChartHistoryCache } from "./lib/history-cache";
+  import { chartPreferenceIdentity } from "./lib/chart-preferences";
+  import {
+    MAX_SELECTED_RUNS,
+    METRIC_CHART_PAGE_SIZE,
+    comparisonCacheKey,
+    metricAvailability,
+    metricPage,
+    normalizeRunSelection,
+    planComparisonBatches,
+    readComparisonUrl,
+    runStyle,
+    writeComparisonUrl,
+    type ComparisonUrlState,
+    type MetricSetMode,
+    type RunAlignment,
+  } from "./lib/comparison-state";
+  import {
+    CHART_BUCKET_BUDGET,
+    COMPARISON_CACHE_MAX_CELLS,
+    COMPARISON_CACHE_MAX_ENTRIES,
+    COMPARISON_CACHE_MAX_ESTIMATED_BYTES,
+    ChartHistoryCache,
+    ComparisonHistoryCache,
+  } from "./lib/history-cache";
   import ArtifactBrowser from "./lib/ArtifactBrowser.svelte";
   import Icon from "./lib/Icon.svelte";
   import JsonTreeNode from "./lib/JsonTreeNode.svelte";
@@ -39,10 +64,17 @@
   import MetricChart from "./lib/MetricChart.svelte";
   import MarkdownPanel from "./lib/MarkdownPanel.svelte";
   import { filterMetricKeys } from "./lib/metric-filter";
+  import { QueryScheduler } from "./lib/query-scheduler";
 
   const MAX_CONCURRENT_CHART_REQUESTS = 4;
   const LIVE_REFRESH_MS = 2_000;
   const historyCache = new ChartHistoryCache();
+  const comparisonHistoryCache = new ComparisonHistoryCache({
+    maxEntries: COMPARISON_CACHE_MAX_ENTRIES,
+    maxCells: COMPARISON_CACHE_MAX_CELLS,
+    maxEstimatedBytes: COMPARISON_CACHE_MAX_ESTIMATED_BYTES,
+  });
+  const chartScheduler = new QueryScheduler(MAX_CONCURRENT_CHART_REQUESTS);
   const RUN_TABS = [
     { id: "summary", label: "Summary", icon: "summary" },
     { id: "configuration", label: "Configuration", icon: "settings" },
@@ -52,6 +84,7 @@
     { id: "artifacts", label: "Artifacts", icon: "archive" },
   ] as const;
   type RunTab = (typeof RUN_TABS)[number]["id"];
+  const VALID_RUN_TABS = new Set<RunTab>(RUN_TABS.map((tab) => tab.id));
 
   let health: Health | null = null;
   let projects: Project[] = [];
@@ -59,8 +92,13 @@
   let reports: Report[] = [];
   let selectedProject = "";
   let selectedRun: Run | null = null;
+  let selectedRunIds: string[] = [];
+  let metricKeysByRun: Record<string, string[]> = {};
+  let loadingMetricKeys = new Set<string>();
+  let metricMode: MetricSetMode = "union";
+  let xAlignment: RunAlignment = "step";
+  let selectionNotice: string | null = null;
   let selectedReport: Report | null = null;
-  let metricKeys: string[] = [];
   let alerts: Alert[] = [];
   let richValues: RichValue[] = [];
   let artifacts: RunArtifact[] = [];
@@ -75,40 +113,65 @@
   let traceCursor: string | null = null;
   let traceSearch = "";
   let traceSearchLoading = false;
-  let histories: Record<string, ChartHistory> = {};
+  let comparisonHistories: Record<string, ComparisonChartHistory> = {};
   let historyRequestKeys: Record<string, string> = {};
   let metricViewports: Record<string, ChartHistoryViewport | null> = {};
+  let urlViewportMetric: string | null = null;
   let loadingMetrics = new Set<string>();
   let visibleMetrics = new Set<string>();
-  let pendingMetrics: string[] = [];
-  let activeChartRequests = 0;
+  let scheduledMetricStateKeys: Record<string, string> = {};
+  let scheduledMetricBatchKeys: Record<string, string> = {};
+  let metricPageIndex = 0;
+  let instantiatedMetricSignature = "";
+  let fullRangeFlushScheduled = false;
+  const fullRangeBatchMetrics = new Map<string, Set<string>>();
   let reportHistories: Record<string, ChartHistory> = {};
   let reportHistoryRequestKeys: Record<string, string> = {};
   let reportViewports: Record<string, ChartHistoryViewport | null> = {};
   let loadingReportMetrics = new Set<string>();
-  let pendingReportMetrics: Array<{
-    identity: string;
-    runId: string;
-    metric: string;
-  }> = [];
-  let activeReportRequests = 0;
-  let refreshingRun = false;
+  let refreshingRuns = false;
   let error: string | null = null;
   let loading = true;
   let projectController: AbortController | null = null;
   let runController: AbortController | null = null;
-  let selectionGeneration = 0;
 
-  $: filteredMetricKeys = filterMetricKeys(metricKeys, metricSearch);
+  $: comparisonRuns = selectedRunIds.flatMap((runId) => {
+    const run = runs.find((candidate) => candidate.id === runId);
+    return run ? [run] : [];
+  });
+  $: metricCatalog = metricAvailability(selectedRunIds, metricKeysByRun, metricMode);
+  $: filteredMetricNames = new Set(
+    filterMetricKeys(
+      metricCatalog.map((entry) => entry.key),
+      metricSearch,
+    ),
+  );
+  $: filteredMetricCatalog = metricCatalog.filter((entry) => filteredMetricNames.has(entry.key));
+  $: metricPageResult = metricPage(filteredMetricCatalog, metricPageIndex);
+  $: pagedMetricCatalog = metricPageResult.values;
+  $: pagedMetricSignature = JSON.stringify(pagedMetricCatalog.map((entry) => entry.key));
+  $: if (pagedMetricSignature !== instantiatedMetricSignature) {
+    instantiatedMetricSignature = pagedMetricSignature;
+    evictMetricsOutsidePage(new Set(pagedMetricCatalog.map((entry) => entry.key)));
+  }
 
   onMount(() => {
     const controller = new AbortController();
-    const refreshTimer = window.setInterval(refreshSelectedRun, LIVE_REFRESH_MS);
+    const refreshTimer = window.setInterval(refreshSelectedRuns, LIVE_REFRESH_MS);
+    const handlePopState = () => void restoreFromLocation();
+    window.addEventListener("popstate", handlePopState);
     Promise.all([getHealth(controller.signal), getProjects(controller.signal)])
       .then(async ([healthResult, projectResult]) => {
         health = healthResult;
         projects = projectResult;
-        if (projects[0]) await chooseProject(projects[0].name);
+        const restored = readComparisonUrl(
+          new URL(window.location.href),
+          VALID_RUN_TABS,
+          "metrics",
+        );
+        const project =
+          projects.find((candidate) => candidate.name === restored.project) ?? projects[0];
+        if (project) await chooseProject(project.name, "replace", restored);
       })
       .catch(showError)
       .finally(() => {
@@ -118,11 +181,17 @@
       controller.abort();
       projectController?.abort();
       runController?.abort();
+      chartScheduler.cancelAll();
+      window.removeEventListener("popstate", handlePopState);
       window.clearInterval(refreshTimer);
     };
   });
 
-  async function chooseProject(name: string): Promise<void> {
+  async function chooseProject(
+    name: string,
+    historyMode: "push" | "replace" | "none" = "push",
+    restored?: ComparisonUrlState<RunTab>,
+  ): Promise<void> {
     projectController?.abort();
     const controller = new AbortController();
     projectController = controller;
@@ -136,22 +205,80 @@
         getRuns(name, controller.signal),
         getReports(name, controller.signal),
       ]);
-      if (reports[0]) chooseReport(reports[0]);
-      else if (runs[0]) await chooseRun(runs[0]);
+      const state: ComparisonUrlState<RunTab> = restored ?? {
+        project: name,
+        runIds: [],
+        runSelectionSpecified: false,
+        primaryRunId: null,
+        tab: "metrics",
+        metricMode: "union",
+        search: "",
+        alignment: "step",
+        chartMetric: null,
+        chartViewport: null,
+      };
+      await applyComparisonState(state, !state.runSelectionSpecified, controller.signal);
+      if (historyMode !== "none") syncComparisonUrl(historyMode);
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
     }
   }
 
+  async function applyComparisonState(
+    state: ComparisonUrlState<RunTab>,
+    selectDefault: boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const available = new Set(runs.map((run) => run.id));
+    const requestedRunIds =
+      selectDefault && state.runIds.length === 0 && runs[0] ? [runs[0].id] : state.runIds;
+    const normalized = normalizeRunSelection(requestedRunIds, available, state.primaryRunId);
+    selectedRunIds = normalized.runIds;
+    metricMode = state.metricMode;
+    metricSearch = state.search;
+    xAlignment = state.alignment;
+    activeRunTab = state.tab;
+    selectionNotice = null;
+    resetChartState(false);
+    await activatePrimaryRun(normalized.primaryRunId, true);
+    await loadMetricKeysForRuns(normalized.runIds, signal);
+    if (
+      state.chartMetric &&
+      state.chartViewport &&
+      metricAvailability(selectedRunIds, metricKeysByRun, "union").some(
+        (entry) => entry.key === state.chartMetric,
+      )
+    ) {
+      const viewport = normalizedViewport(state.chartViewport.minimum, state.chartViewport.maximum);
+      if (viewport) {
+        urlViewportMetric = state.chartMetric;
+        metricViewports = { [state.chartMetric]: viewport };
+      }
+    }
+    queueVisibleMetrics();
+  }
+
   async function chooseRun(run: Run): Promise<void> {
-    selectionGeneration += 1;
+    if (!selectedRunIds.includes(run.id)) {
+      if (selectedRunIds.length >= MAX_SELECTED_RUNS) {
+        selectionNotice = `Up to ${MAX_SELECTED_RUNS} runs can be visible at once.`;
+        return;
+      }
+      selectedRunIds = [...selectedRunIds, run.id];
+      await loadMetricKeysForRuns([run.id], projectController?.signal);
+      resetChartState(false);
+    }
+    await activatePrimaryRun(run.id, true);
+    queueVisibleMetrics();
+    syncComparisonUrl("push");
+  }
+
+  async function activatePrimaryRun(runId: string | null, loadTab: boolean): Promise<void> {
     runController?.abort();
     const controller = new AbortController();
     runController = controller;
     selectedReport = null;
     resetReportState();
-    resetChartState();
-    metricKeys = [];
     alerts = [];
     richValues = [];
     artifacts = [];
@@ -163,24 +290,117 @@
     richValueCursor = null;
     artifactCursor = null;
     traceCursor = null;
-    selectedRun = run;
-    activeRunTab = "metrics";
-    metricSearch = "";
+    selectedRun = runs.find((run) => run.id === runId) ?? null;
     error = null;
+    if (!selectedRun) return;
+    loadedRunTabs = new Set(["configuration", "metrics"]);
+    if (loadTab) await ensureRunTabLoaded(activeRunTab);
+  }
+
+  async function toggleRun(run: Run, selected: boolean): Promise<void> {
+    selectionNotice = null;
+    if (selected) {
+      if (selectedRunIds.includes(run.id)) return;
+      if (selectedRunIds.length >= MAX_SELECTED_RUNS) {
+        selectionNotice = `Up to ${MAX_SELECTED_RUNS} runs can be visible at once.`;
+        return;
+      }
+      selectedRunIds = [...selectedRunIds, run.id];
+      await loadMetricKeysForRuns([run.id], projectController?.signal);
+      if (!selectedRun) await activatePrimaryRun(run.id, true);
+    } else {
+      selectedRunIds = selectedRunIds.filter((runId) => runId !== run.id);
+      if (selectedRun?.id === run.id) await activatePrimaryRun(selectedRunIds[0] ?? null, true);
+    }
+    resetChartState(false);
+    queueVisibleMetrics();
+    syncComparisonUrl("push");
+  }
+
+  async function isolateRun(run: Run): Promise<void> {
+    selectedRunIds = [run.id];
+    selectionNotice = null;
+    await loadMetricKeysForRuns([run.id], projectController?.signal);
+    if (selectedRun?.id !== run.id) await activatePrimaryRun(run.id, true);
+    resetChartState(false);
+    queueVisibleMetrics();
+    syncComparisonUrl("push");
+  }
+
+  async function clearRunSelection(): Promise<void> {
+    selectedRunIds = [];
+    selectionNotice = null;
+    await activatePrimaryRun(null, false);
+    resetChartState();
+    syncComparisonUrl("push");
+  }
+
+  async function loadMetricKeysForRuns(
+    runIds: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const missing = runIds.filter((runId) => metricKeysByRun[runId] === undefined);
+    if (missing.length === 0) return;
+    loadingMetricKeys = new Set([...loadingMetricKeys, ...missing]);
     try {
-      metricKeys = await getMetricKeys(run.id, controller.signal);
-      loadedRunTabs = new Set(["configuration", "metrics"]);
+      const results = await Promise.all(
+        missing.map(async (runId) => [runId, await getMetricKeys(runId, signal)] as const),
+      );
+      metricKeysByRun = { ...metricKeysByRun, ...Object.fromEntries(results) };
     } catch (reason) {
-      if (!controller.signal.aborted) showError(reason);
+      if (!signal?.aborted) showError(reason);
+    } finally {
+      const next = new Set(loadingMetricKeys);
+      for (const runId of missing) next.delete(runId);
+      loadingMetricKeys = next;
     }
   }
 
+  async function restoreFromLocation(): Promise<void> {
+    const state = readComparisonUrl(new URL(window.location.href), VALID_RUN_TABS, "metrics");
+    const requestedProject =
+      projects.find((project) => project.name === state.project) ?? projects[0];
+    if (!requestedProject) return;
+    if (requestedProject.name !== selectedProject) {
+      await chooseProject(requestedProject.name, "none", state);
+      return;
+    }
+    const controller = projectController;
+    if (!controller) return;
+    await applyComparisonState(state, !state.runSelectionSpecified, controller.signal);
+  }
+
+  function syncComparisonUrl(mode: "push" | "replace"): void {
+    const state: ComparisonUrlState<RunTab> = {
+      project: selectedProject || null,
+      runIds: selectedRunIds,
+      runSelectionSpecified: true,
+      primaryRunId: selectedRun?.id ?? null,
+      tab: activeRunTab,
+      metricMode,
+      search: metricSearch,
+      alignment: xAlignment,
+      chartMetric: urlViewportMetric,
+      chartViewport:
+        urlViewportMetric && metricViewports[urlViewportMetric]
+          ? {
+              minimum: metricViewports[urlViewportMetric]!.stepMin,
+              maximum: metricViewports[urlViewportMetric]!.stepMax,
+            }
+          : null,
+    };
+    const next = writeComparisonUrl(new URL(window.location.href), state);
+    if (next.href === window.location.href) return;
+    window.history[mode === "push" ? "pushState" : "replaceState"]({}, "", next);
+  }
+
   function resetRunSelection(): void {
-    selectionGeneration += 1;
     runController?.abort();
     selectedRun = null;
+    selectedRunIds = [];
     selectedReport = null;
-    metricKeys = [];
+    metricKeysByRun = {};
+    loadingMetricKeys = new Set();
     alerts = [];
     richValues = [];
     artifacts = [];
@@ -198,13 +418,19 @@
     resetReportState();
   }
 
-  function resetChartState(): void {
-    histories = {};
+  function resetChartState(resetVisibility = true): void {
+    chartScheduler.cancelAll();
+    comparisonHistories = {};
     historyRequestKeys = {};
     metricViewports = {};
+    urlViewportMetric = null;
     loadingMetrics = new Set();
-    visibleMetrics = new Set();
-    pendingMetrics = [];
+    scheduledMetricStateKeys = {};
+    scheduledMetricBatchKeys = {};
+    metricPageIndex = 0;
+    fullRangeFlushScheduled = false;
+    fullRangeBatchMetrics.clear();
+    if (resetVisibility) visibleMetrics = new Set();
   }
 
   function resetReportState(): void {
@@ -212,16 +438,13 @@
     reportHistoryRequestKeys = {};
     reportViewports = {};
     loadingReportMetrics = new Set();
-    pendingReportMetrics = [];
   }
 
   function chooseReport(report: Report): void {
-    selectionGeneration += 1;
     runController?.abort();
     runController = new AbortController();
     selectedRun = null;
     selectedReport = report;
-    metricKeys = [];
     alerts = [];
     richValues = [];
     artifacts = [];
@@ -235,7 +458,7 @@
     richValueCursor = null;
     artifactCursor = null;
     traceCursor = null;
-    resetChartState();
+    chartScheduler.cancelAll();
     resetReportState();
     error = null;
   }
@@ -264,66 +487,68 @@
   }
 
   function queueReportMetric(request: { identity: string; runId: string; metric: string }): void {
-    const requestKey = viewportKey(reportViewports[request.identity] ?? null);
-    if (
-      reportHistoryRequestKeys[request.identity] === requestKey ||
-      loadingReportMetrics.has(request.identity)
-    ) {
-      return;
-    }
-    if (pendingReportMetrics.some((candidate) => candidate.identity === request.identity)) return;
-    pendingReportMetrics = [...pendingReportMetrics, request];
-    drainReportMetricQueue();
+    const report = selectedReport;
+    if (!report) return;
+    const viewport = reportViewports[request.identity] ?? null;
+    const revision = runs.find((run) => run.id === request.runId)?.metric_revision ?? 0;
+    const requestKey = `${CHART_BUCKET_BUDGET}:${revision}:${viewportKey(viewport)}`;
+    if (reportHistoryRequestKeys[request.identity] === requestKey) return;
+    loadingReportMetrics = new Set([...loadingReportMetrics, request.identity]);
+    chartScheduler.schedule({
+      identity: `report:${request.identity}`,
+      requestKey,
+      request: async (signal) => {
+        const cached = historyCache.get(
+          request.runId,
+          request.metric,
+          revision,
+          CHART_BUCKET_BUDGET,
+          viewport?.stepMin,
+          viewport?.stepMax,
+        );
+        if (cached) return cached;
+        const history = await getChartHistory(request.runId, [request.metric], {
+          maxBuckets: CHART_BUCKET_BUDGET,
+          viewport: viewport ?? undefined,
+          signal,
+        });
+        historyCache.set(
+          request.runId,
+          request.metric,
+          revision,
+          CHART_BUCKET_BUDGET,
+          history,
+          viewport?.stepMin,
+          viewport?.stepMax,
+        );
+        return history;
+      },
+      publish: (history, publishedKey) => {
+        if (selectedReport?.id !== report.id) return;
+        if (reportRequestKey(request) !== publishedKey) return;
+        reportHistories = { ...reportHistories, [request.identity]: history };
+        reportHistoryRequestKeys = {
+          ...reportHistoryRequestKeys,
+          [request.identity]: publishedKey,
+        };
+        finishReportLoading(request.identity);
+      },
+      reject: (reason) => {
+        finishReportLoading(request.identity);
+        showError(reason);
+      },
+    });
   }
 
-  function drainReportMetricQueue(): void {
-    while (
-      activeReportRequests < MAX_CONCURRENT_CHART_REQUESTS &&
-      pendingReportMetrics.length > 0
-    ) {
-      const request = pendingReportMetrics[0];
-      pendingReportMetrics = pendingReportMetrics.slice(1);
-      const report = selectedReport;
-      const controller = runController;
-      if (!report || !controller) continue;
-      const generation = selectionGeneration;
-      const viewport = reportViewports[request.identity] ?? null;
-      const requestKey = viewportKey(viewport);
-      activeReportRequests += 1;
-      loadingReportMetrics = new Set([...loadingReportMetrics, request.identity]);
-      void getChartHistory(request.runId, [request.metric], {
-        maxBuckets: CHART_BUCKET_BUDGET,
-        viewport: viewport ?? undefined,
-        signal: controller.signal,
-      })
-        .then((history) => {
-          if (generation !== selectionGeneration || selectedReport?.id !== report.id) return;
-          if (viewportKey(reportViewports[request.identity] ?? null) !== requestKey) return;
-          reportHistories = { ...reportHistories, [request.identity]: history };
-          reportHistoryRequestKeys = {
-            ...reportHistoryRequestKeys,
-            [request.identity]: requestKey,
-          };
-        })
-        .catch((reason) => {
-          if (generation === selectionGeneration && !controller.signal.aborted) showError(reason);
-        })
-        .finally(() => {
-          activeReportRequests -= 1;
-          if (generation === selectionGeneration) {
-            const nextLoading = new Set(loadingReportMetrics);
-            nextLoading.delete(request.identity);
-            loadingReportMetrics = nextLoading;
-            if (
-              selectedReport?.id === report.id &&
-              viewportKey(reportViewports[request.identity] ?? null) !== requestKey
-            ) {
-              queueReportMetric(request);
-            }
-          }
-          drainReportMetricQueue();
-        });
-    }
+  function reportRequestKey(request: { identity: string; runId: string }): string {
+    const revision = runs.find((run) => run.id === request.runId)?.metric_revision ?? 0;
+    return `${CHART_BUCKET_BUDGET}:${revision}:${viewportKey(reportViewports[request.identity] ?? null)}`;
+  }
+
+  function finishReportLoading(identity: string): void {
+    const next = new Set(loadingReportMetrics);
+    next.delete(identity);
+    loadingReportMetrics = next;
   }
 
   function reportMetricIdentity(panel: ReportPanel, metric: string): string {
@@ -336,139 +561,405 @@
     else next.delete(metric);
     visibleMetrics = next;
     if (visible) queueMetric(metric);
+    else evictMetricHistory(metric, false);
   }
 
   function chartViewport(metric: string, stepMin: number | null, stepMax: number | null): void {
+    if (!visibleMetrics.has(metric)) return;
     const viewport = normalizedViewport(stepMin, stepMax);
     if (viewportKey(metricViewports[metric] ?? null) === viewportKey(viewport)) return;
     metricViewports = { ...metricViewports, [metric]: viewport };
+    urlViewportMetric = viewport ? metric : null;
     queueMetric(metric);
+    syncComparisonUrl("replace");
   }
 
   function queueMetric(metric: string): void {
-    const run = selectedRun;
-    if (!run) return;
-    const requestKey = metricRequestKey(run.metric_revision, metricViewports[metric] ?? null);
-    if (historyRequestKeys[metric] === requestKey) return;
-    if (loadingMetrics.has(metric) || pendingMetrics.includes(metric)) return;
-    pendingMetrics = [...pendingMetrics, metric];
-    drainMetricQueue();
-  }
-
-  function drainMetricQueue(): void {
-    while (activeChartRequests < MAX_CONCURRENT_CHART_REQUESTS && pendingMetrics.length > 0) {
-      const metric = pendingMetrics[0];
-      pendingMetrics = pendingMetrics.slice(1);
-      const run = selectedRun;
-      const controller = runController;
-      if (!run || !controller) continue;
-      const generation = selectionGeneration;
-      const viewport = metricViewports[metric] ?? null;
-      const requestKey = metricRequestKey(run.metric_revision, viewport);
-      activeChartRequests += 1;
-      loadingMetrics = new Set([...loadingMetrics, metric]);
-      void loadMetric(run, metric, viewport, requestKey, generation, controller.signal)
-        .catch((reason) => {
-          if (generation === selectionGeneration && !controller.signal.aborted) showError(reason);
-        })
-        .finally(() => {
-          activeChartRequests -= 1;
-          if (generation === selectionGeneration) {
-            const nextLoading = new Set(loadingMetrics);
-            nextLoading.delete(metric);
-            loadingMetrics = nextLoading;
-            if (
-              selectedRun?.id === run.id &&
-              metricRequestKey(selectedRun.metric_revision, metricViewports[metric] ?? null) !==
-                requestKey
-            ) {
-              queueMetric(metric);
-            }
-          }
-          drainMetricQueue();
-        });
-    }
-  }
-
-  async function loadMetric(
-    run: Run,
-    metric: string,
-    viewport: ChartHistoryViewport | null,
-    requestKey: string,
-    generation: number,
-    signal: AbortSignal,
-  ): Promise<void> {
-    const revision = run.metric_revision;
-    const cached = historyCache.get(run.id, metric, revision, viewport?.stepMin, viewport?.stepMax);
-    if (cached) {
-      publishHistory(run.id, metric, requestKey, generation, cached);
+    const viewport = metricViewports[metric] ?? null;
+    if (!viewport) {
+      scheduleFullRangeFlush();
       return;
     }
+    const plan = deterministicComparisonPlans().find((candidatePlan) =>
+      candidatePlan.candidates.some((candidate) => candidate.metric === metric),
+    );
+    if (!plan) return;
+    const stateKey = comparisonMetricStateKey(metric, plan, viewport);
+    if (historyRequestKeys[metric] === stateKey || scheduledMetricStateKeys[metric] === stateKey) {
+      return;
+    }
+    scheduleComparisonPlan(
+      plan,
+      viewport,
+      `comparison:${chartPreferenceIdentity(selectedProject, metric)}`,
+      new Set([metric]),
+    );
+  }
 
-    const result = await getChartHistory(run.id, [metric], {
-      maxBuckets: CHART_BUCKET_BUDGET,
-      viewport: viewport ?? undefined,
-      signal,
+  function scheduleFullRangeFlush(): void {
+    if (fullRangeFlushScheduled) return;
+    fullRangeFlushScheduled = true;
+    queueMicrotask(() => {
+      if (!fullRangeFlushScheduled) return;
+      fullRangeFlushScheduled = false;
+      flushFullRangeMetrics();
     });
-    historyCache.set(run.id, metric, revision, result, viewport?.stepMin, viewport?.stepMax);
-    publishHistory(run.id, metric, requestKey, generation, result);
   }
 
-  function publishHistory(
-    runId: string,
-    metric: string,
-    requestKey: string,
-    generation: number,
-    result: ChartHistory,
-  ): void {
-    if (generation !== selectionGeneration || selectedRun?.id !== runId) return;
-    if (
-      metricRequestKey(selectedRun.metric_revision, metricViewports[metric] ?? null) !== requestKey
-    ) {
-      return;
+  function flushFullRangeMetrics(): void {
+    for (const plan of deterministicComparisonPlans()) {
+      const trackedMetrics = new Set(
+        plan.candidates.flatMap((candidate) => {
+          const metric = candidate.metric;
+          if (!visibleMetrics.has(metric) || metricViewports[metric]) return [];
+          const stateKey = comparisonMetricStateKey(metric, plan, null);
+          return historyRequestKeys[metric] === stateKey ||
+            scheduledMetricStateKeys[metric] === stateKey
+            ? []
+            : [metric];
+        }),
+      );
+      if (trackedMetrics.size === 0) continue;
+      const metrics = plan.candidates.map((candidate) => candidate.metric);
+      const identity = `comparison-batch:${selectedProject}:${JSON.stringify(metrics)}`;
+      scheduleComparisonPlan(plan, null, identity, trackedMetrics);
     }
-    histories = { ...histories, [metric]: result };
-    historyRequestKeys = { ...historyRequestKeys, [metric]: requestKey };
   }
 
-  async function refreshSelectedRun(): Promise<void> {
-    const run = selectedRun;
-    const controller = runController;
-    if (!run || !controller || refreshingRun || run.state !== "running") return;
-    refreshingRun = true;
+  function deterministicComparisonPlans() {
+    const candidates = metricAvailability(selectedRunIds, metricKeysByRun, "union").flatMap(
+      ({ key }) => {
+        const candidate = comparisonCandidate(key);
+        return candidate ? [candidate] : [];
+      },
+    );
+    return planComparisonBatches(candidates, CHART_BUCKET_BUDGET);
+  }
+
+  function scheduleComparisonPlan(
+    plan: ReturnType<typeof planComparisonBatches>[number],
+    viewport: ChartHistoryViewport | null,
+    identity: string,
+    trackedMetrics = new Set(plan.candidates.map((candidate) => candidate.metric)),
+  ): void {
+    const project = selectedProject;
+    const alignment = xAlignment;
+    const stateKeys = Object.fromEntries(
+      plan.candidates.map((candidate) => [
+        candidate.metric,
+        comparisonMetricStateKey(candidate.metric, plan, viewport),
+      ]),
+    );
+    const requestKey = comparisonBatchRequestKey(plan, viewport);
+    const nextLoading = new Set(loadingMetrics);
+    const nextStateKeys = { ...scheduledMetricStateKeys };
+    const nextBatchKeys = { ...scheduledMetricBatchKeys };
+    for (const metric of trackedMetrics) {
+      nextLoading.add(metric);
+      nextStateKeys[metric] = stateKeys[metric];
+      nextBatchKeys[metric] = requestKey;
+    }
+    loadingMetrics = nextLoading;
+    scheduledMetricStateKeys = nextStateKeys;
+    scheduledMetricBatchKeys = nextBatchKeys;
+    if (!viewport) {
+      fullRangeBatchMetrics.set(
+        identity,
+        new Set([...(fullRangeBatchMetrics.get(identity) ?? []), ...trackedMetrics]),
+      );
+    }
+    chartScheduler.schedule({
+      identity,
+      requestKey,
+      request: async (signal) => {
+        const cached = comparisonHistoryCache.get(requestKey);
+        if (cached) return cached;
+        const response = await getComparisonChartHistory(
+          project,
+          plan.candidates.flatMap((candidate) =>
+            candidate.runIds.map((runId) => ({ run_id: runId, key: candidate.metric })),
+          ),
+          {
+            alignment: alignmentForApi(alignment),
+            maxBuckets: plan.maxBuckets,
+            viewport: viewport
+              ? { minimum: viewport.stepMin, maximum: viewport.stepMax }
+              : undefined,
+            signal,
+          },
+        );
+        comparisonHistoryCache.set(requestKey, response);
+        return response;
+      },
+      publish: (response, publishedKey) => {
+        if (project !== selectedProject || alignment !== xAlignment) return;
+        const nextHistories = { ...comparisonHistories };
+        const nextHistoryKeys = { ...historyRequestKeys };
+        for (const candidate of plan.candidates) {
+          const metric = candidate.metric;
+          if (scheduledMetricBatchKeys[metric] !== publishedKey) continue;
+          if (viewportKey(metricViewports[metric] ?? null) === viewportKey(viewport)) {
+            nextHistories[metric] = comparisonResponseForMetric(response, metric);
+            nextHistoryKeys[metric] = stateKeys[metric];
+          }
+          finishMetricRequest(metric, publishedKey);
+        }
+        comparisonHistories = nextHistories;
+        historyRequestKeys = nextHistoryKeys;
+        fullRangeBatchMetrics.delete(identity);
+      },
+      reject: (reason) => {
+        for (const candidate of plan.candidates) {
+          finishMetricRequest(candidate.metric, requestKey);
+        }
+        fullRangeBatchMetrics.delete(identity);
+        showError(reason);
+      },
+    });
+  }
+
+  function comparisonCandidate(metric: string): { metric: string; runIds: string[] } | null {
+    const runIds = currentComparisonRuns()
+      .filter((run) => metricKeysByRun[run.id]?.includes(metric))
+      .map((run) => run.id);
+    return runIds.length > 0 ? { metric, runIds } : null;
+  }
+
+  function comparisonResponseForMetric(
+    response: ComparisonChartHistory,
+    metric: string,
+  ): ComparisonChartHistory {
+    const series = response.series.filter((candidate) => candidate.key === metric);
+    const runIds = new Set(series.map((candidate) => candidate.run_id));
+    return {
+      ...response,
+      runs: response.runs.filter((run) => runIds.has(run.run_id)),
+      series,
+    };
+  }
+
+  function comparisonMetricStateKey(
+    metric: string,
+    plan: ReturnType<typeof planComparisonBatches>[number],
+    viewport: ChartHistoryViewport | null,
+  ): string {
+    return JSON.stringify({
+      metric,
+      batch: comparisonBatchRequestKey(plan, viewport),
+    });
+  }
+
+  function comparisonBatchRequestKey(
+    plan: ReturnType<typeof planComparisonBatches>[number],
+    viewport: ChartHistoryViewport | null,
+  ): string {
+    return comparisonCacheKey(
+      selectedProject,
+      xAlignment,
+      plan.maxBuckets,
+      viewport ? { minimum: viewport.stepMin, maximum: viewport.stepMax } : null,
+      plan.candidates.map((candidate) => ({
+        metric: candidate.metric,
+        revisions: candidate.runIds.map(
+          (runId) => [runId, runs.find((run) => run.id === runId)?.metric_revision ?? -1] as const,
+        ),
+      })),
+    );
+  }
+
+  function finishMetricRequest(metric: string, batchKey: string): void {
+    if (scheduledMetricBatchKeys[metric] !== batchKey) return;
+    const nextLoading = new Set(loadingMetrics);
+    nextLoading.delete(metric);
+    loadingMetrics = nextLoading;
+    const nextStateKeys = { ...scheduledMetricStateKeys };
+    const nextBatchKeys = { ...scheduledMetricBatchKeys };
+    delete nextStateKeys[metric];
+    delete nextBatchKeys[metric];
+    scheduledMetricStateKeys = nextStateKeys;
+    scheduledMetricBatchKeys = nextBatchKeys;
+  }
+
+  function evictMetricHistory(metric: string, removeViewport: boolean): void {
+    chartScheduler.cancel(`comparison:${chartPreferenceIdentity(selectedProject, metric)}`);
+    for (const [identity, metrics] of fullRangeBatchMetrics) {
+      metrics.delete(metric);
+      if (metrics.size === 0) {
+        chartScheduler.cancel(identity);
+        fullRangeBatchMetrics.delete(identity);
+      }
+    }
+    const nextHistories = { ...comparisonHistories };
+    const nextHistoryKeys = { ...historyRequestKeys };
+    const nextStateKeys = { ...scheduledMetricStateKeys };
+    const nextBatchKeys = { ...scheduledMetricBatchKeys };
+    delete nextHistories[metric];
+    delete nextHistoryKeys[metric];
+    delete nextStateKeys[metric];
+    delete nextBatchKeys[metric];
+    comparisonHistories = nextHistories;
+    historyRequestKeys = nextHistoryKeys;
+    scheduledMetricStateKeys = nextStateKeys;
+    scheduledMetricBatchKeys = nextBatchKeys;
+    if (removeViewport && urlViewportMetric !== metric) {
+      const nextViewports = { ...metricViewports };
+      delete nextViewports[metric];
+      metricViewports = nextViewports;
+    }
+    const nextLoading = new Set(loadingMetrics);
+    nextLoading.delete(metric);
+    loadingMetrics = nextLoading;
+  }
+
+  function evictMetricsOutsidePage(metrics: ReadonlySet<string>): void {
+    for (const metric of new Set([
+      ...Object.keys(comparisonHistories),
+      ...Object.keys(scheduledMetricStateKeys),
+      ...visibleMetrics,
+    ])) {
+      if (!metrics.has(metric)) evictMetricHistory(metric, true);
+    }
+    visibleMetrics = new Set([...visibleMetrics].filter((metric) => metrics.has(metric)));
+  }
+
+  function queueVisibleMetrics(): void {
+    for (const metric of visibleMetrics) queueMetric(metric);
+  }
+
+  function comparisonSeries(
+    metric: string,
+    selectedRuns: readonly Run[],
+    keysByRun: Readonly<Record<string, readonly string[]>>,
+    histories: Readonly<Record<string, ComparisonChartHistory>>,
+    activeLoadingMetrics: ReadonlySet<string>,
+  ) {
+    const response = histories[metric];
+    return selectedRuns.map((run) => {
+      const keys = keysByRun[run.id];
+      const available = keys === undefined || keys.includes(metric);
+      return {
+        runId: run.id,
+        runName: run.name,
+        ...runStyle(run.id),
+        available,
+        history: response ? comparisonSeriesHistory(response, run.id, metric) : undefined,
+        loading: keys === undefined || (available && activeLoadingMetrics.has(metric)),
+      };
+    });
+  }
+
+  function reportSeries(
+    panel: ReportPanel,
+    metric: string,
+    availableRuns: readonly Run[],
+    histories: Readonly<Record<string, ChartHistory>>,
+    activeLoadingMetrics: ReadonlySet<string>,
+  ) {
+    const identity = reportMetricIdentity(panel, metric);
+    const run = availableRuns.find((candidate) => candidate.id === panel.run_id);
+    if (!run) return [];
+    return [
+      {
+        runId: run.id,
+        runName: run.name,
+        ...runStyle(run.id),
+        available: true,
+        history: histories[identity],
+        loading: activeLoadingMetrics.has(identity),
+      },
+    ];
+  }
+
+  function alignmentForApi(alignment: RunAlignment): "step" | "relative_step" | "elapsed_time" {
+    if (alignment === "relative-step") return "relative_step";
+    if (alignment === "elapsed-time") return "elapsed_time";
+    return "step";
+  }
+
+  function changeAlignment(_: string, alignment: RunAlignment): void {
+    if (xAlignment === alignment) return;
+    xAlignment = alignment;
+    comparisonHistories = {};
+    historyRequestKeys = {};
+    metricViewports = {};
+    urlViewportMetric = null;
+    chartScheduler.cancelAll();
+    scheduledMetricStateKeys = {};
+    scheduledMetricBatchKeys = {};
+    fullRangeBatchMetrics.clear();
+    queueVisibleMetrics();
+    syncComparisonUrl("push");
+  }
+
+  function changeMetricMode(mode: MetricSetMode): void {
+    if (metricMode === mode) return;
+    metricMode = mode;
+    metricPageIndex = 0;
+    syncComparisonUrl("push");
+  }
+
+  async function refreshSelectedRuns(): Promise<void> {
+    const controller = projectController;
+    const running = currentComparisonRuns().filter((run) => run.state === "running");
+    if (!controller || refreshingRuns || running.length === 0) return;
+    refreshingRuns = true;
     try {
-      const latest = await getRun(run.id, controller.signal);
-      if (selectedRun?.id !== latest.id) return;
-      const revisionChanged = latest.metric_revision !== selectedRun.metric_revision;
-      selectedRun = latest;
-      runs = runs.map((candidate) => (candidate.id === latest.id ? latest : candidate));
-      if (activeRunTab === "summary") alerts = await getAlerts(latest.id, controller.signal);
+      const latestRuns = await Promise.all(running.map((run) => getRun(run.id, controller.signal)));
+      const stillSelected = new Set(selectedRunIds);
+      const revisionsChanged = latestRuns.filter((latest) => {
+        const previous = runs.find((run) => run.id === latest.id);
+        return stillSelected.has(latest.id) && previous?.metric_revision !== latest.metric_revision;
+      });
+      runs = runs.map(
+        (candidate) => latestRuns.find((latest) => latest.id === candidate.id) ?? candidate,
+      );
+      if (selectedRun) selectedRun = runs.find((run) => run.id === selectedRun?.id) ?? null;
+      if (revisionsChanged.length > 0) {
+        const updatedKeys = await Promise.all(
+          revisionsChanged.map(
+            async (run) => [run.id, await getMetricKeys(run.id, controller.signal)] as const,
+          ),
+        );
+        metricKeysByRun = { ...metricKeysByRun, ...Object.fromEntries(updatedKeys) };
+        metricPageIndex = 0;
+        queueVisibleMetrics();
+      }
+      const primary = selectedRun;
+      const detailController = runController;
+      if (!primary || !detailController) return;
+      if (activeRunTab === "summary") alerts = await getAlerts(primary.id, detailController.signal);
       if (activeRunTab === "media") {
-        const page = await getRichValuePage(latest.id, undefined, controller.signal);
+        const page = await getRichValuePage(primary.id, undefined, detailController.signal);
         richValues = page.items;
         richValueCursor = page.nextBefore;
       }
       if (activeRunTab === "artifacts") {
-        const page = await getRunArtifactPage(latest.id, undefined, controller.signal);
+        const page = await getRunArtifactPage(primary.id, undefined, detailController.signal);
         artifacts = page.items;
         artifactCursor = page.nextBefore;
       }
       if (activeRunTab === "traces") {
-        const page = await getTracePage(latest.id, traceSearch, undefined, controller.signal);
+        const page = await getTracePage(
+          primary.id,
+          traceSearch,
+          undefined,
+          detailController.signal,
+        );
         traces = page.items;
         traceCursor = page.nextBefore;
-      }
-      if (revisionChanged) {
-        metricKeys = await getMetricKeys(latest.id, controller.signal);
-        if (activeRunTab === "metrics") {
-          for (const metric of visibleMetrics) queueMetric(metric);
-        }
       }
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
     } finally {
-      refreshingRun = false;
+      refreshingRuns = false;
     }
+  }
+
+  function currentComparisonRuns(): Run[] {
+    return selectedRunIds.flatMap((runId) => {
+      const run = runs.find((candidate) => candidate.id === runId);
+      return run ? [run] : [];
+    });
   }
 
   function showError(reason: unknown): void {
@@ -521,6 +1012,7 @@
   function selectRunTab(tab: RunTab): void {
     activeRunTab = tab;
     void ensureRunTabLoaded(tab);
+    syncComparisonUrl("push");
   }
 
   async function ensureRunTabLoaded(tab: RunTab): Promise<void> {
@@ -606,7 +1098,7 @@
   function runTabCount(tab: RunTab): number {
     if (tab === "summary") return Object.keys(selectedRun?.summary ?? {}).length;
     if (tab === "configuration") return Object.keys(selectedRun?.config ?? {}).length;
-    if (tab === "metrics") return metricKeys.length;
+    if (tab === "metrics") return metricCatalog.length;
     if (tab === "media") return richValues.length;
     if (tab === "traces") return traces.length;
     return artifacts.length;
@@ -677,20 +1169,48 @@
           {#if runs.length > 0}<p class="nav-label">Runs</p>{/if}
           <div class="run-list" aria-label="Runs" class:hidden={runs.length === 0}>
             {#each runs as run (run.id)}
-              <button class:active={selectedRun?.id === run.id} onclick={() => chooseRun(run)}>
-                <span>{run.name}</span>
-                <small
-                  class="run-list-state"
-                  class:live={run.state === "running"}
-                  class:finished={run.state === "finished"}
+              {@const style = runStyle(run.id)}
+              <div
+                class="run-list-row"
+                class:selected={selectedRunIds.includes(run.id)}
+                class:primary={selectedRun?.id === run.id}
+                style={`--run-color: ${style.color}`}
+              >
+                <label class="run-checkbox" aria-label={`Compare ${run.name}`}>
+                  <input
+                    type="checkbox"
+                    checked={selectedRunIds.includes(run.id)}
+                    disabled={!selectedRunIds.includes(run.id) &&
+                      selectedRunIds.length >= MAX_SELECTED_RUNS}
+                    onchange={(event) => void toggleRun(run, event.currentTarget.checked)}
+                  />
+                  <span class={`run-swatch pattern-${style.pattern}`} aria-hidden="true"></span>
+                </label>
+                <button
+                  class="run-primary-button"
+                  class:active={selectedRun?.id === run.id}
+                  onclick={() => void chooseRun(run)}
                 >
-                  <Icon name={run.state === "running" ? "activity" : "check"} size={12} />
-                  <span>{run.state}</span>
-                  <span>r{run.metric_revision}</span>
-                </small>
-              </button>
+                  <span>{run.name}</span>
+                  <small
+                    class="run-list-state"
+                    class:live={run.state === "running"}
+                    class:finished={run.state === "finished"}
+                  >
+                    <Icon name={run.state === "running" ? "activity" : "check"} size={12} />
+                    <span>{run.state}</span>
+                    <span>r{run.metric_revision}</span>
+                  </small>
+                </button>
+              </div>
             {/each}
           </div>
+          {#if selectionNotice}
+            <p class="selection-notice" role="status">{selectionNotice}</p>
+          {/if}
+          {#if runs.length > 0}
+            <p class="run-limit">{selectedRunIds.length} / {MAX_SELECTED_RUNS} visible</p>
+          {/if}
         </aside>
 
         <section class="run-view">
@@ -735,8 +1255,20 @@
                           {metric}
                           {identity}
                           title={panel.metric_keys.length === 1 ? metric : metric}
-                          history={reportHistories[identity]}
-                          loading={loadingReportMetrics.has(identity)}
+                          series={reportSeries(
+                            panel,
+                            metric,
+                            runs,
+                            reportHistories,
+                            loadingReportMetrics,
+                          )}
+                          parentViewport={reportViewports[identity]
+                            ? {
+                                minimum: reportViewports[identity]!.stepMin,
+                                maximum: reportViewports[identity]!.stepMax,
+                              }
+                            : null}
+                          xAlignment="step"
                           onvisibilitychange={(_, visible) =>
                             reportChartVisibility(panel, metric, visible)}
                           onviewportchange={(_, stepMin, stepMax) =>
@@ -751,7 +1283,9 @@
           {:else if selectedRun}
             <div class="run-heading">
               <div>
-                <p class="eyebrow">{selectedRun.project} / {selectedRun.id.slice(0, 8)}</p>
+                <p class="eyebrow">
+                  {selectedRun.project} / primary run / {selectedRun.id.slice(0, 8)}
+                </p>
                 <h1>{selectedRun.name}</h1>
               </div>
               <span
@@ -762,6 +1296,48 @@
                 <Icon name={selectedRun.state === "running" ? "activity" : "check"} size={14} />
                 {selectedRun.state}
               </span>
+            </div>
+
+            <div class="comparison-bar" aria-label="Compared runs">
+              <div class="comparison-chips">
+                {#each comparisonRuns as run (run.id)}
+                  {@const style = runStyle(run.id)}
+                  <div
+                    class="run-chip"
+                    class:primary={selectedRun.id === run.id}
+                    style={`--run-color: ${style.color}`}
+                  >
+                    <span class={`run-swatch pattern-${style.pattern}`} aria-hidden="true"></span>
+                    <button
+                      class="chip-name"
+                      type="button"
+                      aria-label={`Use ${run.name} as primary run`}
+                      onclick={() => void chooseRun(run)}>{run.name}</button
+                    >
+                    <button
+                      class="chip-action"
+                      type="button"
+                      aria-label={`Show only ${run.name}`}
+                      title={`Show only ${run.name}`}
+                      onclick={() => void isolateRun(run)}>◎</button
+                    >
+                    <button
+                      class="chip-action"
+                      type="button"
+                      aria-label={`Remove ${run.name} from comparison`}
+                      title={`Remove ${run.name} from comparison`}
+                      onclick={() => void toggleRun(run, false)}>×</button
+                    >
+                  </div>
+                {/each}
+              </div>
+              <button
+                class="clear-comparison"
+                type="button"
+                onclick={() => void clearRunSelection()}
+              >
+                Clear
+              </button>
             </div>
 
             <div class="run-tabs" role="tablist" aria-label="Run data">
@@ -858,7 +1434,9 @@
             >
               <div class="section-heading metrics-toolbar">
                 <div>
-                  <p class="eyebrow">Exact bucket envelopes · four concurrent queries</p>
+                  <p class="eyebrow">
+                    {comparisonRuns.length} runs · exact buckets · four concurrent queries
+                  </p>
                   <h2>Metrics</h2>
                 </div>
                 <label class="search-control">
@@ -867,21 +1445,87 @@
                     type="search"
                     aria-label="Search metrics"
                     placeholder="Search metric keys"
-                    bind:value={metricSearch}
+                    value={metricSearch}
+                    oninput={(event) => {
+                      metricSearch = event.currentTarget.value;
+                      metricPageIndex = 0;
+                      syncComparisonUrl("replace");
+                    }}
                   />
                 </label>
-                <span>
-                  {filteredMetricKeys.length.toLocaleString()} of {metricKeys.length.toLocaleString()}
-                </span>
+                <span
+                  >{filteredMetricCatalog.length.toLocaleString()} of {metricCatalog.length.toLocaleString()}</span
+                >
               </div>
-              {#if filteredMetricKeys.length > 0}
+              <div class="comparison-controls">
+                <div class="segmented-control" aria-label="Metric availability mode">
+                  <button
+                    type="button"
+                    class:active={metricMode === "union"}
+                    aria-pressed={metricMode === "union"}
+                    onclick={() => changeMetricMode("union")}>Any run</button
+                  >
+                  <button
+                    type="button"
+                    class:active={metricMode === "intersection"}
+                    aria-pressed={metricMode === "intersection"}
+                    onclick={() => changeMetricMode("intersection")}>All runs</button
+                  >
+                </div>
+                <label class="alignment-control">
+                  <span>Align x-axis</span>
+                  <select
+                    value={xAlignment}
+                    onchange={(event) =>
+                      changeAlignment("", event.currentTarget.value as RunAlignment)}
+                  >
+                    <option value="step">Absolute step</option>
+                    <option value="relative-step">Relative step</option>
+                    <option value="elapsed-time">Elapsed time</option>
+                  </select>
+                </label>
+                <span class="availability-hint">Availability is shown on each chart.</span>
+              </div>
+              {#if filteredMetricCatalog.length > 0}
+                <nav class="metric-pagination" aria-label="Metric chart pages">
+                  <button
+                    type="button"
+                    disabled={metricPageResult.page === 0}
+                    onclick={() => (metricPageIndex = metricPageResult.page - 1)}>Previous</button
+                  >
+                  <span>
+                    Page {(metricPageResult.page + 1).toLocaleString()} of {metricPageResult.pageCount.toLocaleString()}
+                    · up to {METRIC_CHART_PAGE_SIZE} charts
+                  </span>
+                  <button
+                    type="button"
+                    disabled={metricPageResult.page + 1 >= metricPageResult.pageCount}
+                    onclick={() => (metricPageIndex = metricPageResult.page + 1)}>Next</button
+                  >
+                </nav>
                 <div class="metric-grid">
-                  {#each filteredMetricKeys as metric (`${selectedRun.id}:${metric}`)}
+                  {#each pagedMetricCatalog as entry (`${selectedProject}:${entry.key}`)}
                     <MetricChart
-                      {metric}
-                      identity={`${selectedRun.id}:${metric}`}
-                      history={histories[metric]}
-                      loading={loadingMetrics.has(metric)}
+                      metric={entry.key}
+                      identity={chartPreferenceIdentity(selectedProject, entry.key)}
+                      title={entry.total === 1
+                        ? entry.key
+                        : `${entry.key} · ${entry.available}/${entry.total} runs`}
+                      series={comparisonSeries(
+                        entry.key,
+                        comparisonRuns,
+                        metricKeysByRun,
+                        comparisonHistories,
+                        loadingMetrics,
+                      )}
+                      parentViewport={metricViewports[entry.key]
+                        ? {
+                            minimum: metricViewports[entry.key]!.stepMin,
+                            maximum: metricViewports[entry.key]!.stepMax,
+                          }
+                        : null}
+                      {xAlignment}
+                      onalignmentchange={changeAlignment}
                       onvisibilitychange={chartVisibility}
                       onviewportchange={chartViewport}
                     />
@@ -889,9 +1533,13 @@
                 </div>
               {:else}
                 <section class="metric-empty">
-                  {metricKeys.length === 0
-                    ? "No scalar metrics logged yet."
-                    : "No metric keys match this search."}
+                  {selectedRunIds.length === 0
+                    ? "Select one or more runs to compare metrics."
+                    : loadingMetricKeys.size > 0
+                      ? "Loading metric catalogs…"
+                      : metricCatalog.length === 0
+                        ? "No scalar metrics are available in this mode."
+                        : "No metric keys match this search."}
                 </section>
               {/if}
             </div>
@@ -1057,7 +1705,11 @@
               {/if}
             </div>
           {:else}
-            <section class="empty">This project has no runs.</section>
+            <section class="empty">
+              {runs.length === 0
+                ? "This project has no runs."
+                : "Select one or more runs from the sidebar."}
+            </section>
           {/if}
         </section>
       </div>

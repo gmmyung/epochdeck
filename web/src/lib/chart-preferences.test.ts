@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { readChartPreferences, rememberChartPreferences } from "./chart-preferences";
+import {
+  chartPreferenceIdentity,
+  readChartPreferences,
+  rememberChartPreferences,
+} from "./chart-preferences";
 
 describe("chart preferences", () => {
-  it("restores an isolated copy for a run and metric identity", () => {
+  it("restores an isolated copy for a project and metric identity", () => {
     const value = {
       displayMode: "band" as const,
       smoothingMode: "ema" as const,
@@ -15,11 +19,17 @@ describe("chart preferences", () => {
       yMinimum: "0.01",
       yMaximum: "",
     };
-    rememberChartPreferences("run:loss", value);
-    const restored = readChartPreferences("run:loss");
+    const identity = chartPreferenceIdentity("robotics", "train/loss");
+    rememberChartPreferences(identity, value);
+    const restored = readChartPreferences(identity);
     expect(restored).toEqual(value);
     if (restored) restored.smoothingAmount = 99;
-    expect(readChartPreferences("run:loss")?.smoothingAmount).toBe(0.2);
-    expect(readChartPreferences("other:loss")).toBeUndefined();
+    expect(readChartPreferences(identity)?.smoothingAmount).toBe(0.2);
+    expect(readChartPreferences(chartPreferenceIdentity("other", "train/loss"))).toBeUndefined();
+  });
+
+  it("does not encode a selected run set in the preference identity", () => {
+    expect(chartPreferenceIdentity("a:b", "c")).not.toBe(chartPreferenceIdentity("a", "b:c"));
+    expect(chartPreferenceIdentity("project", "loss")).toBe('["project","loss"]');
   });
 });

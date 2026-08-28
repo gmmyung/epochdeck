@@ -18,18 +18,26 @@ budget. The harness verifies source counts, the bucket cap, and that every last
 value remains inside its exact band. It then requests a centered 512-step
 viewport and records decoded rows plus selected and pruned row groups. Pruning
 is conservative: only exact step statistics can exclude a group.
+The harness also projects eight requested metric columns together, discovers
+their shared per-run origin, and builds a relative-step comparison aggregate
+under the 20,000-cell request ceiling. This exercises the grouped scan shape
+used when several run overlays miss the server cache.
+The comparison number below is therefore a cold storage-path measurement. The
+server separately caches exact per-key axis extents by sequence watermark, so
+an identical natural-range endpoint replay does not repeat this extent pass.
 It also projects the final sequence and step from the last row of the latest
 segment, matching the remote-resume workload. Temporary data is removed after
 each run.
 
-Reference smoke result on an Apple M5 Pro on 2026-08-28:
+Reference smoke result on an Apple M5 Pro on 2026-08-29:
 
 ```text
 rows=200000 metrics=180 segments_before=196 segments_after=13
-compaction_seconds=1.926 compacted_mib=97.52
-write_seconds=8.501 stored_mib=114.78
-sampled_query_seconds=0.016 source_points=200000 returned_points=5000
-chart_history_seconds=0.016 extent_seconds=0.008 aggregate_seconds=0.008 source_points=200000 returned_buckets=2000
+compaction_seconds=1.753 compacted_mib=97.52
+write_seconds=8.215 stored_mib=114.78
+sampled_query_seconds=0.015 source_points=200000 returned_points=5000
+chart_history_seconds=0.015 extent_seconds=0.007 aggregate_seconds=0.008 source_points=200000 returned_buckets=2000
+comparison_chart_seconds=0.038 series=8 cells=16000 alignment=relative_step
 chart_viewport_seconds=0.002 source_points=512 decoded_rows=8192 row_groups_read=1 row_groups_pruned=24
 resume_tail_seconds=0.000 sequence=200000 step=199999
 ```

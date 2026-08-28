@@ -299,6 +299,96 @@ select:hover {
   opacity: 0.75;
 }
 
+.run-list-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.run-list-row.selected {
+  background: color-mix(in srgb, var(--run-color) 9%, transparent);
+}
+
+.run-list-row.primary {
+  box-shadow: inset 3px 0 var(--run-color);
+}
+
+.run-list-row .run-primary-button {
+  width: 100%;
+  padding-left: 7px;
+}
+
+.run-list-row .run-primary-button.active {
+  box-shadow: none;
+  background: color-mix(in srgb, var(--run-color) 14%, transparent);
+  color: var(--text);
+}
+
+.run-checkbox {
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  place-items: center;
+  padding: 6px 4px;
+  cursor: pointer;
+}
+
+.run-checkbox:hover {
+  background: var(--button-hover);
+}
+
+.run-checkbox input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--run-color);
+}
+
+.run-checkbox input:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+
+.run-swatch {
+  width: 18px;
+  height: 4px;
+  flex: 0 0 auto;
+  background: var(--run-color);
+}
+
+.run-swatch.pattern-dash {
+  background: repeating-linear-gradient(90deg, var(--run-color) 0 5px, transparent 5px 8px);
+}
+
+.run-swatch.pattern-dot {
+  background: repeating-linear-gradient(90deg, var(--run-color) 0 2px, transparent 2px 5px);
+}
+
+.run-swatch.pattern-dash-dot {
+  background: repeating-linear-gradient(
+    90deg,
+    var(--run-color) 0 6px,
+    transparent 6px 8px,
+    var(--run-color) 8px 10px,
+    transparent 10px 13px
+  );
+}
+
+.selection-notice,
+.run-limit {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.selection-notice {
+  color: var(--danger);
+}
+
+.run-limit {
+  text-align: right;
+}
+
 .run-view {
   min-width: 0;
 }
@@ -335,6 +425,110 @@ select:hover {
 
 .run-heading h1 {
   overflow-wrap: anywhere;
+}
+
+.comparison-bar {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.comparison-chips {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.run-chip {
+  --chip-background: color-mix(in srgb, var(--run-color) 8%, var(--surface));
+  min-width: 0;
+  max-width: min(360px, 44vw);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 3px 3px 3px 8px;
+  border-left: 3px solid var(--run-color);
+  background: var(--chip-background);
+}
+
+.run-chip.primary {
+  --chip-background: color-mix(in srgb, var(--run-color) 15%, var(--surface));
+}
+
+.run-chip .run-swatch {
+  width: 16px;
+}
+
+.chip-name,
+.chip-action,
+.clear-comparison {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.chip-name {
+  min-width: 0;
+  padding: 3px 2px;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 600;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip-action {
+  position: relative;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  padding: 0;
+}
+
+.chip-action:hover,
+.chip-name:hover,
+.clear-comparison:hover {
+  background: var(--button-hover);
+  color: var(--text);
+}
+
+.chip-action[aria-label]::after {
+  content: attr(aria-label);
+  position: absolute;
+  z-index: 45;
+  top: calc(100% + 6px);
+  right: 0;
+  width: max-content;
+  max-width: 220px;
+  padding: 5px 7px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  box-shadow: 0 3px 10px rgb(0 0 0 / 12%);
+  color: var(--text);
+  font-size: 9px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.chip-action[aria-label]:hover::after,
+.chip-action[aria-label]:focus-visible::after {
+  opacity: 1;
+}
+
+.clear-comparison {
+  min-height: 30px;
+  flex: 0 0 auto;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--line);
 }
 
 .report-description {
@@ -1092,6 +1286,91 @@ dd {
   align-items: end;
 }
 
+.comparison-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: -2px 0 16px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.metric-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.metric-pagination button {
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text);
+  font-size: 10px;
+}
+
+.metric-pagination button:hover:not(:disabled) {
+  background: var(--button-hover);
+}
+
+.metric-pagination button:disabled {
+  color: var(--faint);
+  cursor: default;
+  opacity: 0.55;
+}
+
+.segmented-control {
+  display: flex;
+}
+
+.segmented-control button {
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.segmented-control button + button {
+  border-left: 0;
+}
+
+.segmented-control button:hover,
+.segmented-control button.active {
+  background: var(--button-hover);
+  color: var(--text);
+}
+
+.segmented-control button.active {
+  box-shadow: inset 0 -2px var(--accent);
+}
+
+.alignment-control {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.alignment-control select {
+  width: auto;
+  min-height: 30px;
+}
+
+.availability-hint {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 9px;
+}
+
 .search-control {
   min-height: 34px;
   display: flex;
@@ -1470,6 +1749,19 @@ dd {
     grid-auto-columns: minmax(190px, 1fr);
     grid-auto-flow: column;
     overflow-x: auto;
+  }
+
+  .run-list-row {
+    min-width: 210px;
+  }
+
+  .comparison-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .clear-comparison {
+    align-self: flex-end;
   }
 
   .document-cards,

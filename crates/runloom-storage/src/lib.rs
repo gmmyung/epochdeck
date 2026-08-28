@@ -19,7 +19,7 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
 use runloom_protocol::{
     ChartHistoryResponse, ChartMetricHistory, HistoryResponse, IngestBatchRequest,
-    MAX_CHART_BUCKET_CELLS, MAX_CHART_BUCKETS, ProjectId, RunId,
+    MAX_CHART_BUCKET_CELLS, MAX_CHART_BUCKETS, MAX_CHART_QUERY_CELLS, ProjectId, RunId,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -485,6 +485,14 @@ pub struct ChartStepExtent {
     pub maximum: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChartAxisExtent {
+    pub step_minimum: u64,
+    pub step_maximum: u64,
+    pub timestamp_minimum_ms: i64,
+    pub timestamp_maximum_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChartScanStatistics {
     pub decoded_rows: u64,
@@ -562,36 +570,183 @@ impl ChartStepExtentScanner {
     }
 }
 
+#[derive(Debug)]
+pub struct ChartAxisExtentScanner {
+    keys: Vec<String>,
+    first_sequence: u64,
+    last_sequence: u64,
+    extents: Vec<Option<ChartAxisExtent>>,
+}
+
+impl ChartAxisExtentScanner {
+    pub fn new(
+        keys: &[String],
+        first_sequence: u64,
+        last_sequence: u64,
+    ) -> Result<Self, StorageError> {
+        if keys.is_empty() || first_sequence > last_sequence {
+            return Err(StorageError::InvalidSegment(
+                "chart axis extent requires metric keys and an ordered sequence range".to_owned(),
+            ));
+        }
+        Ok(Self {
+            keys: keys.to_vec(),
+            first_sequence,
+            last_sequence,
+            extents: vec![None; keys.len()],
+        })
+    }
+
+    pub fn read_segments(
+        &mut self,
+        store: &MetricStore,
+        segments: &[SegmentSource],
+        cancelled: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        for segment in segments {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(StorageError::Cancelled);
+            }
+            let path = store.resolve_segment(&segment.relative_path)?;
+            read_segment_chart_axis_extent(&path, self, cancelled)?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn finish(self) -> Option<ChartAxisExtent> {
+        self.extents
+            .into_iter()
+            .flatten()
+            .reduce(merge_axis_extents)
+    }
+
+    #[must_use]
+    pub fn finish_by_key(self) -> BTreeMap<String, ChartAxisExtent> {
+        self.keys
+            .into_iter()
+            .zip(self.extents)
+            .filter_map(|(key, extent)| extent.map(|extent| (key, extent)))
+            .collect()
+    }
+
+    fn observe(&mut self, sequence: u64, step: u64, timestamp_ms: i64, values: &[Option<f64>]) {
+        if sequence < self.first_sequence || sequence > self.last_sequence {
+            return;
+        }
+        for (value, extent) in values.iter().zip(&mut self.extents) {
+            if value.is_none() {
+                continue;
+            }
+            *extent = Some(match *extent {
+                Some(extent) => merge_axis_extents(
+                    extent,
+                    ChartAxisExtent {
+                        step_minimum: step,
+                        step_maximum: step,
+                        timestamp_minimum_ms: timestamp_ms,
+                        timestamp_maximum_ms: timestamp_ms,
+                    },
+                ),
+                None => ChartAxisExtent {
+                    step_minimum: step,
+                    step_maximum: step,
+                    timestamp_minimum_ms: timestamp_ms,
+                    timestamp_maximum_ms: timestamp_ms,
+                },
+            });
+        }
+    }
+}
+
+fn merge_axis_extents(left: ChartAxisExtent, right: ChartAxisExtent) -> ChartAxisExtent {
+    ChartAxisExtent {
+        step_minimum: left.step_minimum.min(right.step_minimum),
+        step_maximum: left.step_maximum.max(right.step_maximum),
+        timestamp_minimum_ms: left.timestamp_minimum_ms.min(right.timestamp_minimum_ms),
+        timestamp_maximum_ms: left.timestamp_maximum_ms.max(right.timestamp_maximum_ms),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ChartBucket {
     minimum: f64,
     maximum: f64,
     last_sequence: u64,
+    last_x: u64,
     last_step: u64,
     last_timestamp_ms: i64,
     last: f64,
 }
 
 impl ChartBucket {
-    fn new(sequence: u64, step: u64, timestamp_ms: i64, value: f64) -> Self {
+    fn new(sequence: u64, x: u64, step: u64, timestamp_ms: i64, value: f64) -> Self {
         Self {
             minimum: value,
             maximum: value,
             last_sequence: sequence,
+            last_x: x,
             last_step: step,
             last_timestamp_ms: timestamp_ms,
             last: value,
         }
     }
 
-    fn observe(&mut self, sequence: u64, step: u64, timestamp_ms: i64, value: f64) {
+    fn observe(&mut self, sequence: u64, x: u64, step: u64, timestamp_ms: i64, value: f64) {
         self.minimum = self.minimum.min(value);
         self.maximum = self.maximum.max(value);
         if sequence >= self.last_sequence {
             self.last_sequence = sequence;
+            self.last_x = x;
             self.last_step = step;
             self.last_timestamp_ms = timestamp_ms;
             self.last = value;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartCoordinate {
+    Step,
+    RelativeStep { origin: u64 },
+    ElapsedTime { origin_ms: i64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChartSamplingSpec {
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub coordinate: ChartCoordinate,
+    pub x_min: u64,
+    pub x_max: u64,
+    pub max_buckets: usize,
+}
+
+impl ChartCoordinate {
+    fn x(self, step: u64, timestamp_ms: i64) -> Option<u64> {
+        match self {
+            Self::Step => Some(step),
+            Self::RelativeStep { origin } => step.checked_sub(origin),
+            Self::ElapsedTime { origin_ms } => {
+                let elapsed = i128::from(timestamp_ms) - i128::from(origin_ms);
+                (elapsed >= 0)
+                    .then(|| u64::try_from(elapsed).ok())
+                    .flatten()
+            }
+        }
+    }
+
+    fn step_viewport(self, x_min: u64, x_max: u64) -> Option<ChartStepExtent> {
+        match self {
+            Self::Step => Some(ChartStepExtent {
+                minimum: x_min,
+                maximum: x_max,
+            }),
+            Self::RelativeStep { origin } => Some(ChartStepExtent {
+                minimum: origin.saturating_add(x_min),
+                maximum: origin.saturating_add(x_max),
+            }),
+            Self::ElapsedTime { .. } => None,
         }
     }
 }
@@ -602,8 +757,10 @@ pub struct ChartHistorySampler {
     keys: Vec<String>,
     first_sequence: u64,
     last_sequence: u64,
-    step_min: u64,
-    step_max: u64,
+    coordinate: ChartCoordinate,
+    x_min: u64,
+    x_max: u64,
+    step_viewport: Option<ChartStepExtent>,
     bucket_count: usize,
     source_points: u64,
     metric_source_points: Vec<u64>,
@@ -621,9 +778,46 @@ impl ChartHistorySampler {
         step_max: u64,
         max_buckets: usize,
     ) -> Result<Self, StorageError> {
-        if keys.is_empty() || first_sequence > last_sequence || step_min > step_max {
+        Self::new_with_cell_limit(
+            run_id,
+            keys,
+            ChartSamplingSpec {
+                first_sequence,
+                last_sequence,
+                coordinate: ChartCoordinate::Step,
+                x_min: step_min,
+                x_max: step_max,
+                max_buckets,
+            },
+            MAX_CHART_BUCKET_CELLS,
+        )
+    }
+
+    pub fn new_aligned(
+        run_id: RunId,
+        keys: &[String],
+        spec: ChartSamplingSpec,
+    ) -> Result<Self, StorageError> {
+        Self::new_with_cell_limit(run_id, keys, spec, MAX_CHART_QUERY_CELLS)
+    }
+
+    fn new_with_cell_limit(
+        run_id: RunId,
+        keys: &[String],
+        spec: ChartSamplingSpec,
+        cell_limit: usize,
+    ) -> Result<Self, StorageError> {
+        let ChartSamplingSpec {
+            first_sequence,
+            last_sequence,
+            coordinate,
+            x_min,
+            x_max,
+            max_buckets,
+        } = spec;
+        if keys.is_empty() || first_sequence > last_sequence || x_min > x_max {
             return Err(StorageError::InvalidSegment(
-                "chart history requires metric keys and ordered sequence and step ranges"
+                "chart history requires metric keys and ordered sequence and axis ranges"
                     .to_owned(),
             ));
         }
@@ -635,21 +829,24 @@ impl ChartHistorySampler {
         let bucket_cells = max_buckets.checked_mul(keys.len()).ok_or_else(|| {
             StorageError::InvalidSegment("chart history bucket budget overflow".to_owned())
         })?;
-        if bucket_cells > MAX_CHART_BUCKET_CELLS {
+        if bucket_cells > cell_limit {
             return Err(StorageError::InvalidSegment(format!(
-                "chart history exceeds the {MAX_CHART_BUCKET_CELLS} metric-bucket cell limit"
+                "chart history exceeds the {cell_limit} metric-bucket cell limit"
             )));
         }
-        let step_span = u128::from(step_max - step_min) + 1;
-        let bucket_count = usize::try_from(step_span.min(max_buckets as u128))
+        let x_span = u128::from(x_max - x_min) + 1;
+        let bucket_count = usize::try_from(x_span.min(max_buckets as u128))
             .map_err(|_| StorageError::InvalidSegment("chart bucket count overflow".to_owned()))?;
+        let step_viewport = coordinate.step_viewport(x_min, x_max);
         Ok(Self {
             run_id,
             keys: keys.to_vec(),
             first_sequence,
             last_sequence,
-            step_min,
-            step_max,
+            coordinate,
+            x_min,
+            x_max,
+            step_viewport,
             bucket_count,
             source_points: 0,
             metric_source_points: vec![0; keys.len()],
@@ -698,6 +895,7 @@ impl ChartHistorySampler {
                         u32::try_from(bucket_index)
                             .expect("chart bucket count is bounded below u32::MAX"),
                     );
+                    series.last_x.push(bucket.last_x);
                     series.last_step.push(bucket.last_step);
                     series.last_timestamp_ms.push(bucket.last_timestamp_ms);
                     series.minimum.push(bucket.minimum);
@@ -709,8 +907,8 @@ impl ChartHistorySampler {
             .collect();
         ChartHistoryResponse {
             run_id: self.run_id,
-            step_min: Some(self.step_min),
-            step_max: Some(self.step_max),
+            step_min: Some(self.x_min),
+            step_max: Some(self.x_max),
             bucket_count: self.bucket_count,
             source_points: self.source_points,
             source_last_sequence: None,
@@ -722,12 +920,15 @@ impl ChartHistorySampler {
         if sequence < self.first_sequence || sequence > self.last_sequence {
             return;
         }
-        if step < self.step_min || step > self.step_max {
+        let Some(x) = self.coordinate.x(step, timestamp_ms) else {
+            return;
+        };
+        if x < self.x_min || x > self.x_max {
             return;
         }
         let mut observed_row = false;
-        let span = u128::from(self.step_max - self.step_min) + 1;
-        let offset = u128::from(step - self.step_min);
+        let span = u128::from(self.x_max - self.x_min) + 1;
+        let offset = u128::from(x - self.x_min);
         let bucket_index = usize::try_from((offset * self.bucket_count as u128) / span)
             .unwrap_or(self.bucket_count - 1)
             .min(self.bucket_count - 1);
@@ -739,9 +940,9 @@ impl ChartHistorySampler {
             self.metric_source_points[metric_index] =
                 self.metric_source_points[metric_index].saturating_add(1);
             match &mut self.buckets[metric_index][bucket_index] {
-                Some(bucket) => bucket.observe(sequence, step, timestamp_ms, value),
+                Some(bucket) => bucket.observe(sequence, x, step, timestamp_ms, value),
                 slot @ None => {
-                    *slot = Some(ChartBucket::new(sequence, step, timestamp_ms, value));
+                    *slot = Some(ChartBucket::new(sequence, x, step, timestamp_ms, value));
                 }
             }
         }
@@ -1369,6 +1570,49 @@ fn read_segment_chart_extent(
     Ok(())
 }
 
+fn read_segment_chart_axis_extent(
+    path: &Path,
+    scanner: &mut ChartAxisExtentScanner,
+    cancelled: &AtomicBool,
+) -> Result<(), StorageError> {
+    let reader = projected_reader(path, &scanner.keys, PARQUET_BATCH_SIZE)?;
+
+    for batch in reader {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(StorageError::Cancelled);
+        }
+        let batch = batch?;
+        let sequence = required_array::<UInt64Array>(&batch, SEQUENCE_COLUMN)?;
+        let step = required_array::<UInt64Array>(&batch, STEP_COLUMN)?;
+        let timestamp = required_array::<Int64Array>(&batch, TIMESTAMP_COLUMN)?;
+        let metric_columns = scanner
+            .keys
+            .iter()
+            .map(|key| {
+                batch
+                    .column_by_name(&metric_column(key))
+                    .and_then(|column| column.as_any().downcast_ref::<Float64Array>())
+            })
+            .collect::<Vec<_>>();
+        let mut values = Vec::with_capacity(scanner.keys.len());
+        for row_index in 0..batch.num_rows() {
+            values.clear();
+            values.extend(metric_columns.iter().map(|column| {
+                column.and_then(|column| {
+                    (!column.is_null(row_index)).then(|| column.value(row_index))
+                })
+            }));
+            scanner.observe(
+                sequence.value(row_index),
+                step.value(row_index),
+                timestamp.value(row_index),
+                &values,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn read_segment_chart_history(
     path: &Path,
     sampler: &mut ChartHistorySampler,
@@ -1377,8 +1621,7 @@ fn read_segment_chart_history(
     let (reader, row_groups_read, row_groups_pruned) = projected_chart_reader(
         path,
         &sampler.keys,
-        sampler.step_min,
-        sampler.step_max,
+        sampler.step_viewport,
         PARQUET_BATCH_SIZE,
     )?;
     sampler.scan_statistics.row_groups_read = sampler
@@ -1433,8 +1676,7 @@ fn read_segment_chart_history(
 fn projected_chart_reader(
     path: &Path,
     keys: &[String],
-    step_min: u64,
-    step_max: u64,
+    step_viewport: Option<ChartStepExtent>,
     batch_size: usize,
 ) -> Result<(ParquetRecordBatchReader, u64, u64), StorageError> {
     let file = File::open(path).map_err(|source| StorageError::Io {
@@ -1464,12 +1706,15 @@ fn projected_chart_reader(
         .iter()
         .enumerate()
         .filter_map(|(index, row_group)| {
-            row_group_may_overlap_step_range(
-                row_group.column(step_parquet_index).statistics(),
-                step_min,
-                step_max,
-            )
-            .then_some(index)
+            step_viewport
+                .is_none_or(|viewport| {
+                    row_group_may_overlap_step_range(
+                        row_group.column(step_parquet_index).statistics(),
+                        viewport.minimum,
+                        viewport.maximum,
+                    )
+                })
+                .then_some(index)
         })
         .collect::<Vec<_>>();
     let row_groups_read = selected_row_groups.len() as u64;
@@ -1627,9 +1872,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        BlobStore, ChartHistorySampler, ChartStepExtent, ChartStepExtentScanner, CompactionSource,
-        MetricStore, MinMaxHistorySampler, SegmentSource, StorageLayout,
-        row_group_may_overlap_step_range,
+        BlobStore, ChartAxisExtent, ChartAxisExtentScanner, ChartCoordinate, ChartHistorySampler,
+        ChartSamplingSpec, ChartStepExtent, ChartStepExtentScanner, CompactionSource, MetricStore,
+        MinMaxHistorySampler, SegmentSource, StorageLayout, row_group_may_overlap_step_range,
     };
 
     #[test]
@@ -2101,6 +2346,7 @@ mod tests {
         assert_eq!(response.source_points, 7);
         assert_eq!(response.metrics["a"].source_points, 5);
         assert_eq!(response.metrics["a"].bucket, vec![0, 1]);
+        assert_eq!(response.metrics["a"].last_x, vec![4, 5]);
         assert_eq!(response.metrics["a"].last_step, vec![4, 5]);
         assert_eq!(response.metrics["a"].last_timestamp_ms, vec![30, 70]);
         assert_eq!(response.metrics["a"].minimum, vec![-5.0, 15.0]);
@@ -2108,11 +2354,95 @@ mod tests {
         assert_eq!(response.metrics["a"].last, vec![7.0, 15.0]);
         assert_eq!(response.metrics["b"].source_points, 4);
         assert_eq!(response.metrics["b"].bucket, vec![0, 1]);
+        assert_eq!(response.metrics["b"].last_x, vec![0, 5]);
         assert_eq!(response.metrics["b"].last_step, vec![0, 5]);
         assert_eq!(response.metrics["b"].last_timestamp_ms, vec![40, 70]);
         assert_eq!(response.metrics["b"].minimum, vec![50.0, -1.0]);
         assert_eq!(response.metrics["b"].maximum, vec![100.0, 2.0]);
         assert_eq!(response.metrics["b"].last, vec![50.0, 2.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn chart_axis_extents_remain_exact_per_metric() -> Result<(), Box<dyn std::error::Error>> {
+        let keys = ["early".to_owned(), "late".to_owned(), "missing".to_owned()];
+        let mut scanner = ChartAxisExtentScanner::new(&keys, 2, 4)?;
+        for (sequence, step, timestamp_ms, values) in [
+            (1, 1, 10, [Some(1.0), None, None]),
+            (2, 5, 50, [Some(2.0), None, None]),
+            (3, 8, 80, [None, Some(3.0), None]),
+            (4, 3, 100, [Some(4.0), Some(5.0), None]),
+            (5, 20, 200, [None, Some(6.0), None]),
+        ] {
+            scanner.observe(sequence, step, timestamp_ms, &values);
+        }
+
+        let extents = scanner.finish_by_key();
+        assert_eq!(
+            extents["early"],
+            ChartAxisExtent {
+                step_minimum: 3,
+                step_maximum: 5,
+                timestamp_minimum_ms: 50,
+                timestamp_maximum_ms: 100,
+            }
+        );
+        assert_eq!(
+            extents["late"],
+            ChartAxisExtent {
+                step_minimum: 3,
+                step_maximum: 8,
+                timestamp_minimum_ms: 80,
+                timestamp_maximum_ms: 100,
+            }
+        );
+        assert!(!extents.contains_key("missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn aligned_chart_sampling_uses_relative_and_elapsed_lattices()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = RunId::new();
+        let keys = ["loss".to_owned()];
+        for (coordinate, maximum, expected_x) in [
+            (
+                ChartCoordinate::RelativeStep { origin: 100 },
+                20,
+                vec![10, 20],
+            ),
+            (
+                ChartCoordinate::ElapsedTime { origin_ms: 5_000 },
+                2_000,
+                vec![1_000, 2_000],
+            ),
+        ] {
+            let mut sampler = ChartHistorySampler::new_aligned(
+                run_id,
+                &keys,
+                ChartSamplingSpec {
+                    first_sequence: 1,
+                    last_sequence: 3,
+                    coordinate,
+                    x_min: 0,
+                    x_max: maximum,
+                    max_buckets: 2,
+                },
+            )?;
+            for (sequence, step, timestamp_ms, value) in [
+                (1, 100, 5_000, 5.0),
+                (2, 110, 6_000, -2.0),
+                (3, 120, 7_000, 9.0),
+            ] {
+                sampler.observe(sequence, step, timestamp_ms, &[Some(value)]);
+            }
+            let history = sampler.finish();
+            assert_eq!(history.metrics["loss"].bucket, vec![0, 1]);
+            assert_eq!(history.metrics["loss"].last_x, expected_x);
+            assert_eq!(history.metrics["loss"].minimum, vec![-2.0, 9.0]);
+            assert_eq!(history.metrics["loss"].maximum, vec![5.0, 9.0]);
+            assert_eq!(history.metrics["loss"].last, vec![-2.0, 9.0]);
+        }
         Ok(())
     }
 }

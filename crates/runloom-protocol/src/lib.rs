@@ -15,6 +15,9 @@ pub const MAX_HISTORY_KEYS: usize = 32;
 pub const MAX_HISTORY_POINTS: usize = 5_000;
 pub const MAX_CHART_BUCKETS: usize = 2_000;
 pub const MAX_CHART_BUCKET_CELLS: usize = 5_000;
+pub const MAX_CHART_QUERY_RUNS: usize = 32;
+pub const MAX_CHART_QUERY_SERIES: usize = 32;
+pub const MAX_CHART_QUERY_CELLS: usize = 20_000;
 pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
 pub const MAX_SUMMARY_BYTES: usize = 256 * 1024;
 pub const MAX_ALERT_TITLE_BYTES: usize = 256;
@@ -1036,6 +1039,7 @@ pub struct HistoryResponse {
 pub struct ChartMetricHistory {
     pub source_points: u64,
     pub bucket: Vec<u32>,
+    pub last_x: Vec<u64>,
     pub last_step: Vec<u64>,
     pub last_timestamp_ms: Vec<i64>,
     pub minimum: Vec<f64>,
@@ -1052,6 +1056,66 @@ pub struct ChartHistoryResponse {
     pub source_points: u64,
     pub source_last_sequence: Option<u64>,
     pub metrics: BTreeMap<String, ChartMetricHistory>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChartAlignment {
+    Step,
+    RelativeStep,
+    ElapsedTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartSeriesRequest {
+    pub run_id: RunId,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartViewport {
+    pub minimum: u64,
+    pub maximum: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartHistoryQueryRequest {
+    pub series: Vec<ChartSeriesRequest>,
+    pub alignment: ChartAlignment,
+    pub max_buckets: usize,
+    #[serde(default)]
+    pub viewport: Option<ChartViewport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartRunWatermark {
+    pub run_id: RunId,
+    pub source_last_sequence: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChartSeriesHistory {
+    pub run_id: RunId,
+    pub key: String,
+    pub source_points: u64,
+    pub bucket: Vec<u32>,
+    pub last_x: Vec<u64>,
+    pub last_step: Vec<u64>,
+    pub last_timestamp_ms: Vec<i64>,
+    pub minimum: Vec<f64>,
+    pub maximum: Vec<f64>,
+    pub last: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChartHistoryQueryResponse {
+    pub project: String,
+    pub alignment: ChartAlignment,
+    pub x_min: Option<u64>,
+    pub x_max: Option<u64>,
+    pub bucket_count: usize,
+    pub runs: Vec<ChartRunWatermark>,
+    pub series: Vec<ChartSeriesHistory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1075,7 +1139,8 @@ mod tests {
     use std::str::FromStr;
 
     use super::{
-        AlertLevel, HealthResponse, HealthStatus, ProjectId, ResumePolicy, RunId, RunState,
+        AlertLevel, ChartAlignment, HealthResponse, HealthStatus, ProjectId, ResumePolicy, RunId,
+        RunState,
     };
 
     #[test]
@@ -1099,6 +1164,10 @@ mod tests {
         assert_eq!(serde_json::to_string(&ResumePolicy::Must)?, "\"must\"");
         assert_eq!(serde_json::to_string(&RunState::Finished)?, "\"finished\"");
         assert_eq!(serde_json::to_string(&AlertLevel::Warn)?, "\"warn\"");
+        assert_eq!(
+            serde_json::to_string(&ChartAlignment::RelativeStep)?,
+            "\"relative_step\""
+        );
         Ok(())
     }
 }

@@ -4,8 +4,10 @@ import {
   artifactArchiveUrl,
   blobUrl,
   artifactFileUrl,
+  comparisonSeriesHistory,
   getAlerts,
   getChartHistory,
+  getComparisonChartHistory,
   getHealth,
   getHistory,
   getReports,
@@ -139,6 +141,7 @@ describe("getHealth", () => {
         "train/loss": {
           source_points: 4,
           bucket: [0, 511],
+          last_x: [10, 20],
           last_step: [10, 20],
           last_timestamp_ms: [100, 200],
           minimum: [0.5, 0.25],
@@ -161,6 +164,74 @@ describe("getHealth", () => {
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/api/v1/runs/run%2Fid/chart-history?key=train%2Floss&key=comma%2Ckey&key=reward+%2B+bonus&max_buckets=512&step_min=10&step_max=20",
     );
+  });
+
+  it("posts a bounded multi-metric comparison and maps one series for the chart", async () => {
+    const comparison = {
+      project: "robot learning",
+      alignment: "relative_step",
+      x_min: 0,
+      x_max: 10,
+      bucket_count: 256,
+      runs: [{ run_id: "run-a", source_last_sequence: 42 }],
+      series: [
+        {
+          run_id: "run-a",
+          key: "train/loss",
+          source_points: 2,
+          bucket: [0, 255],
+          last_x: [0, 10],
+          last_step: [100, 110],
+          last_timestamp_ms: [1_000, 2_000],
+          minimum: [0.5, 0.25],
+          maximum: [1, 0.5],
+          last: [0.75, 0.3],
+        },
+      ],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(comparison), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await getComparisonChartHistory(
+      "robot learning",
+      [
+        { run_id: "run-a", key: "train/loss" },
+        { run_id: "run-b", key: "train/loss" },
+        { run_id: "run-a", key: "train/reward" },
+      ],
+      {
+        alignment: "relative_step",
+        maxBuckets: 256,
+        viewport: { minimum: 0, maximum: 10 },
+      },
+    );
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/v1/projects/robot%20learning/chart-history/query",
+    );
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      series: [
+        { run_id: "run-a", key: "train/loss" },
+        { run_id: "run-b", key: "train/loss" },
+        { run_id: "run-a", key: "train/reward" },
+      ],
+      alignment: "relative_step",
+      max_buckets: 256,
+      viewport: { minimum: 0, maximum: 10 },
+    });
+    expect(comparisonSeriesHistory(result, "run-a", "train/loss")).toMatchObject({
+      run_id: "run-a",
+      step_min: 0,
+      step_max: 10,
+      source_last_sequence: 42,
+      metrics: { "train/loss": { last_x: [0, 10], last_step: [100, 110] } },
+    });
   });
 
   it("loads a bounded alert page", async () => {

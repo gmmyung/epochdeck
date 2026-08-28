@@ -6,7 +6,7 @@ pub use compaction::{CompactionConfig, MetricRuntime, run_compaction_worker};
 #[cfg(test)]
 use compaction::{CompactionOutcome, compact_once};
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -30,15 +30,17 @@ use runloom_catalog::{
 use runloom_protocol::{
     AlertId, AlertListResponse, ApiError, ArtifactId, ArtifactLineageResponse,
     ArtifactListResponse, ArtifactRecord, ArtifactRelation, BlobRef, BlobUploadResponse,
-    ChartHistoryResponse, ChartMetricHistory, ClaimSweepTrialRequest, ClaimSweepTrialResponse,
-    CompleteSweepTrialRequest, ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse,
-    CreateArtifactRequest, CreateArtifactResponse, CreateReportRequest, CreateReportResponse,
-    CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest, CreateRunResponse,
-    CreateSweepRequest, CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse,
-    DiagnosticsResponse, FinishRunRequest, FinishRunResponse, HealthResponse, HistoryResponse,
-    IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES,
-    MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS, MAX_CHART_BUCKET_CELLS,
-    MAX_CHART_BUCKETS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS, MAX_HISTORY_POINTS,
+    ChartAlignment, ChartHistoryQueryRequest, ChartHistoryQueryResponse, ChartHistoryResponse,
+    ChartMetricHistory, ChartRunWatermark, ChartSeriesHistory, ClaimSweepTrialRequest,
+    ClaimSweepTrialResponse, CompleteSweepTrialRequest, ConfigUpdateRequest, CreateAlertRequest,
+    CreateAlertResponse, CreateArtifactRequest, CreateArtifactResponse, CreateReportRequest,
+    CreateReportResponse, CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest,
+    CreateRunResponse, CreateSweepRequest, CreateSweepResponse, CreateTraceSpanRequest,
+    CreateTraceSpanResponse, DiagnosticsResponse, FinishRunRequest, FinishRunResponse,
+    HealthResponse, HistoryResponse, IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES,
+    MAX_ALERT_TITLE_BYTES, MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS,
+    MAX_CHART_BUCKET_CELLS, MAX_CHART_BUCKETS, MAX_CHART_QUERY_CELLS, MAX_CHART_QUERY_RUNS,
+    MAX_CHART_QUERY_SERIES, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS, MAX_HISTORY_POINTS,
     MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES,
     MAX_TRACE_METADATA_BYTES, MetricKeyListResponse, ProjectListResponse, ReportId, ReportLayout,
     ReportListResponse, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId, RichValueKind,
@@ -49,8 +51,9 @@ use runloom_protocol::{
     UseArtifactRequest,
 };
 use runloom_storage::{
-    BlobStore, ChartHistorySampler, ChartStepExtent, ChartStepExtentScanner, MetricStore,
-    MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
+    BlobStore, ChartAxisExtent, ChartAxisExtentScanner, ChartCoordinate, ChartHistorySampler,
+    ChartSamplingSpec, ChartStepExtent, ChartStepExtentScanner, MetricStore, MinMaxHistorySampler,
+    SegmentSource, SegmentTail, StorageError,
 };
 #[cfg(feature = "embedded-dashboard")]
 use rust_embed::RustEmbed;
@@ -94,6 +97,11 @@ const DEFAULT_SLOW_REQUEST_MS: u64 = 1_000;
 const MAX_RECENT_SLOW_REQUESTS: usize = 64;
 const MAX_DIAGNOSTIC_PATH_BYTES: usize = 512;
 const DEFAULT_CHART_BUCKETS: usize = 1_000;
+const CHART_SERIES_CACHE_MAX_ENTRIES: usize = 512;
+const CHART_SERIES_CACHE_MAX_CELLS: usize = 250_000;
+const CHART_SERIES_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const CHART_AXIS_EXTENT_CACHE_MAX_ENTRIES: usize = 2_048;
+const CHART_AXIS_EXTENT_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct AppState {
@@ -103,7 +111,225 @@ struct AppState {
     ingest_permits: Arc<Semaphore>,
     query_permits: Arc<Semaphore>,
     artifact_download_permits: Arc<Semaphore>,
+    chart_series_cache: Arc<Mutex<ChartSeriesCache>>,
+    chart_axis_extent_cache: Arc<Mutex<ChartAxisExtentCache>>,
     telemetry: Arc<RequestTelemetry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ChartAxisExtentCacheKey {
+    run_id: RunId,
+    key: String,
+    source_first_sequence: u64,
+    source_last_sequence: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedChartAxisExtent {
+    extent: Option<ChartAxisExtent>,
+    bytes: usize,
+    last_used: u64,
+}
+
+#[derive(Debug, Default)]
+struct ChartAxisExtentCache {
+    entries: HashMap<ChartAxisExtentCacheKey, CachedChartAxisExtent>,
+    bytes: usize,
+    clock: u64,
+    #[cfg(test)]
+    scans: u64,
+}
+
+impl ChartAxisExtentCache {
+    fn get(&mut self, key: &ChartAxisExtentCacheKey) -> Option<Option<ChartAxisExtent>> {
+        self.clock = self.clock.saturating_add(1);
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = self.clock;
+        Some(entry.extent)
+    }
+
+    fn insert(&mut self, key: ChartAxisExtentCacheKey, extent: Option<ChartAxisExtent>) {
+        let bytes = std::mem::size_of::<ChartAxisExtentCacheKey>()
+            .saturating_add(std::mem::size_of::<CachedChartAxisExtent>())
+            .saturating_add(key.key.capacity());
+        if bytes > CHART_AXIS_EXTENT_CACHE_MAX_BYTES {
+            return;
+        }
+        self.remove(&key);
+        self.clock = self.clock.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.insert(
+            key,
+            CachedChartAxisExtent {
+                extent,
+                bytes,
+                last_used: self.clock,
+            },
+        );
+        while self.entries.len() > CHART_AXIS_EXTENT_CACHE_MAX_ENTRIES
+            || self.bytes > CHART_AXIS_EXTENT_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, key: &ChartAxisExtentCacheKey) {
+        if let Some(removed) = self.entries.remove(key) {
+            self.bytes = self.bytes.saturating_sub(removed.bytes);
+        }
+    }
+
+    #[cfg(test)]
+    fn record_scan(&mut self) {
+        self.scans = self.scans.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    fn scan_count(&self) -> u64 {
+        self.scans
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CachedChartOrigin {
+    Step,
+    RelativeStep(u64),
+    ElapsedTime(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ChartSeriesCacheKey {
+    run_id: RunId,
+    key: String,
+    source_last_sequence: u64,
+    alignment: ChartAlignment,
+    origin: CachedChartOrigin,
+    x_min: u64,
+    x_max: u64,
+    max_buckets: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedChartSeries {
+    history: ChartMetricHistory,
+    cells: usize,
+    bytes: usize,
+    last_used: u64,
+}
+
+#[derive(Debug, Default)]
+struct ChartSeriesCache {
+    entries: HashMap<ChartSeriesCacheKey, CachedChartSeries>,
+    cells: usize,
+    bytes: usize,
+    clock: u64,
+}
+
+impl ChartSeriesCache {
+    fn get(&mut self, key: &ChartSeriesCacheKey) -> Option<ChartMetricHistory> {
+        self.clock = self.clock.saturating_add(1);
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = self.clock;
+        Some(entry.history.clone())
+    }
+
+    fn insert(&mut self, key: ChartSeriesCacheKey, history: ChartMetricHistory) {
+        let cells = history.bucket.len();
+        let bytes = chart_series_cache_bytes(&key, &history);
+        if cells > CHART_SERIES_CACHE_MAX_CELLS || bytes > CHART_SERIES_CACHE_MAX_BYTES {
+            return;
+        }
+        self.remove(&key);
+        self.clock = self.clock.saturating_add(1);
+        self.cells = self.cells.saturating_add(cells);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.insert(
+            key,
+            CachedChartSeries {
+                history,
+                cells,
+                bytes,
+                last_used: self.clock,
+            },
+        );
+        while self.entries.len() > CHART_SERIES_CACHE_MAX_ENTRIES
+            || self.cells > CHART_SERIES_CACHE_MAX_CELLS
+            || self.bytes > CHART_SERIES_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, key: &ChartSeriesCacheKey) {
+        if let Some(removed) = self.entries.remove(key) {
+            self.cells = self.cells.saturating_sub(removed.cells);
+            self.bytes = self.bytes.saturating_sub(removed.bytes);
+        }
+    }
+}
+
+fn chart_series_cache_bytes(key: &ChartSeriesCacheKey, history: &ChartMetricHistory) -> usize {
+    std::mem::size_of::<ChartSeriesCacheKey>()
+        .saturating_add(std::mem::size_of::<CachedChartSeries>())
+        .saturating_add(key.key.capacity())
+        .saturating_add(
+            history
+                .bucket
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u32>()),
+        )
+        .saturating_add(
+            history
+                .last_x
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u64>()),
+        )
+        .saturating_add(
+            history
+                .last_step
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u64>()),
+        )
+        .saturating_add(
+            history
+                .last_timestamp_ms
+                .capacity()
+                .saturating_mul(std::mem::size_of::<i64>()),
+        )
+        .saturating_add(
+            history
+                .minimum
+                .capacity()
+                .saturating_mul(std::mem::size_of::<f64>()),
+        )
+        .saturating_add(
+            history
+                .maximum
+                .capacity()
+                .saturating_mul(std::mem::size_of::<f64>()),
+        )
+        .saturating_add(
+            history
+                .last
+                .capacity()
+                .saturating_mul(std::mem::size_of::<f64>()),
+        )
 }
 
 #[derive(Debug)]
@@ -173,6 +399,20 @@ pub fn app_with_runtime_and_blobs(
     catalog: Catalog,
     metrics: MetricRuntime,
     blobs: BlobStore,
+) -> Router {
+    app_with_axis_extent_cache(
+        catalog,
+        metrics,
+        blobs,
+        Arc::new(Mutex::new(ChartAxisExtentCache::default())),
+    )
+}
+
+fn app_with_axis_extent_cache(
+    catalog: Catalog,
+    metrics: MetricRuntime,
+    blobs: BlobStore,
+    chart_axis_extent_cache: Arc<Mutex<ChartAxisExtentCache>>,
 ) -> Router {
     let telemetry = Arc::new(RequestTelemetry::from_environment());
     let router = Router::new()
@@ -251,6 +491,10 @@ pub fn app_with_runtime_and_blobs(
         .route("/api/v1/blobs/{digest}", put(upload_blob).get(get_blob))
         .route("/api/v1/runs/{run_id}/history", get(history))
         .route("/api/v1/runs/{run_id}/chart-history", get(chart_history))
+        .route(
+            "/api/v1/projects/{project}/chart-history/query",
+            post(query_chart_history),
+        )
         .with_state(AppState {
             catalog,
             metrics,
@@ -258,6 +502,8 @@ pub fn app_with_runtime_and_blobs(
             ingest_permits: Arc::new(Semaphore::new(INGEST_WORKERS)),
             query_permits: Arc::new(Semaphore::new(QUERY_WORKERS)),
             artifact_download_permits: Arc::new(Semaphore::new(ARTIFACT_DOWNLOAD_WORKERS)),
+            chart_series_cache: Arc::new(Mutex::new(ChartSeriesCache::default())),
+            chart_axis_extent_cache,
             telemetry: Arc::clone(&telemetry),
         })
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -331,7 +577,9 @@ async fn record_request(
     let _active_guard = ActiveRequestGuard(Arc::clone(&telemetry));
     let method = request.method().to_string();
     let path = truncate_diagnostic_path(request.uri().path());
-    let history_query = path.ends_with("/history") || path.ends_with("/chart-history");
+    let history_query = path.ends_with("/history")
+        || path.ends_with("/chart-history")
+        || path.ends_with("/chart-history/query");
     let started_at = Instant::now();
     let response = next.run(request).await;
     let elapsed = started_at.elapsed();
@@ -1627,11 +1875,20 @@ struct HistoryQuery {
 }
 
 #[derive(Debug)]
-struct ChartHistoryQuery {
+struct SingleRunChartHistoryQuery {
     keys: Vec<String>,
     max_buckets: Option<usize>,
     step_min: Option<u64>,
     step_max: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ChartRunQueryPlan {
+    run_id: RunId,
+    keys: Vec<String>,
+    first_sequence: Option<u64>,
+    last_sequence: Option<u64>,
+    axis_extent: Option<ChartAxisExtent>,
 }
 
 struct ChartQueryLease {
@@ -1729,6 +1986,407 @@ async fn chart_history(
     let mut response = sampler.finish();
     response.source_last_sequence = source_last_sequence;
     Ok(Json(response))
+}
+
+async fn query_chart_history(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    Json(request): Json<ChartHistoryQueryRequest>,
+) -> Result<Json<ChartHistoryQueryResponse>, HttpError> {
+    validate_project_name(&project)?;
+    validate_chart_history_request(&request)?;
+
+    let mut run_order = Vec::new();
+    let mut keys_by_run = HashMap::<RunId, BTreeSet<String>>::new();
+    for requested in &request.series {
+        if !keys_by_run.contains_key(&requested.run_id) {
+            run_order.push(requested.run_id);
+        }
+        keys_by_run
+            .entry(requested.run_id)
+            .or_default()
+            .insert(requested.key.clone());
+    }
+    for run_id in &run_order {
+        let run = state.catalog.get_run(*run_id).await?;
+        if run.project != project {
+            return Err(HttpError::invalid(format!(
+                "run {run_id} does not belong to project '{project}'"
+            )));
+        }
+    }
+
+    let permit = Arc::clone(&state.query_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
+    let snapshot = state.metrics.read_snapshot().await;
+    let mut lease = ChartQueryLease {
+        _snapshot: snapshot,
+        _permit: permit,
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelChartQueryOnDrop(Arc::clone(&cancelled));
+    let needs_axis_extent = request.viewport.is_none()
+        || matches!(
+            request.alignment,
+            ChartAlignment::RelativeStep | ChartAlignment::ElapsedTime
+        );
+
+    let mut plans = Vec::with_capacity(run_order.len());
+    for run_id in run_order.iter().copied() {
+        let keys = keys_by_run
+            .remove(&run_id)
+            .expect("run order and grouped chart keys stay aligned")
+            .into_iter()
+            .collect::<Vec<_>>();
+        let source_extent = state.catalog.metric_extent(run_id, None).await?;
+        let mut plan = ChartRunQueryPlan {
+            run_id,
+            keys,
+            first_sequence: source_extent.map(|extent| extent.first_sequence),
+            last_sequence: source_extent.map(|extent| extent.last_sequence),
+            axis_extent: None,
+        };
+        if needs_axis_extent {
+            if let Some(extent) = source_extent {
+                let mut missing_keys = Vec::new();
+                {
+                    let mut cache = state
+                        .chart_axis_extent_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for key in &plan.keys {
+                        let cache_key = ChartAxisExtentCacheKey {
+                            run_id,
+                            key: key.clone(),
+                            source_first_sequence: extent.first_sequence,
+                            source_last_sequence: extent.last_sequence,
+                        };
+                        match cache.get(&cache_key) {
+                            Some(Some(cached)) => {
+                                include_axis_extent(&mut plan.axis_extent, cached)
+                            }
+                            Some(None) => {}
+                            None => missing_keys.push(key.clone()),
+                        }
+                    }
+                }
+                if !missing_keys.is_empty() {
+                    let scanner = ChartAxisExtentScanner::new(
+                        &missing_keys,
+                        extent.first_sequence,
+                        extent.last_sequence,
+                    )?;
+                    let (scanner, returned_lease) = scan_chart_axis_extent(
+                        &state,
+                        run_id,
+                        extent.last_sequence,
+                        scanner,
+                        lease,
+                        Arc::clone(&cancelled),
+                    )
+                    .await?;
+                    lease = returned_lease;
+                    let mut scanned = scanner.finish_by_key();
+                    let mut cache = state
+                        .chart_axis_extent_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for key in missing_keys {
+                        let scanned_extent = scanned.remove(&key);
+                        cache.insert(
+                            ChartAxisExtentCacheKey {
+                                run_id,
+                                key,
+                                source_first_sequence: extent.first_sequence,
+                                source_last_sequence: extent.last_sequence,
+                            },
+                            scanned_extent,
+                        );
+                        if let Some(scanned_extent) = scanned_extent {
+                            include_axis_extent(&mut plan.axis_extent, scanned_extent);
+                        }
+                    }
+                }
+            }
+        }
+        plans.push(plan);
+    }
+
+    let x_extent = if let Some(viewport) = request.viewport {
+        Some(ChartStepExtent {
+            minimum: viewport.minimum,
+            maximum: viewport.maximum,
+        })
+    } else {
+        plans.iter().filter_map(|plan| plan.axis_extent).fold(
+            None,
+            |combined: Option<ChartStepExtent>, extent| {
+                let current = aligned_axis_extent(request.alignment, extent);
+                Some(match combined {
+                    Some(combined) => ChartStepExtent {
+                        minimum: combined.minimum.min(current.minimum),
+                        maximum: combined.maximum.max(current.maximum),
+                    },
+                    None => current,
+                })
+            },
+        )
+    };
+    let runs = plans
+        .iter()
+        .map(|plan| ChartRunWatermark {
+            run_id: plan.run_id,
+            source_last_sequence: plan.last_sequence,
+        })
+        .collect::<Vec<_>>();
+    let Some(x_extent) = x_extent else {
+        return Ok(Json(ChartHistoryQueryResponse {
+            project,
+            alignment: request.alignment,
+            x_min: None,
+            x_max: None,
+            bucket_count: 0,
+            runs,
+            series: request
+                .series
+                .into_iter()
+                .map(|requested| empty_chart_series(requested.run_id, requested.key))
+                .collect(),
+        }));
+    };
+    let x_span = u128::from(x_extent.maximum - x_extent.minimum) + 1;
+    let bucket_count = usize::try_from(x_span.min(request.max_buckets as u128))
+        .expect("validated chart bucket count fits usize");
+    let mut sampled = HashMap::<(RunId, String), ChartMetricHistory>::new();
+
+    for plan in &plans {
+        let (Some(first_sequence), Some(last_sequence)) = (plan.first_sequence, plan.last_sequence)
+        else {
+            continue;
+        };
+        let Some((coordinate, origin)) = chart_coordinate(request.alignment, plan.axis_extent)
+        else {
+            continue;
+        };
+        let mut missing_keys = Vec::new();
+        let mut cache_keys = HashMap::new();
+        for key in &plan.keys {
+            let cache_key = ChartSeriesCacheKey {
+                run_id: plan.run_id,
+                key: key.clone(),
+                source_last_sequence: last_sequence,
+                alignment: request.alignment,
+                origin: origin.clone(),
+                x_min: x_extent.minimum,
+                x_max: x_extent.maximum,
+                max_buckets: request.max_buckets,
+            };
+            let cached = state
+                .chart_series_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&cache_key);
+            if let Some(history) = cached {
+                sampled.insert((plan.run_id, key.clone()), history);
+            } else {
+                missing_keys.push(key.clone());
+                cache_keys.insert(key.clone(), cache_key);
+            }
+        }
+        if missing_keys.is_empty() {
+            continue;
+        }
+        let sampler = ChartHistorySampler::new_aligned(
+            plan.run_id,
+            &missing_keys,
+            ChartSamplingSpec {
+                first_sequence,
+                last_sequence,
+                coordinate,
+                x_min: x_extent.minimum,
+                x_max: x_extent.maximum,
+                max_buckets: request.max_buckets,
+            },
+        )?;
+        let (sampler, returned_lease) = sample_chart_history(
+            &state,
+            plan.run_id,
+            last_sequence,
+            sampler,
+            lease,
+            Arc::clone(&cancelled),
+        )
+        .await?;
+        lease = returned_lease;
+        for (key, history) in sampler.finish().metrics {
+            let cache_key = cache_keys
+                .remove(&key)
+                .expect("sampler returns every requested chart metric");
+            state
+                .chart_series_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(cache_key, history.clone());
+            sampled.insert((plan.run_id, key), history);
+        }
+    }
+    drop(lease);
+
+    Ok(Json(ChartHistoryQueryResponse {
+        project,
+        alignment: request.alignment,
+        x_min: Some(x_extent.minimum),
+        x_max: Some(x_extent.maximum),
+        bucket_count,
+        runs,
+        series: request
+            .series
+            .into_iter()
+            .map(|requested| {
+                let history = sampled.remove(&(requested.run_id, requested.key.clone()));
+                match history {
+                    Some(history) => {
+                        chart_series_from_metric(requested.run_id, requested.key, history)
+                    }
+                    None => empty_chart_series(requested.run_id, requested.key),
+                }
+            })
+            .collect(),
+    }))
+}
+
+fn aligned_axis_extent(alignment: ChartAlignment, extent: ChartAxisExtent) -> ChartStepExtent {
+    match alignment {
+        ChartAlignment::Step => ChartStepExtent {
+            minimum: extent.step_minimum,
+            maximum: extent.step_maximum,
+        },
+        ChartAlignment::RelativeStep => ChartStepExtent {
+            minimum: 0,
+            maximum: extent.step_maximum - extent.step_minimum,
+        },
+        ChartAlignment::ElapsedTime => ChartStepExtent {
+            minimum: 0,
+            maximum: u64::try_from(
+                i128::from(extent.timestamp_maximum_ms) - i128::from(extent.timestamp_minimum_ms),
+            )
+            .expect("ordered i64 timestamps have a non-negative u64 difference"),
+        },
+    }
+}
+
+fn include_axis_extent(combined: &mut Option<ChartAxisExtent>, extent: ChartAxisExtent) {
+    *combined = Some(match *combined {
+        Some(combined) => ChartAxisExtent {
+            step_minimum: combined.step_minimum.min(extent.step_minimum),
+            step_maximum: combined.step_maximum.max(extent.step_maximum),
+            timestamp_minimum_ms: combined
+                .timestamp_minimum_ms
+                .min(extent.timestamp_minimum_ms),
+            timestamp_maximum_ms: combined
+                .timestamp_maximum_ms
+                .max(extent.timestamp_maximum_ms),
+        },
+        None => extent,
+    });
+}
+
+fn chart_coordinate(
+    alignment: ChartAlignment,
+    extent: Option<ChartAxisExtent>,
+) -> Option<(ChartCoordinate, CachedChartOrigin)> {
+    match alignment {
+        ChartAlignment::Step => Some((ChartCoordinate::Step, CachedChartOrigin::Step)),
+        ChartAlignment::RelativeStep => extent.map(|extent| {
+            (
+                ChartCoordinate::RelativeStep {
+                    origin: extent.step_minimum,
+                },
+                CachedChartOrigin::RelativeStep(extent.step_minimum),
+            )
+        }),
+        ChartAlignment::ElapsedTime => extent.map(|extent| {
+            (
+                ChartCoordinate::ElapsedTime {
+                    origin_ms: extent.timestamp_minimum_ms,
+                },
+                CachedChartOrigin::ElapsedTime(extent.timestamp_minimum_ms),
+            )
+        }),
+    }
+}
+
+fn chart_series_from_metric(
+    run_id: RunId,
+    key: String,
+    history: ChartMetricHistory,
+) -> ChartSeriesHistory {
+    ChartSeriesHistory {
+        run_id,
+        key,
+        source_points: history.source_points,
+        bucket: history.bucket,
+        last_x: history.last_x,
+        last_step: history.last_step,
+        last_timestamp_ms: history.last_timestamp_ms,
+        minimum: history.minimum,
+        maximum: history.maximum,
+        last: history.last,
+    }
+}
+
+fn empty_chart_series(run_id: RunId, key: String) -> ChartSeriesHistory {
+    chart_series_from_metric(run_id, key, ChartMetricHistory::default())
+}
+
+async fn scan_chart_axis_extent(
+    state: &AppState,
+    run_id: RunId,
+    source_last_sequence: u64,
+    mut scanner: ChartAxisExtentScanner,
+    mut lease: ChartQueryLease,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(ChartAxisExtentScanner, ChartQueryLease), HttpError> {
+    #[cfg(test)]
+    state
+        .chart_axis_extent_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record_scan();
+    let mut segment_cursor = None;
+    loop {
+        let records = state.catalog.list_segments(run_id, segment_cursor).await?;
+        let Some(page_last) = records.last().map(|segment| segment.last_sequence) else {
+            break;
+        };
+        let page_full = records.len() == MAX_SEGMENTS_PER_QUERY;
+        let segments = records
+            .into_iter()
+            .map(|segment| SegmentSource {
+                relative_path: segment.relative_path,
+            })
+            .collect::<Vec<_>>();
+        let metrics = state.metrics.store().clone();
+        let worker_cancelled = Arc::clone(&cancelled);
+        (scanner, lease) = tokio::task::spawn_blocking(move || -> Result<_, StorageError> {
+            scanner.read_segments(&metrics, &segments, &worker_cancelled)?;
+            Ok((scanner, lease))
+        })
+        .await
+        .map_err(|error| HttpError::internal(format!("query worker failed: {error}")))??;
+        if page_last >= source_last_sequence || !page_full {
+            break;
+        }
+        if segment_cursor == Some(page_last) {
+            return Err(HttpError::internal(
+                "chart axis extent cursor did not advance",
+            ));
+        }
+        segment_cursor = Some(page_last);
+    }
+    Ok((scanner, lease))
 }
 
 async fn scan_chart_step_extent(
@@ -2318,7 +2976,7 @@ fn parse_history_keys(value: &str) -> Result<Vec<String>, HttpError> {
     Ok(keys.into_iter().collect())
 }
 
-fn parse_chart_history_query(value: Option<&str>) -> Result<ChartHistoryQuery, HttpError> {
+fn parse_chart_history_query(value: Option<&str>) -> Result<SingleRunChartHistoryQuery, HttpError> {
     let pairs = serde_urlencoded::from_str::<Vec<(String, String)>>(value.unwrap_or_default())
         .map_err(|error| HttpError::invalid(format!("invalid chart history query: {error}")))?;
     let mut keys = BTreeSet::new();
@@ -2351,7 +3009,7 @@ fn parse_chart_history_query(value: Option<&str>) -> Result<ChartHistoryQuery, H
             "chart history queries must request 1 to {MAX_HISTORY_KEYS} metric keys"
         )));
     }
-    Ok(ChartHistoryQuery {
+    Ok(SingleRunChartHistoryQuery {
         keys: keys.into_iter().collect(),
         max_buckets,
         step_min,
@@ -2387,6 +3045,63 @@ fn validate_sample_points(max_points: usize, key_count: usize) -> Result<(), Htt
         return Err(HttpError::invalid(format!(
             "history max_points must be between {minimum} and {MAX_HISTORY_POINTS} for {key_count} requested metric key(s)"
         )));
+    }
+    Ok(())
+}
+
+fn validate_chart_history_request(request: &ChartHistoryQueryRequest) -> Result<(), HttpError> {
+    if request.series.is_empty() || request.series.len() > MAX_CHART_QUERY_SERIES {
+        return Err(HttpError::invalid(format!(
+            "chart history queries must request 1 to {MAX_CHART_QUERY_SERIES} series"
+        )));
+    }
+    let mut keys_by_run = HashMap::<RunId, BTreeSet<&str>>::new();
+    for series in &request.series {
+        if series.key.is_empty()
+            || series.key.len() > MAX_METRIC_KEY_BYTES
+            || series.key.chars().any(char::is_control)
+        {
+            return Err(HttpError::invalid(format!(
+                "chart metric keys must contain 1 to {MAX_METRIC_KEY_BYTES} non-control bytes"
+            )));
+        }
+        if !keys_by_run
+            .entry(series.run_id)
+            .or_default()
+            .insert(&series.key)
+        {
+            return Err(HttpError::invalid(format!(
+                "chart series ({}, '{}') is repeated",
+                series.run_id, series.key
+            )));
+        }
+    }
+    if keys_by_run.len() > MAX_CHART_QUERY_RUNS {
+        return Err(HttpError::invalid(format!(
+            "chart history queries may include at most {MAX_CHART_QUERY_RUNS} runs"
+        )));
+    }
+    let cells = request
+        .max_buckets
+        .checked_mul(request.series.len())
+        .ok_or_else(|| HttpError::invalid("chart history bucket budget overflow"))?;
+    if request.max_buckets == 0
+        || request.max_buckets > MAX_CHART_BUCKETS
+        || cells > MAX_CHART_QUERY_CELLS
+    {
+        let maximum = MAX_CHART_BUCKETS.min(MAX_CHART_QUERY_CELLS / request.series.len());
+        return Err(HttpError::invalid(format!(
+            "chart history max_buckets must be between 1 and {maximum} for {} requested series",
+            request.series.len()
+        )));
+    }
+    if request
+        .viewport
+        .is_some_and(|viewport| viewport.minimum > viewport.maximum)
+    {
+        return Err(HttpError::invalid(
+            "chart history viewport minimum must not exceed maximum",
+        ));
     }
     Ok(())
 }
@@ -2729,8 +3444,8 @@ impl From<StorageError> for HttpError {
 mod tests {
     use std::collections::BTreeMap;
     use std::io::{Cursor, Read};
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use axum::body::{Body, to_bytes};
@@ -2738,29 +3453,110 @@ mod tests {
     use runloom_catalog::Catalog;
     use runloom_protocol::{
         AlertId, AlertLevel, AlertListResponse, ArtifactEntry, ArtifactListResponse, BlobRef,
-        BlobUploadResponse, ChartHistoryResponse, ClaimSweepTrialRequest, ClaimSweepTrialResponse,
-        CompleteSweepTrialRequest, ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse,
-        CreateArtifactRequest, CreateArtifactResponse, CreateReportRequest, CreateReportResponse,
-        CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest, CreateRunResponse,
-        CreateSweepRequest, CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse,
-        DiagnosticsResponse, EarlyTerminateConfig, FinishRunRequest, FinishRunResponse,
-        HealthResponse, HealthStatus, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
-        MetricGoal, MetricKeyListResponse, MetricPoint, ProjectListResponse, ReportLayout,
-        ReportListResponse, ReportPanel, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId,
-        RichValueKind, RichValueListResponse, RunArtifactListResponse, RunListResponse,
-        RunQueryRequest, RunQueryResponse, RunState, RunUpdateResponse, SummaryUpdateRequest,
-        SweepMethod, SweepMetric, SweepParameter, SweepTrialListResponse, SweepTrialState,
-        TraceKind, TraceSpanId, TraceSpanListResponse, TraceSpanRecord, TraceStatus,
-        UpdateReportRequest, UseArtifactRequest,
+        BlobUploadResponse, ChartAlignment, ChartHistoryQueryRequest, ChartHistoryQueryResponse,
+        ChartHistoryResponse, ChartMetricHistory, ChartSeriesRequest, ChartViewport,
+        ClaimSweepTrialRequest, ClaimSweepTrialResponse, CompleteSweepTrialRequest,
+        ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse, CreateArtifactRequest,
+        CreateArtifactResponse, CreateReportRequest, CreateReportResponse, CreateRichValueRequest,
+        CreateRichValueResponse, CreateRunRequest, CreateRunResponse, CreateSweepRequest,
+        CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse, DiagnosticsResponse,
+        EarlyTerminateConfig, FinishRunRequest, FinishRunResponse, HealthResponse, HealthStatus,
+        HistoryResponse, IngestBatchRequest, IngestBatchResponse, MetricGoal,
+        MetricKeyListResponse, MetricPoint, ProjectListResponse, ReportLayout, ReportListResponse,
+        ReportPanel, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId, RichValueKind,
+        RichValueListResponse, RunArtifactListResponse, RunId, RunListResponse, RunQueryRequest,
+        RunQueryResponse, RunState, RunUpdateResponse, SummaryUpdateRequest, SweepMethod,
+        SweepMetric, SweepParameter, SweepTrialListResponse, SweepTrialState, TraceKind,
+        TraceSpanId, TraceSpanListResponse, TraceSpanRecord, TraceStatus, UpdateReportRequest,
+        UseArtifactRequest,
     };
-    use runloom_storage::MetricStore;
+    use runloom_storage::{BlobStore, ChartAxisExtent, MetricStore};
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
     use tower::ServiceExt;
 
     use super::{
-        CompactionConfig, CompactionOutcome, MetricRuntime, app, app_with_runtime, compact_once,
+        CHART_AXIS_EXTENT_CACHE_MAX_ENTRIES, CHART_SERIES_CACHE_MAX_ENTRIES, CachedChartOrigin,
+        ChartAxisExtentCache, ChartAxisExtentCacheKey, ChartSeriesCache, ChartSeriesCacheKey,
+        CompactionConfig, CompactionOutcome, MetricRuntime, app, app_with_axis_extent_cache,
+        app_with_runtime, compact_once,
     };
+
+    #[test]
+    fn chart_axis_extent_cache_is_bounded_and_caches_missing_metrics() {
+        let run_id = RunId::new();
+        let keys = (0..=CHART_AXIS_EXTENT_CACHE_MAX_ENTRIES)
+            .map(|index| ChartAxisExtentCacheKey {
+                run_id,
+                key: format!("metric-{index}"),
+                source_first_sequence: 1,
+                source_last_sequence: 10,
+            })
+            .collect::<Vec<_>>();
+        let mut cache = ChartAxisExtentCache::default();
+        for (index, key) in keys
+            .iter()
+            .take(CHART_AXIS_EXTENT_CACHE_MAX_ENTRIES)
+            .enumerate()
+        {
+            cache.insert(
+                key.clone(),
+                (index != 0).then_some(ChartAxisExtent {
+                    step_minimum: index as u64,
+                    step_maximum: index as u64 + 1,
+                    timestamp_minimum_ms: index as i64,
+                    timestamp_maximum_ms: index as i64 + 1,
+                }),
+            );
+        }
+        assert_eq!(cache.get(&keys[0]), Some(None));
+        cache.insert(
+            keys[CHART_AXIS_EXTENT_CACHE_MAX_ENTRIES].clone(),
+            Some(ChartAxisExtent {
+                step_minimum: 0,
+                step_maximum: 1,
+                timestamp_minimum_ms: 0,
+                timestamp_maximum_ms: 1,
+            }),
+        );
+        assert!(cache.get(&keys[0]).is_some());
+        assert!(cache.get(&keys[1]).is_none());
+        assert!(cache.entries.len() <= CHART_AXIS_EXTENT_CACHE_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn chart_series_cache_is_bounded_and_updates_recency() {
+        let mut cache = ChartSeriesCache::default();
+        let keys = (0..=CHART_SERIES_CACHE_MAX_ENTRIES)
+            .map(|index| ChartSeriesCacheKey {
+                run_id: RunId::new(),
+                key: format!("metric-{index}"),
+                source_last_sequence: 1,
+                alignment: ChartAlignment::Step,
+                origin: CachedChartOrigin::Step,
+                x_min: 0,
+                x_max: 1,
+                max_buckets: 2,
+            })
+            .collect::<Vec<_>>();
+        for key in keys.iter().take(CHART_SERIES_CACHE_MAX_ENTRIES) {
+            cache.insert(key.clone(), ChartMetricHistory::default());
+        }
+        assert!(cache.get(&keys[0]).is_some());
+        cache.insert(
+            keys[CHART_SERIES_CACHE_MAX_ENTRIES].clone(),
+            ChartMetricHistory::default(),
+        );
+
+        assert_eq!(cache.entries.len(), CHART_SERIES_CACHE_MAX_ENTRIES);
+        assert!(cache.entries.contains_key(&keys[0]));
+        assert!(!cache.entries.contains_key(&keys[1]));
+        assert!(
+            cache
+                .entries
+                .contains_key(&keys[CHART_SERIES_CACHE_MAX_ENTRIES])
+        );
+    }
 
     #[tokio::test]
     async fn health_checks_the_catalog() -> Result<(), Box<dyn std::error::Error>> {
@@ -3422,6 +4218,335 @@ mod tests {
                     ))
                     .body(Body::empty())?,
                 )
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_chart_history_overlays_runs_on_a_shared_sparse_axis()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let axis_extent_cache = Arc::new(Mutex::new(ChartAxisExtentCache::default()));
+        let router = app_with_axis_extent_cache(
+            catalog,
+            MetricRuntime::new(MetricStore::new(directory.path().join("metrics"))),
+            BlobStore::new(directory.path().join("blobs")),
+            Arc::clone(&axis_extent_cache),
+        );
+        let create_run = |name: &str| CreateRunRequest {
+            id: None,
+            name: Some(name.to_owned()),
+            config: BTreeMap::new(),
+            resume: ResumePolicy::Never,
+            sweep_trial_id: None,
+        };
+        let first: CreateRunResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/compare/runs",
+                    &create_run("first"),
+                )?)
+                .await?,
+        )
+        .await?;
+        let second: CreateRunResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/compare/runs",
+                    &create_run("second"),
+                )?)
+                .await?,
+        )
+        .await?;
+        let foreign: CreateRunResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/other/runs",
+                    &create_run("foreign"),
+                )?)
+                .await?,
+        )
+        .await?;
+
+        for (run_id, steps, timestamps, losses) in [
+            (
+                first.run.id,
+                [10, 20, 30],
+                [1_000, 2_000, 3_000],
+                [1.0, 2.0, 3.0],
+            ),
+            (
+                second.run.id,
+                [100, 110, 120],
+                [5_000, 6_000, 7_000],
+                [4.0, 5.0, 6.0],
+            ),
+        ] {
+            let points = (0..3)
+                .map(|index| {
+                    let mut metrics = BTreeMap::from([("loss".to_owned(), losses[index])]);
+                    if run_id == first.run.id && index != 1 {
+                        metrics.insert("sparse".to_owned(), (index + 10) as f64);
+                    }
+                    MetricPoint {
+                        sequence: index as u64 + 1,
+                        step: steps[index],
+                        timestamp_ms: timestamps[index],
+                        metrics,
+                    }
+                })
+                .collect();
+            let response = router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("/api/v1/runs/{run_id}/batches"),
+                    &IngestBatchRequest {
+                        batch_sequence: 1,
+                        points,
+                    },
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let series = vec![
+            ChartSeriesRequest {
+                run_id: first.run.id,
+                key: "loss".to_owned(),
+            },
+            ChartSeriesRequest {
+                run_id: second.run.id,
+                key: "loss".to_owned(),
+            },
+            ChartSeriesRequest {
+                run_id: first.run.id,
+                key: "sparse".to_owned(),
+            },
+        ];
+        let query = ChartHistoryQueryRequest {
+            series: series.clone(),
+            alignment: ChartAlignment::Step,
+            max_buckets: 2,
+            viewport: None,
+        };
+        let absolute: ChartHistoryQueryResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/compare/chart-history/query",
+                    &query,
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(
+            axis_extent_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .scan_count(),
+            2
+        );
+        assert_eq!((absolute.x_min, absolute.x_max), (Some(10), Some(120)));
+        assert_eq!(absolute.bucket_count, 2);
+        assert_eq!(absolute.runs.len(), 2);
+        assert!(
+            absolute
+                .runs
+                .iter()
+                .all(|run| run.source_last_sequence == Some(3))
+        );
+        assert_eq!(absolute.series[0].bucket, vec![0]);
+        assert_eq!(absolute.series[0].minimum, vec![1.0]);
+        assert_eq!(absolute.series[0].maximum, vec![3.0]);
+        assert_eq!(absolute.series[0].last, vec![3.0]);
+        assert_eq!(absolute.series[0].last_x, vec![30]);
+        assert_eq!(absolute.series[1].bucket, vec![1]);
+        assert_eq!(absolute.series[1].last_x, vec![120]);
+        assert_eq!(absolute.series[2].bucket, vec![0]);
+        assert_eq!(absolute.series[2].minimum, vec![10.0]);
+        assert_eq!(absolute.series[2].maximum, vec![12.0]);
+
+        let replay: ChartHistoryQueryResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/compare/chart-history/query",
+                    &query,
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(replay, absolute);
+        assert_eq!(
+            axis_extent_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .scan_count(),
+            2,
+            "a natural-range replay must reuse cached per-key axis extents"
+        );
+
+        for alignment in [ChartAlignment::RelativeStep, ChartAlignment::ElapsedTime] {
+            let aligned: ChartHistoryQueryResponse = response_json(
+                router
+                    .clone()
+                    .oneshot(json_request(
+                        "POST",
+                        "/api/v1/projects/compare/chart-history/query",
+                        &ChartHistoryQueryRequest {
+                            series: series[..2].to_vec(),
+                            alignment,
+                            max_buckets: 2,
+                            viewport: None,
+                        },
+                    )?)
+                    .await?,
+            )
+            .await?;
+            if alignment == ChartAlignment::RelativeStep {
+                assert_eq!((aligned.x_min, aligned.x_max), (Some(0), Some(20)));
+                assert_eq!(aligned.series[0].last_x, vec![10, 20]);
+                assert_eq!(aligned.series[1].last_x, vec![10, 20]);
+            } else {
+                assert_eq!((aligned.x_min, aligned.x_max), (Some(0), Some(2_000)));
+                assert_eq!(aligned.series[0].last_x, vec![1_000, 2_000]);
+                assert_eq!(aligned.series[1].last_x, vec![1_000, 2_000]);
+            }
+            assert_eq!(aligned.series[0].bucket, vec![0, 1]);
+            assert_eq!(aligned.series[1].bucket, vec![0, 1]);
+        }
+
+        let viewport: ChartHistoryQueryResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/compare/chart-history/query",
+                    &ChartHistoryQueryRequest {
+                        series: series[..2].to_vec(),
+                        alignment: ChartAlignment::RelativeStep,
+                        max_buckets: 3,
+                        viewport: Some(ChartViewport {
+                            minimum: 5,
+                            maximum: 15,
+                        }),
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(viewport.bucket_count, 3);
+        assert_eq!(viewport.series[0].bucket, vec![1]);
+        assert_eq!(viewport.series[0].last_x, vec![10]);
+        assert_eq!(viewport.series[1].last_x, vec![10]);
+
+        let update = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{}/batches", first.run.id),
+                &IngestBatchRequest {
+                    batch_sequence: 2,
+                    points: vec![MetricPoint {
+                        sequence: 4,
+                        step: 40,
+                        timestamp_ms: 4_000,
+                        metrics: BTreeMap::from([("loss".to_owned(), -100.0)]),
+                    }],
+                },
+            )?)
+            .await?;
+        assert_eq!(update.status(), StatusCode::CREATED);
+        let refreshed: ChartHistoryQueryResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/compare/chart-history/query",
+                    &query,
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(refreshed.series[0].minimum, vec![-100.0]);
+        assert_eq!(refreshed.series[0].last, vec![-100.0]);
+        assert_eq!(refreshed.series[1], absolute.series[1]);
+        assert_eq!(refreshed.runs[0].source_last_sequence, Some(4));
+        assert_eq!(refreshed.runs[1].source_last_sequence, Some(3));
+        assert_eq!(
+            axis_extent_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .scan_count(),
+            3,
+            "only the run with a new sequence watermark should rescan extents"
+        );
+
+        let foreign_response = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/v1/projects/compare/chart-history/query",
+                &ChartHistoryQueryRequest {
+                    series: vec![ChartSeriesRequest {
+                        run_id: foreign.run.id,
+                        key: "loss".to_owned(),
+                    }],
+                    alignment: ChartAlignment::Step,
+                    max_buckets: 10,
+                    viewport: None,
+                },
+            )?)
+            .await?;
+        assert_eq!(foreign_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        for invalid in [
+            ChartHistoryQueryRequest {
+                series: vec![series[0].clone(), series[0].clone()],
+                alignment: ChartAlignment::Step,
+                max_buckets: 10,
+                viewport: None,
+            },
+            ChartHistoryQueryRequest {
+                series: series[..2].to_vec(),
+                alignment: ChartAlignment::Step,
+                max_buckets: 2_000,
+                viewport: Some(ChartViewport {
+                    minimum: 2,
+                    maximum: 1,
+                }),
+            },
+            ChartHistoryQueryRequest {
+                series: (0..32)
+                    .map(|index| ChartSeriesRequest {
+                        run_id: first.run.id,
+                        key: format!("metric-{index}"),
+                    })
+                    .collect(),
+                alignment: ChartAlignment::Step,
+                max_buckets: 626,
+                viewport: None,
+            },
+        ] {
+            let response = router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/compare/chart-history/query",
+                    &invalid,
+                )?)
                 .await?;
             assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         }
