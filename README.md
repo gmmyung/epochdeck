@@ -252,13 +252,16 @@ uv run --project python --with wandb runloom import-wandb gyungmin bello-mujoco 
 ```
 
 The importer derives stable Runloom IDs from W&B run paths and sends scalar
-history in deterministic batches. A response lost after commit is replayed
-exactly; completed runs are skipped on the next invocation. W&B run files,
-including media and checkpoints, are streamed into CAS and retained as
-versioned artifacts. Unsupported non-scalar history cells are counted in the
-imported summary rather than silently presented as scalar metrics. W&B registry
-artifact lineage and native reconstruction of W&B media-history references are
-not part of this first importer surface.
+history in deterministic batches. Sparse high-step histories adapt their scan
+window to avoid issuing millions of empty W&B requests. A response lost after
+commit is replayed exactly; completed runs are skipped on the next invocation.
+W&B run files and logged artifacts, including checkpoints, are streamed into
+CAS with durable progress and a fixed four-artifact transfer window. Image,
+audio, and video history references become native Runloom rich values while
+their original files remain preserved.
+Unsupported non-scalar history cells are counted in the imported summary rather
+than silently presented as scalar metrics. W&B registry-wide and input-artifact
+lineage remain outside this importer surface.
 
 Create a complete portable project bundle:
 

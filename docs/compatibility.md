@@ -137,13 +137,15 @@ safe headings, paragraphs, lists, and fenced code. Arbitrary W&B report blocks,
 inline rich text, collaborative editing, and hosted sharing semantics remain
 outside the current partial surface.
 
-The W&B importer scans runs lazily with one to sixteen bounded workers. Stable
-target IDs, deterministic metric batches, and an fsynced atomic checkpoint make
-lost-response replay and whole-process restart safe. Scalar histories, config,
-summary, source metadata, and W&B run files are retained; run files become
-versioned CAS-backed artifacts. Unsupported history values are counted in each
-imported summary. W&B registry artifact lineage and conversion of media-history
-references into native Runloom rich rows remain outside this partial importer.
+The W&B importer scans runs lazily with one to sixteen bounded workers. Its
+history window adapts to sparse, high-valued step domains rather than walking
+empty fixed-size ranges. Stable run, batch, rich-value, and artifact identities
+plus an fsynced checkpoint make retries resumable and idempotent after ambiguous
+responses. Scalar history, config, final source summary, source metadata, W&B
+run files, and logged output artifacts are retained in CAS. Image, audio, and
+video history references become native Runloom rich rows. Unsupported history
+cells are counted in the final imported summary. Registry-wide and input
+artifact lineage remain outside this partial importer.
 
 Runloom project exports are lossless for the current supported Runloom surface.
 They cursor-scan full-resolution metric columns and every paginated metadata

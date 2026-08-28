@@ -21,9 +21,19 @@ _CHECKPOINT_VERSION = 1
 _MAX_IMPORT_RUNS = 100_000
 _MAX_CHECKPOINT_BYTES = 64 * 1024 * 1024
 _MAX_WORKERS = 16
+_ARTIFACT_WORKERS = 4
 _METRIC_BATCH_SIZE = 512
+_METRIC_BATCH_BYTES = 1_750_000
 _FILE_CHUNK_SIZE = 64
+_MAX_ARTIFACT_FILES = 10_000
 _HASH_CHUNK_BYTES = 1024 * 1024
+_MIN_HISTORY_PAGE_SIZE = 1_000
+_TARGET_HISTORY_PAGE_COUNT = 256
+_MEDIA_KINDS = {
+    "audio-file": "audio",
+    "image-file": "image",
+    "video-file": "video",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +155,7 @@ def _import_one_run(
         "run_id": source_id,
         "url": str(getattr(source, "url", "")),
     }
-    config = _json_document(dict(getattr(source, "config", {}) or {}), "W&B config")
+    config = _wandb_document(getattr(source, "config", {}) or {}, "W&B config")
     if "_runloom_wandb_source" in config:
         raise WandbImportError("W&B config uses reserved key '_runloom_wandb_source'")
     config["_runloom_wandb_source"] = source_metadata
@@ -186,34 +196,71 @@ def _import_one_run(
     next_sequence = _state_int(state, "next_sequence", 1)
     unsupported_values = _state_int(state, "unsupported_values", 0)
     batch: list[dict[str, Any]] = []
+    batch_bytes = 0
     batch_rows_end = rows_committed
     scanned_rows = 0
 
-    history = source.scan_history(page_size=1_000)
+    history = source.scan_history(page_size=_history_page_size(source))
     for row_index, raw_row in enumerate(history):
         scanned_rows = row_index + 1
         if scanned_rows <= rows_committed:
             continue
         if not isinstance(raw_row, Mapping):
             raise WandbImportError("W&B history yielded a non-object row")
-        metrics, skipped_values = _history_metrics(raw_row)
-        unsupported_values += skipped_values
+        metrics, media, skipped_values = _history_values(raw_row)
+        step = _history_step(raw_row, row_index)
+        timestamp_ms = _history_timestamp_ms(raw_row, row_index)
+        if include_files:
+            for key, kind, reference in media:
+                _import_media_reference(
+                    source,
+                    client,
+                    run_id=run_id,
+                    source_metadata=source_metadata,
+                    key=key,
+                    kind=kind,
+                    step=step,
+                    timestamp_ms=timestamp_ms,
+                    reference=reference,
+                )
+        else:
+            skipped_values += len(media)
         if metrics:
             sequence = next_sequence + len(batch)
-            batch.append(
-                {
-                    "sequence": sequence,
-                    "step": _history_step(raw_row, row_index),
-                    "timestamp_ms": _history_timestamp_ms(raw_row, row_index),
-                    "metrics": metrics,
-                }
-            )
+            point = {
+                "sequence": sequence,
+                "step": step,
+                "timestamp_ms": timestamp_ms,
+                "metrics": metrics,
+            }
+            point_bytes = _json_size(point) + 1
+            if point_bytes > _METRIC_BATCH_BYTES:
+                raise WandbImportError(
+                    f"W&B history row {row_index} exceeds the metric request byte budget"
+                )
+            if batch and batch_bytes + point_bytes > _METRIC_BATCH_BYTES:
+                _commit_metric_batch(client, run_id, batch)
+                next_sequence += len(batch)
+                rows_committed = batch_rows_end
+                checkpoint.update(
+                    source_id,
+                    rows_committed=rows_committed,
+                    next_sequence=next_sequence,
+                    unsupported_values=unsupported_values,
+                )
+                batch = []
+                batch_bytes = 0
+                point["sequence"] = next_sequence
+            batch.append(point)
+            batch_bytes += point_bytes
+        unsupported_values += skipped_values
         batch_rows_end = scanned_rows
         if len(batch) >= _METRIC_BATCH_SIZE:
             _commit_metric_batch(client, run_id, batch)
             next_sequence += len(batch)
             rows_committed = batch_rows_end
             batch = []
+            batch_bytes = 0
             checkpoint.update(
                 source_id,
                 rows_committed=rows_committed,
@@ -235,8 +282,9 @@ def _import_one_run(
 
     if include_files:
         _import_run_files(source, client, checkpoint, source_id, run_id, source_metadata)
+        _import_logged_artifacts(source, client, checkpoint, source_id, run_id, source_metadata)
 
-    summary = _json_document(dict(getattr(source, "summary", {}) or {}), "W&B summary")
+    summary = _wandb_document(getattr(source, "summary", {}) or {}, "W&B summary")
     if "_runloom_wandb_source" in summary:
         raise WandbImportError("W&B summary uses reserved key '_runloom_wandb_source'")
     summary["_runloom_wandb_source"] = {
@@ -327,14 +375,7 @@ def _import_file_chunk(
             artifact_path = _safe_artifact_path(_required_text(source_file, "name"))
             downloaded = source_file.download(root=str(root), replace=True)
             local_path = _downloaded_path(downloaded, root, artifact_path)
-            digest, size = _hash_file(local_path)
-            mime_type = mimetypes.guess_type(artifact_path)[0] or "application/octet-stream"
-            blob = {
-                "digest": digest,
-                "size": size,
-                "mime_type": mime_type,
-                "file_name": PurePosixPath(artifact_path).name,
-            }
+            blob = _blob_for_file(local_path, artifact_path)
             client.upload_blob(local_path, blob)
             entries.append({"path": artifact_path, "blob": blob})
     artifact_id = str(
@@ -358,8 +399,148 @@ def _import_file_chunk(
     )
 
 
-def _history_metrics(row: Mapping[str, Any]) -> tuple[dict[str, float | bool], int]:
+def _import_logged_artifacts(
+    source: Any,
+    client: RunloomClient,
+    checkpoint: _Checkpoint,
+    source_id: str,
+    run_id: str,
+    source_metadata: dict[str, str],
+) -> None:
+    list_artifacts = getattr(source, "logged_artifacts", None)
+    if not callable(list_artifacts):
+        return
+    state = checkpoint.state(source_id)
+    if state.get("logged_artifacts_complete") is True:
+        return
+    committed = _state_int(state, "logged_artifacts_committed", 0)
+    seen = 0
+    pending: list[tuple[int, Future[None]]] = []
+
+    def collect(index: int, future: Future[None]) -> None:
+        nonlocal committed
+        future.result()
+        committed = index + 1
+        checkpoint.update(source_id, logged_artifacts_committed=committed)
+
+    with ThreadPoolExecutor(
+        max_workers=_ARTIFACT_WORKERS,
+        thread_name_prefix="runloom-wandb-artifact",
+    ) as executor:
+        for index, artifact in enumerate(list_artifacts(per_page=100)):
+            seen = index + 1
+            if seen <= committed:
+                continue
+            pending.append(
+                (
+                    index,
+                    executor.submit(
+                        _import_logged_artifact,
+                        client,
+                        artifact,
+                        run_id,
+                        source_metadata,
+                    ),
+                )
+            )
+            if len(pending) >= _ARTIFACT_WORKERS:
+                collect(*pending.pop(0))
+        for item in pending:
+            collect(*item)
+    checkpoint.update(
+        source_id,
+        logged_artifacts_committed=max(committed, seen),
+        logged_artifacts_complete=True,
+    )
+
+
+def _import_logged_artifact(
+    client: RunloomClient,
+    source_artifact: Any,
+    run_id: str,
+    source_metadata: dict[str, str],
+) -> None:
+    qualified_name = str(getattr(source_artifact, "qualified_name", ""))
+    source_id = str(getattr(source_artifact, "id", "")) or qualified_name
+    if not source_id:
+        raise WandbImportError("W&B artifact has no stable identity")
+    source_name = _required_text(source_artifact, "name")
+    source_version = str(getattr(source_artifact, "version", ""))
+    suffix = f":{source_version}" if source_version else ""
+    target_name = source_name.removesuffix(suffix)
+    entries: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="runloom-wandb-artifact-") as raw_root:
+        root = Path(raw_root).resolve()
+        for source_file in source_artifact.files(per_page=100):
+            if len(entries) >= _MAX_ARTIFACT_FILES:
+                raise WandbImportError(
+                    f"W&B artifact {source_name!r} exceeds {_MAX_ARTIFACT_FILES} files"
+                )
+            artifact_path = _safe_artifact_path(_required_text(source_file, "name"))
+            downloaded = source_file.download(root=str(root), replace=True)
+            local_path = _downloaded_path(downloaded, root, artifact_path)
+            blob = _blob_for_file(local_path, artifact_path)
+            client.upload_blob(local_path, blob)
+            entries.append({"path": artifact_path, "blob": blob})
+            local_path.unlink()
+    raw_metadata = _wandb_document(
+        getattr(source_artifact, "metadata", {}) or {},
+        "W&B artifact source metadata",
+    )
+    metadata = _json_document(
+        {
+            "wandb_source": {
+                **source_metadata,
+                "artifact_id": source_id,
+                "qualified_name": qualified_name,
+                "version": source_version,
+            },
+            "wandb_metadata": raw_metadata,
+        },
+        "W&B artifact metadata",
+    )
+    raw_aliases = list(getattr(source_artifact, "aliases", []) or [])
+    aliases = list(dict.fromkeys(str(alias) for alias in raw_aliases if str(alias)))
+    artifact_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"https://wandb.ai/artifacts/{source_id}",
+        )
+    )
+    description = getattr(source_artifact, "description", None)
+    client.create_artifact(
+        run_id,
+        {
+            "id": artifact_id,
+            "name": target_name,
+            "type": _required_text(source_artifact, "type"),
+            "description": str(description) if description is not None else None,
+            "metadata": metadata,
+            "aliases": aliases,
+            "entries": entries,
+        },
+    )
+
+
+def _history_page_size(source: Any) -> int:
+    last_step = getattr(source, "lastHistoryStep", None)
+    if (
+        isinstance(last_step, bool)
+        or not isinstance(last_step, (int, float))
+        or not math.isfinite(float(last_step))
+        or int(last_step) != last_step
+        or last_step < 0
+    ):
+        return _MIN_HISTORY_PAGE_SIZE
+    span = int(last_step) + 1
+    return max(_MIN_HISTORY_PAGE_SIZE, math.ceil(span / _TARGET_HISTORY_PAGE_COUNT))
+
+
+def _history_values(
+    row: Mapping[str, Any],
+) -> tuple[dict[str, float | bool], list[tuple[str, str, dict[str, Any]]], int]:
     metrics: dict[str, float | bool] = {}
+    media: list[tuple[str, str, dict[str, Any]]] = []
     skipped = 0
 
     def visit(prefix: str, value: Any) -> None:
@@ -373,8 +554,14 @@ def _history_metrics(row: Mapping[str, Any]) -> tuple[dict[str, float | bool], i
             else:
                 metrics[prefix] = value
         elif isinstance(value, Mapping):
-            if "_type" in value:
-                skipped += 1
+            value_type = value.get("_type")
+            if value_type is not None:
+                kind = _MEDIA_KINDS.get(str(value_type))
+                path = value.get("path")
+                if kind is None or not isinstance(path, str) or not path:
+                    skipped += 1
+                else:
+                    media.append((prefix, kind, dict(value)))
                 return
             for child_key, child_value in value.items():
                 key = f"{prefix}/{child_key}" if prefix else str(child_key)
@@ -386,7 +573,62 @@ def _history_metrics(row: Mapping[str, Any]) -> tuple[dict[str, float | bool], i
         if str(key).startswith("_"):
             continue
         visit(str(key), value)
-    return metrics, skipped
+    return metrics, media, skipped
+
+
+def _import_media_reference(
+    source: Any,
+    client: RunloomClient,
+    *,
+    run_id: str,
+    source_metadata: dict[str, str],
+    key: str,
+    kind: str,
+    step: int,
+    timestamp_ms: int,
+    reference: dict[str, Any],
+) -> None:
+    artifact_path = _safe_artifact_path(str(reference["path"]))
+    source_file = source.file(artifact_path)
+    with tempfile.TemporaryDirectory(prefix="runloom-wandb-media-") as raw_root:
+        root = Path(raw_root).resolve()
+        downloaded = source_file.download(root=str(root), replace=True)
+        local_path = _downloaded_path(downloaded, root, artifact_path)
+        blob = _blob_for_file(local_path, artifact_path)
+        expected_digest = reference.get("sha256")
+        if isinstance(expected_digest, str) and expected_digest != blob["digest"]:
+            raise WandbImportError(
+                f"W&B media digest mismatch for {artifact_path!r}: "
+                f"expected {expected_digest}, received {blob['digest']}"
+            )
+        client.upload_blob(local_path, blob)
+    metadata = {
+        "wandb_path": artifact_path,
+        "wandb_source": source_metadata,
+    }
+    for name in ("caption", "width", "height", "duration"):
+        value = reference.get(name)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            metadata[name] = value
+    value_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"https://wandb.ai/{source_metadata['entity']}/{source_metadata['project']}"
+            f"/runs/{source_metadata['run_id']}/media/{key}/{step}/{blob['digest']}",
+        )
+    )
+    client.create_rich_value(
+        run_id,
+        {
+            "id": value_id,
+            "key": key,
+            "kind": kind,
+            "step": step,
+            "timestamp_ms": timestamp_ms,
+            "blob": blob,
+            "metadata": metadata,
+        },
+    )
 
 
 def _history_step(row: Mapping[str, Any], row_index: int) -> int:
@@ -447,6 +689,17 @@ def _hash_file(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _blob_for_file(path: Path, artifact_path: str) -> dict[str, Any]:
+    digest, size = _hash_file(path)
+    mime_type = mimetypes.guess_type(artifact_path)[0] or "application/octet-stream"
+    return {
+        "digest": digest,
+        "size": size,
+        "mime_type": mime_type,
+        "file_name": PurePosixPath(artifact_path).name,
+    }
+
+
 def _json_document(value: dict[str, Any], name: str) -> dict[str, Any]:
     try:
         encoded = json.dumps(value, allow_nan=False, separators=(",", ":"), sort_keys=True)
@@ -456,6 +709,37 @@ def _json_document(value: dict[str, Any], name: str) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise WandbImportError(f"{name} must be an object")
     return decoded
+
+
+def _wandb_document(value: Any, name: str) -> dict[str, Any]:
+    normalized = _wandb_json_value(value)
+    if not isinstance(normalized, dict):
+        raise WandbImportError(f"{name} must be an object")
+    return _json_document(normalized, name)
+
+
+def _wandb_json_value(value: Any, depth: int = 0) -> Any:
+    if depth > 64:
+        raise WandbImportError("W&B metadata nesting exceeds 64 levels")
+    json_dict = getattr(value, "_json_dict", None)
+    if isinstance(json_dict, Mapping):
+        value = json_dict
+    if isinstance(value, Mapping):
+        return {str(key): _wandb_json_value(child, depth + 1) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_wandb_json_value(child, depth + 1) for child in value]
+    return value
+
+
+def _json_size(value: dict[str, Any]) -> int:
+    return len(
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode()
+    )
 
 
 def _required_text(value: Any, field: str) -> str:

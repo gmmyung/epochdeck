@@ -116,10 +116,13 @@ HTTP namespace remains explicitly versioned under `/api/v1`.
 ### Import and export
 
 The optional W&B importer is a Python boundary adapter. It scans source runs
-lazily, admits a bounded number of run workers, and sends deterministic metric
-batches. An fsynced checkpoint advances only after acknowledgement, allowing an
-ambiguous accepted request to replay under the server's existing idempotency
-contract. Source run files are chunked into ordinary CAS-backed artifacts.
+lazily, adapts history windows to sparse step domains, admits a bounded number
+of run workers, and sends deterministic metric batches. An fsynced checkpoint
+advances only after acknowledgement, allowing an ambiguous accepted request to
+replay under the server's existing idempotency contract. Source run files are
+chunked into ordinary CAS-backed artifacts, logged artifacts use a fixed
+four-transfer window, and supported media references become deterministic
+native rich values backed by the same CAS.
 
 Portable Runloom export traverses only public bounded APIs. It writes raw
 full-resolution history pages, metadata JSON Lines, lineage links, and verified
