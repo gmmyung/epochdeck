@@ -31,7 +31,9 @@
   onMount(() => {
     const controller = new AbortController();
     const resize = () => (chartRevision += 1);
+    const theme = window.matchMedia("(prefers-color-scheme: dark)");
     window.addEventListener("resize", resize);
+    theme.addEventListener("change", resize);
     Promise.all([getHealth(controller.signal), getProjects(controller.signal)])
       .then(async ([healthResult, projectResult]) => {
         health = healthResult;
@@ -49,6 +51,7 @@
       projectController?.abort();
       runController?.abort();
       window.removeEventListener("resize", resize);
+      theme.removeEventListener("change", resize);
     };
   });
 
@@ -144,7 +147,8 @@
     const xRange = maxX - minX || 1;
     const yRange = maxY - minY || 1;
 
-    context.strokeStyle = "rgba(232, 236, 225, 0.09)";
+    const styles = getComputedStyle(target);
+    context.strokeStyle = styles.getPropertyValue("--chart-grid").trim() || "#d9dde0";
     context.lineWidth = 1;
     for (let line = 0; line <= 4; line += 1) {
       const y = padding + ((height - padding * 2) * line) / 4;
@@ -154,7 +158,7 @@
       context.stroke();
     }
 
-    context.strokeStyle = "#b6e47a";
+    context.strokeStyle = styles.getPropertyValue("--accent").trim() || "#2766ad";
     context.lineWidth = 1.75;
     context.lineJoin = "round";
     context.beginPath();
@@ -184,116 +188,115 @@
   />
 </svelte:head>
 
-<main>
+<div class="app-shell">
   <header>
-    <div class="wordmark" aria-label="Runloom">
-      <span class="mark" aria-hidden="true"></span>
-      <span>RUNLOOM</span>
-    </div>
+    <div class="brand"><h1>Runloom</h1></div>
     <div class="status" class:failed={Boolean(error)}>
       <span class="status-dot" aria-hidden="true"></span>
       {health ? `${health.status} · v${health.version}` : "connecting"}
     </div>
   </header>
 
-  {#if error}
-    <div class="error" role="alert">{error}</div>
-  {/if}
+  <main class="content">
+    {#if error}
+      <div class="error" role="alert">{error}</div>
+    {/if}
 
-  {#if loading}
-    <section class="empty">Loading the loom…</section>
-  {:else if projects.length === 0}
-    <section class="empty">
-      <p class="eyebrow">Ready for a first run</p>
-      <h1>No experiments yet.</h1>
-      <code>runloom.init(project="my-project")</code>
-    </section>
-  {:else}
-    <div class="workspace">
-      <aside>
-        <label for="project">Project</label>
-        <select
-          id="project"
-          value={selectedProject}
-          onchange={(event) => chooseProject(event.currentTarget.value)}
-        >
-          {#each projects as project (project.id)}
-            <option value={project.name}>{project.name} · {project.run_count}</option>
-          {/each}
-        </select>
-
-        <div class="run-list" aria-label="Runs">
-          {#each runs as run (run.id)}
-            <button class:active={selectedRun?.id === run.id} onclick={() => chooseRun(run)}>
-              <span>{run.name}</span>
-              <small>{run.state} · r{run.metric_revision}</small>
-            </button>
-          {/each}
-        </div>
-      </aside>
-
-      <section class="run-view">
-        {#if selectedRun}
-          <div class="run-heading">
-            <div>
-              <p class="eyebrow">{selectedRun.project} / {selectedRun.id.slice(0, 8)}</p>
-              <h1>{selectedRun.name}</h1>
-            </div>
-            <span class="run-state" class:live={selectedRun.state === "running"}
-              >{selectedRun.state}</span
-            >
-          </div>
-
-          <div class="cards">
-            <article class="chart-card">
-              <div class="card-heading">
-                <div>
-                  <small>Metric history</small>
-                  <strong>{selectedMetric || "No metrics logged"}</strong>
-                </div>
-                {#if metricKeys.length > 0}
-                  <select aria-label="Metric" value={selectedMetric} onchange={metricChanged}>
-                    {#each metricKeys as metric}
-                      <option value={metric}>{metric}</option>
-                    {/each}
-                  </select>
-                {/if}
-              </div>
-              <canvas bind:this={canvas} aria-label={`${selectedMetric} history chart`}></canvas>
-              <div class="chart-footer">
-                <span>{history?.sequence.length ?? 0} points loaded</span>
-                <span>bounded at 5,000</span>
-              </div>
-            </article>
-
-            <article>
-              <div class="card-heading"><strong>Summary</strong></div>
-              <dl>
-                {#each Object.entries(selectedRun.summary) as [key, value]}
-                  <div>
-                    <dt>{key}</dt>
-                    <dd>{formatValue(value)}</dd>
-                  </div>
-                {/each}
-              </dl>
-            </article>
-
-            <article>
-              <div class="card-heading"><strong>Configuration</strong></div>
-              <dl>
-                {#each Object.entries(selectedRun.config) as [key, value]}
-                  <div>
-                    <dt>{key}</dt>
-                    <dd>{formatValue(value)}</dd>
-                  </div>
-                {/each}
-              </dl>
-            </article>
-          </div>
-        {:else}
-          <section class="empty">This project has no runs.</section>
-        {/if}
+    {#if loading}
+      <section class="empty">Loading the loom…</section>
+    {:else if projects.length === 0}
+      <section class="empty">
+        <p class="eyebrow">Ready for a first run</p>
+        <h1>No experiments yet.</h1>
+        <code>runloom.init(project="my-project")</code>
       </section>
-    </div>
-  {/if}
-</main>
+    {:else}
+      <div class="workspace">
+        <aside>
+          <label for="project">Project</label>
+          <select
+            id="project"
+            value={selectedProject}
+            onchange={(event) => chooseProject(event.currentTarget.value)}
+          >
+            {#each projects as project (project.id)}
+              <option value={project.name}>{project.name} · {project.run_count}</option>
+            {/each}
+          </select>
+
+          <div class="run-list" aria-label="Runs">
+            {#each runs as run (run.id)}
+              <button class:active={selectedRun?.id === run.id} onclick={() => chooseRun(run)}>
+                <span>{run.name}</span>
+                <small>{run.state} · r{run.metric_revision}</small>
+              </button>
+            {/each}
+          </div>
+        </aside>
+
+        <section class="run-view">
+          {#if selectedRun}
+            <div class="run-heading">
+              <div>
+                <p class="eyebrow">{selectedRun.project} / {selectedRun.id.slice(0, 8)}</p>
+                <h1>{selectedRun.name}</h1>
+              </div>
+              <span class="run-state" class:live={selectedRun.state === "running"}
+                >{selectedRun.state}</span
+              >
+            </div>
+
+            <div class="cards">
+              <article class="chart-card">
+                <div class="card-heading">
+                  <div>
+                    <small>Metric history</small>
+                    <strong>{selectedMetric || "No metrics logged"}</strong>
+                  </div>
+                  {#if metricKeys.length > 0}
+                    <select aria-label="Metric" value={selectedMetric} onchange={metricChanged}>
+                      {#each metricKeys as metric}
+                        <option value={metric}>{metric}</option>
+                      {/each}
+                    </select>
+                  {/if}
+                </div>
+                <canvas bind:this={canvas} aria-label={`${selectedMetric} history chart`}></canvas>
+                <div class="chart-footer">
+                  <span>{history?.sequence.length ?? 0} points loaded</span>
+                  <span>bounded at 5,000</span>
+                </div>
+              </article>
+
+              <article>
+                <div class="card-heading"><strong>Summary</strong></div>
+                <dl>
+                  {#each Object.entries(selectedRun.summary) as [key, value]}
+                    <div>
+                      <dt>{key}</dt>
+                      <dd>{formatValue(value)}</dd>
+                    </div>
+                  {/each}
+                </dl>
+              </article>
+
+              <article>
+                <div class="card-heading"><strong>Configuration</strong></div>
+                <dl>
+                  {#each Object.entries(selectedRun.config) as [key, value]}
+                    <div>
+                      <dt>{key}</dt>
+                      <dd>{formatValue(value)}</dd>
+                    </div>
+                  {/each}
+                </dl>
+              </article>
+            </div>
+          {:else}
+            <section class="empty">This project has no runs.</section>
+          {/if}
+        </section>
+      </div>
+    {/if}
+  </main>
+</div>
