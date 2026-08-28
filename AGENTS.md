@@ -37,3 +37,15 @@ storage, and authentication.
 - Unsupported compatibility arguments must fail or warn explicitly.
 - Keep compatibility adapters outside storage internals.
 - Record significant storage, protocol, and deployment changes as ADRs.
+
+## Pre-alpha change policy
+
+- Do not preserve backward compatibility for Runloom's pre-alpha Python API,
+  HTTP payloads, catalog schema, spool format, or stored data unless the user
+  explicitly asks for it.
+- Prefer replacing a weak design directly over aliases, dual reads/writes,
+  backfills, compatibility shims, or migration scaffolding.
+- Keep the `/api/v1` namespace. It is the current protocol boundary, not a
+  promise that every pre-alpha shape inside it is frozen.
+- Tests and documentation describe only the current supported shape. Remove
+  obsolete behavior instead of carrying it forward.
