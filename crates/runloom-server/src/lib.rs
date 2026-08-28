@@ -9,30 +9,37 @@ use compaction::{CompactionOutcome, compact_once};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use runloom_catalog::{
     BatchRegistration, BatchStatus, Catalog, CatalogError, MAX_SEGMENTS_PER_QUERY, SegmentManifest,
 };
 use runloom_protocol::{
-    AlertId, AlertListResponse, ApiError, ConfigUpdateRequest, CreateAlertRequest,
-    CreateAlertResponse, CreateRunRequest, CreateRunResponse, FinishRunRequest, FinishRunResponse,
-    HealthResponse, HistoryResponse, IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES,
+    AlertId, AlertListResponse, ApiError, BlobRef, BlobUploadResponse, ConfigUpdateRequest,
+    CreateAlertRequest, CreateAlertResponse, CreateRichValueRequest, CreateRichValueResponse,
+    CreateRunRequest, CreateRunResponse, FinishRunRequest, FinishRunResponse, HealthResponse,
+    HistoryResponse, IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES,
     MAX_ALERT_TITLE_BYTES, MAX_BATCH_POINTS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS,
-    MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MAX_SUMMARY_BYTES, MetricKeyListResponse,
-    ProjectListResponse, ResumePolicy, RunId, RunListResponse, RunRecord, RunState,
+    MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES,
+    MAX_SUMMARY_BYTES, MetricKeyListResponse, ProjectListResponse, ResumePolicy, RichValueId,
+    RichValueKind, RichValueListResponse, RunId, RunListResponse, RunRecord, RunState,
     RunUpdateResponse, SummaryUpdateRequest,
 };
 use runloom_storage::{
-    MetricStore, MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
+    BlobStore, MetricStore, MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
+use tower::ServiceExt;
 use tower_http::compression::CompressionLayer;
+use tower_http::services::ServeFile;
 use tower_http::trace::TraceLayer;
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -42,20 +49,46 @@ const MAX_METRIC_KEY_BYTES: usize = 256;
 const INGEST_WORKERS: usize = 2;
 const QUERY_WORKERS: usize = 4;
 const MAX_LIST_ITEMS: usize = 200;
+const MAX_MIME_TYPE_BYTES: usize = 256;
+const MAX_FILE_NAME_BYTES: usize = 512;
 
 #[derive(Debug, Clone)]
 struct AppState {
     catalog: Catalog,
     metrics: MetricRuntime,
+    blobs: BlobStore,
     ingest_permits: Arc<Semaphore>,
     query_permits: Arc<Semaphore>,
 }
 
 pub fn app(catalog: Catalog, metrics: MetricStore) -> Router {
-    app_with_runtime(catalog, MetricRuntime::new(metrics))
+    let blob_root = metrics
+        .root()
+        .parent()
+        .unwrap_or_else(|| metrics.root())
+        .join("blobs");
+    app_with_runtime_and_blobs(
+        catalog,
+        MetricRuntime::new(metrics),
+        BlobStore::new(blob_root),
+    )
 }
 
 pub fn app_with_runtime(catalog: Catalog, metrics: MetricRuntime) -> Router {
+    let blob_root = metrics
+        .store()
+        .root()
+        .parent()
+        .unwrap_or_else(|| metrics.store().root())
+        .join("blobs");
+    app_with_runtime_and_blobs(catalog, metrics, BlobStore::new(blob_root))
+}
+
+pub fn app_with_runtime_and_blobs(
+    catalog: Catalog,
+    metrics: MetricRuntime,
+    blobs: BlobStore,
+) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/projects", get(list_projects))
@@ -73,10 +106,16 @@ pub fn app_with_runtime(catalog: Catalog, metrics: MetricRuntime) -> Router {
             "/api/v1/runs/{run_id}/alerts",
             post(create_alert).get(list_alerts),
         )
+        .route(
+            "/api/v1/runs/{run_id}/rich-values",
+            post(create_rich_value).get(list_rich_values),
+        )
+        .route("/api/v1/blobs/{digest}", put(upload_blob).get(get_blob))
         .route("/api/v1/runs/{run_id}/history", get(history))
         .with_state(AppState {
             catalog,
             metrics,
+            blobs,
             ingest_permits: Arc::new(Semaphore::new(INGEST_WORKERS)),
             query_permits: Arc::new(Semaphore::new(QUERY_WORKERS)),
         })
@@ -159,8 +198,9 @@ async fn create_run(
 
 async fn next_run_position(state: &AppState, run_id: RunId) -> Result<(u64, u64), HttpError> {
     let _snapshot = state.metrics.read_snapshot().await;
+    let rich_next_step = state.catalog.rich_value_next_step(run_id).await?;
     let Some(segment) = state.catalog.last_segment(run_id).await? else {
-        return Ok((1, 0));
+        return Ok((1, rich_next_step));
     };
     let metrics = state.metrics.store().clone();
     let _permit = Arc::clone(&state.query_permits)
@@ -173,7 +213,8 @@ async fn next_run_position(state: &AppState, run_id: RunId) -> Result<(u64, u64)
             .map_err(|error| {
                 HttpError::internal(format!("resume query worker failed: {error}"))
             })??;
-    next_position(tail)
+    let (next_sequence, metric_next_step) = next_position(tail)?;
+    Ok((next_sequence, metric_next_step.max(rich_next_step)))
 }
 
 fn next_position(tail: SegmentTail) -> Result<(u64, u64), HttpError> {
@@ -371,6 +412,205 @@ async fn list_alerts(
     }))
 }
 
+async fn create_rich_value(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    Json(request): Json<CreateRichValueRequest>,
+) -> Result<(StatusCode, Json<CreateRichValueResponse>), HttpError> {
+    validate_rich_value(&request)?;
+    if let Some(blob) = &request.blob {
+        let actual_size = state
+            .blobs
+            .size(&blob.digest)
+            .map_err(|error| HttpError::invalid(error.to_string()))?
+            .ok_or_else(|| HttpError::invalid("rich value blob has not been uploaded"))?;
+        if actual_size != blob.size {
+            return Err(HttpError::invalid(
+                "rich value blob size does not match uploaded content",
+            ));
+        }
+    }
+    let (value, duplicate) = state.catalog.create_rich_value(run_id, &request).await?;
+    let status = if duplicate {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(CreateRichValueResponse { value, duplicate })))
+}
+
+#[derive(Debug, Deserialize)]
+struct RichValueListQuery {
+    before: Option<RichValueId>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+async fn list_rich_values(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    Query(query): Query<RichValueListQuery>,
+) -> Result<Json<RichValueListResponse>, HttpError> {
+    validate_list_limit(query.limit)?;
+    let values = state
+        .catalog
+        .list_rich_values(run_id, query.before, query.limit)
+        .await?;
+    let next_before = if values.len() == query.limit {
+        values.last().map(|value| value.id)
+    } else {
+        None
+    };
+    Ok(Json(RichValueListResponse {
+        values,
+        next_before,
+    }))
+}
+
+async fn upload_blob(
+    State(state): State<AppState>,
+    Path(digest): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<(StatusCode, Json<BlobUploadResponse>), HttpError> {
+    let mime_type = header_text(&headers, "content-type")
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    validate_mime_type(&mime_type)?;
+    let file_name = header_text(&headers, "x-runloom-file-name")
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty());
+    validate_file_name(file_name.as_deref())?;
+    let declared_size = headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+
+    let existing_size = state
+        .blobs
+        .size(&digest)
+        .map_err(|error| HttpError::invalid(error.to_string()))?;
+    if let Some(size) = existing_size {
+        if declared_size.is_some_and(|declared| declared != size) {
+            return Err(HttpError::conflict(
+                "blob_size_conflict",
+                "existing blob size differs from the request",
+            ));
+        }
+        return Ok((
+            StatusCode::OK,
+            Json(BlobUploadResponse {
+                blob: BlobRef {
+                    digest,
+                    size,
+                    mime_type,
+                    file_name,
+                },
+                duplicate: true,
+            }),
+        ));
+    }
+
+    let staging_path = state.blobs.staging_path().map_err(HttpError::from)?;
+    let result = stream_blob(&staging_path, body).await;
+    let (actual_digest, size) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&staging_path).await;
+            return Err(error);
+        }
+    };
+    if actual_digest != digest {
+        let _ = tokio::fs::remove_file(&staging_path).await;
+        return Err(HttpError::invalid(format!(
+            "blob digest mismatch: expected {digest}, received {actual_digest}"
+        )));
+    }
+    let blobs = state.blobs.clone();
+    let install_path = staging_path.clone();
+    let install_digest = digest.clone();
+    tokio::task::spawn_blocking(move || blobs.install(&install_path, &install_digest))
+        .await
+        .map_err(|error| HttpError::internal(format!("blob install worker failed: {error}")))??;
+    Ok((
+        StatusCode::CREATED,
+        Json(BlobUploadResponse {
+            blob: BlobRef {
+                digest,
+                size,
+                mime_type,
+                file_name,
+            },
+            duplicate: false,
+        }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobQuery {
+    mime: Option<String>,
+}
+
+async fn get_blob(
+    State(state): State<AppState>,
+    Path(digest): Path<String>,
+    Query(query): Query<BlobQuery>,
+    request: Request<Body>,
+) -> Result<Response, HttpError> {
+    let path = state
+        .blobs
+        .path(&digest)
+        .map_err(|error| HttpError::invalid(error.to_string()))?;
+    if !path.is_file() {
+        return Err(HttpError::not_found(format!("blob {digest}")));
+    }
+    if let Some(mime_type) = &query.mime {
+        validate_mime_type(mime_type)?;
+    }
+    let response = match ServeFile::new(path).oneshot(request).await {
+        Ok(response) => response,
+        Err(error) => match error {},
+    };
+    let mut response = response.map(Body::new);
+    if let Some(mime_type) = query.mime {
+        let value = mime_type
+            .parse()
+            .map_err(|_| HttpError::invalid("invalid blob MIME type"))?;
+        response.headers_mut().insert("content-type", value);
+    }
+    Ok(response)
+}
+
+async fn stream_blob(path: &std::path::Path, body: Body) -> Result<(String, u64), HttpError> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|error| {
+            HttpError::internal(format!("failed to create blob staging file: {error}"))
+        })?;
+    let mut stream = body.into_data_stream();
+    let mut digest = Sha256::new();
+    let mut size = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|error| HttpError::invalid(format!("blob upload failed: {error}")))?;
+        size = size
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| HttpError::invalid("blob size overflow"))?;
+        digest.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| HttpError::internal(format!("failed to write blob: {error}")))?;
+    }
+    file.sync_all()
+        .await
+        .map_err(|error| HttpError::internal(format!("failed to sync blob: {error}")))?;
+    drop(file);
+    Ok((format!("{:x}", digest.finalize()), size))
+}
+
 #[derive(Debug, Deserialize)]
 struct HistoryQuery {
     keys: String,
@@ -527,6 +767,65 @@ fn validate_alert(request: &CreateAlertRequest) -> Result<(), HttpError> {
         return Err(HttpError::invalid("alert timestamp cannot be negative"));
     }
     Ok(())
+}
+
+fn validate_rich_value(request: &CreateRichValueRequest) -> Result<(), HttpError> {
+    if request.key.is_empty()
+        || request.key.len() > MAX_RICH_KEY_BYTES
+        || request.key.chars().any(char::is_control)
+    {
+        return Err(HttpError::invalid(format!(
+            "rich value keys must contain 1 to {MAX_RICH_KEY_BYTES} non-control bytes"
+        )));
+    }
+    if request.timestamp_ms < 0 {
+        return Err(HttpError::invalid(
+            "rich value timestamp cannot be negative",
+        ));
+    }
+    if matches!(
+        request.kind,
+        RichValueKind::Image | RichValueKind::Audio | RichValueKind::Video | RichValueKind::Table
+    ) && request.blob.is_none()
+    {
+        return Err(HttpError::invalid(format!(
+            "{} rich values require a content blob",
+            request.kind
+        )));
+    }
+    if let Some(blob) = &request.blob {
+        validate_mime_type(&blob.mime_type)?;
+        validate_file_name(blob.file_name.as_deref())?;
+    }
+    validate_document_size(&request.metadata, "rich metadata", MAX_RICH_METADATA_BYTES)
+}
+
+fn validate_mime_type(value: &str) -> Result<(), HttpError> {
+    if value.is_empty()
+        || value.len() > MAX_MIME_TYPE_BYTES
+        || value.chars().any(char::is_control)
+        || !value.contains('/')
+    {
+        return Err(HttpError::invalid(format!(
+            "MIME type must contain 1 to {MAX_MIME_TYPE_BYTES} safe bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_file_name(value: Option<&str>) -> Result<(), HttpError> {
+    if value.is_some_and(|name| {
+        name.is_empty() || name.len() > MAX_FILE_NAME_BYTES || name.chars().any(char::is_control)
+    }) {
+        return Err(HttpError::invalid(format!(
+            "file name must contain 1 to {MAX_FILE_NAME_BYTES} non-control bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 fn validate_create_run(request: &CreateRunRequest) -> Result<(), HttpError> {
@@ -701,6 +1000,13 @@ impl HttpError {
         }
     }
 
+    fn not_found(resource: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: ApiError::new("not_found", format!("{} was not found", resource.into())),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         let message = message.into();
         tracing::error!(%message, "request failed");
@@ -753,13 +1059,16 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use runloom_catalog::Catalog;
     use runloom_protocol::{
-        AlertId, AlertLevel, AlertListResponse, ConfigUpdateRequest, CreateAlertRequest,
-        CreateAlertResponse, CreateRunRequest, CreateRunResponse, FinishRunRequest,
-        FinishRunResponse, HealthResponse, HealthStatus, HistoryResponse, IngestBatchRequest,
-        IngestBatchResponse, MetricKeyListResponse, MetricPoint, ProjectListResponse, ResumePolicy,
-        RunListResponse, RunUpdateResponse, SummaryUpdateRequest,
+        AlertId, AlertLevel, AlertListResponse, BlobRef, BlobUploadResponse, ConfigUpdateRequest,
+        CreateAlertRequest, CreateAlertResponse, CreateRichValueRequest, CreateRichValueResponse,
+        CreateRunRequest, CreateRunResponse, FinishRunRequest, FinishRunResponse, HealthResponse,
+        HealthStatus, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
+        MetricKeyListResponse, MetricPoint, ProjectListResponse, ResumePolicy, RichValueId,
+        RichValueKind, RichValueListResponse, RunListResponse, RunUpdateResponse,
+        SummaryUpdateRequest,
     };
     use runloom_storage::MetricStore;
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
     use tower::ServiceExt;
 
@@ -948,6 +1257,72 @@ mod tests {
         let alerts: AlertListResponse = response_json(response).await?;
         assert_eq!(alerts.alerts, vec![created_alert.alert]);
 
+        let video = b"native-video-content";
+        let blob_digest = format!("{:x}", Sha256::digest(video));
+        let blob_path = format!("/api/v1/blobs/{blob_digest}");
+        let response = router
+            .clone()
+            .oneshot(
+                Request::put(&blob_path)
+                    .header("content-type", "video/mp4")
+                    .header("content-length", video.len())
+                    .body(Body::from(video.as_slice()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let uploaded: BlobUploadResponse = response_json(response).await?;
+        assert_eq!(uploaded.blob.size, video.len() as u64);
+        assert!(!uploaded.duplicate);
+
+        let rich_path = format!("/api/v1/runs/{}/rich-values", created.run.id);
+        let rich_request = CreateRichValueRequest {
+            id: Some(RichValueId::new()),
+            key: "rollout/video".to_owned(),
+            kind: RichValueKind::Video,
+            step: 12,
+            timestamp_ms: 2_100,
+            blob: Some(BlobRef {
+                digest: blob_digest.clone(),
+                size: video.len() as u64,
+                mime_type: "video/mp4".to_owned(),
+                file_name: Some("rollout.mp4".to_owned()),
+            }),
+            metadata: BTreeMap::from([("caption".to_owned(), "native playback".into())]),
+        };
+        let response = router
+            .clone()
+            .oneshot(json_request("POST", &rich_path, &rich_request)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created_value: CreateRichValueResponse = response_json(response).await?;
+        assert!(!created_value.duplicate);
+        let response = router
+            .clone()
+            .oneshot(json_request("POST", &rich_path, &rich_request)?)
+            .await?;
+        let replayed_value: CreateRichValueResponse = response_json(response).await?;
+        assert!(replayed_value.duplicate);
+        let values: RichValueListResponse = response_json(
+            router
+                .clone()
+                .oneshot(Request::get(format!("{rich_path}?limit=10")).body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(values.values, vec![created_value.value]);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(format!("{blob_path}?mime=video%2Fmp4"))
+                    .header("range", "bytes=7-11")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()["content-type"], "video/mp4");
+        assert_eq!(to_bytes(response.into_body(), 64).await?, &video[7..=11]);
+
         let response = router
             .clone()
             .oneshot(json_request(
@@ -964,7 +1339,7 @@ mod tests {
         let resumed: CreateRunResponse = response_json(response).await?;
         assert!(resumed.resumed);
         assert_eq!(resumed.next_sequence, 3);
-        assert_eq!(resumed.next_step, 12);
+        assert_eq!(resumed.next_step, 13);
 
         let history_path = format!("/api/v1/runs/{}/history?keys=loss&limit=1", created.run.id);
         let response = router

@@ -8,6 +8,7 @@ import uuid
 import httpx
 import pytest
 
+from runloom import Histogram, Image, Table
 from runloom.run import DeliveryError, create_run, sync_spool
 
 
@@ -363,3 +364,112 @@ def test_alerts_validate_before_touching_the_journal(tmp_path) -> None:
         run.alert("bad\ntitle")
     assert (tmp_path / run.id / "alerts.jsonl").read_text() == ""
     run.finish()
+
+
+def test_rich_only_runs_resume_at_the_next_user_step(tmp_path) -> None:
+    run_id = "019c1234-5678-7000-8000-000000000008"
+    first = create_run(
+        project="robotics",
+        run_id=run_id,
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+    first.log({"media": {"frame": Image(b"png-bytes")}})
+    del first
+
+    resumed = create_run(
+        project="robotics",
+        run_id=run_id,
+        mode="offline",
+        resume="allow",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+    resumed.log({"loss": 1.0})
+    resumed.finish()
+
+    directory = tmp_path / run_id
+    rich_value = json.loads((directory / "rich-values.jsonl").read_text())
+    metric = json.loads((directory / "events.jsonl").read_text())
+    assert rich_value["key"] == "media/frame"
+    assert rich_value["kind"] == "image"
+    assert rich_value["step"] == 0
+    assert metric["step"] == 1
+    assert (directory / "blobs" / rich_value["blob"]["digest"]).read_bytes() == b"png-bytes"
+
+
+def test_offline_rich_values_stream_blobs_and_sync_idempotently(tmp_path) -> None:
+    run = create_run(
+        project="robotics",
+        run_id="019c1234-5678-7000-8000-000000000009",
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+    run.log(
+        {
+            "frame": Image(b"image-content", caption="camera"),
+            "results": Table(
+                columns=["step", "score"], data=((index, index / 2) for index in range(3))
+            ),
+            "distribution": Histogram([0.0, 0.5, 1.0], num_bins=2),
+        },
+        step=4,
+    )
+    run.finish()
+    directory = tmp_path / run.id
+    uploaded: dict[str, bytes] = {}
+    received: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/runs"):
+            return httpx.Response(
+                201,
+                json={
+                    "run": {"name": "rich-run"},
+                    "resumed": False,
+                    "next_sequence": 1,
+                    "next_step": 0,
+                },
+            )
+        if "/blobs/" in request.url.path:
+            digest = request.url.path.rsplit("/", 1)[1]
+            content = request.read()
+            uploaded[digest] = content
+            return httpx.Response(
+                201,
+                json={
+                    "blob": {
+                        "digest": digest,
+                        "size": len(content),
+                        "mime_type": request.headers["content-type"],
+                        "file_name": request.headers.get("x-runloom-file-name"),
+                    },
+                    "duplicate": False,
+                },
+            )
+        if request.url.path.endswith("/rich-values"):
+            value = json.loads(request.content)
+            received.append(value)
+            return httpx.Response(201, json={"value": value, "duplicate": False})
+        if request.url.path.endswith("/finish"):
+            return httpx.Response(200, json={"run": {"state": "finished"}})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    sync_spool(directory, transport=httpx.MockTransport(handler), timeout=2)
+
+    assert {value["kind"] for value in received} == {"image", "table", "histogram"}
+    assert {value["step"] for value in received} == {4}
+    assert len(uploaded) == 2
+    table = next(value for value in received if value["kind"] == "table")
+    table_payload = json.loads(uploaded[table["blob"]["digest"]])
+    assert table_payload == {
+        "columns": ["step", "score"],
+        "data": [[0, 0.0], [1, 0.5], [2, 1.0]],
+    }
+    assert table["metadata"]["row_count"] == 3
+    assert (
+        int((directory / "rich-ack").read_text())
+        == (directory / "rich-values.jsonl").stat().st_size
+    )

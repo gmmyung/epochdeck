@@ -58,6 +58,25 @@ namespace. The SDK records CPU, memory, disk, network, process, load-average,
 and NVIDIA GPU values when available. Samples are stored losslessly but excluded
 from the user summary and do not advance the logical training step.
 
+## Rich values and blobs
+
+- `PUT /blobs/{sha256}` streams bytes into the content-addressed blob store.
+- `GET /blobs/{sha256}` supports standard byte ranges. The optional `mime`
+  query parameter supplies the media content type for native browser playback.
+- `POST /runs/{run_id}/rich-values` creates a rich-value manifest.
+- `GET /runs/{run_id}/rich-values?limit=100&before=<value_id>` returns bounded
+  newest-first manifests.
+
+Blob uploads send the digest in the path and content type in the header. The
+server hashes while streaming to a staging file, rejects mismatches, syncs the
+file, and atomically installs it under `RUNLOOM_BLOBS_DIR/sha256`. Repeating an
+already installed digest is idempotent and does not rewrite content.
+
+Rich manifests contain a stable UUIDv7 ID, key, `image`, `audio`, `video`,
+`table`, or `histogram` kind, step, timestamp, optional blob reference, and up
+to 256 KiB of preview metadata. Media and table values require an uploaded blob.
+Exact manifest retries are idempotent.
+
 ## Discovery
 
 - `GET /projects?limit=100` returns bounded project summaries.

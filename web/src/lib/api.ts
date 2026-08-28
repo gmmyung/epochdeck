@@ -48,6 +48,25 @@ export type Alert = {
   created_at: string;
 };
 
+export type BlobRef = {
+  digest: string;
+  size: number;
+  mime_type: string;
+  file_name: string | null;
+};
+
+export type RichValue = {
+  id: string;
+  run_id: string;
+  key: string;
+  kind: "image" | "audio" | "video" | "table" | "histogram";
+  step: number;
+  timestamp_ms: number;
+  blob: BlobRef | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
 export function getHealth(signal?: AbortSignal): Promise<Health> {
   return getJson<Health>("/api/v1/health", signal);
 }
@@ -83,6 +102,19 @@ export async function getAlerts(runId: string, signal?: AbortSignal): Promise<Al
     signal,
   );
   return result.alerts;
+}
+
+export async function getRichValues(runId: string, signal?: AbortSignal): Promise<RichValue[]> {
+  const result = await getJson<{ values: RichValue[]; next_before: string | null }>(
+    `/api/v1/runs/${encodeURIComponent(runId)}/rich-values?limit=100`,
+    signal,
+  );
+  return result.values;
+}
+
+export function blobUrl(blob: BlobRef): string {
+  const query = new URLSearchParams({ mime: blob.mime_type });
+  return `/api/v1/blobs/${encodeURIComponent(blob.digest)}?${query}`;
 }
 
 export function getHistory(

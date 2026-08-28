@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from runloom.client import RunloomApiError, RunloomClient
+from runloom.rich import RichValue
 from runloom.system_metrics import SystemMonitor, SystemSampler
 
 Mode = Literal["online", "offline", "disabled"]
@@ -135,9 +136,15 @@ class _Spool:
         self.alerts_path = self.directory / "alerts.jsonl"
         self.alert_ack_path = self.directory / "alert-ack"
         self.alert_delivery_path = self.directory / "alert-delivery.json"
+        self.rich_values_path = self.directory / "rich-values.jsonl"
+        self.rich_ack_path = self.directory / "rich-ack"
+        self.rich_delivery_path = self.directory / "rich-delivery.json"
+        self.blob_root = self.directory / "blobs"
         self._lock = threading.Lock()
         self.events_path.touch(exist_ok=True)
         self.alerts_path.touch(exist_ok=True)
+        self.rich_values_path.touch(exist_ok=True)
+        self.blob_root.mkdir(exist_ok=True)
 
     def read_metadata(self) -> dict[str, Any] | None:
         with self._lock:
@@ -160,6 +167,9 @@ class _Spool:
 
     def append_alert(self, alert: dict[str, Any]) -> None:
         self._append_record(self.alerts_path, alert)
+
+    def append_rich_value(self, value: dict[str, Any]) -> None:
+        self._append_record(self.rich_values_path, value)
 
     def _append_record(self, path: Path, record: dict[str, Any]) -> None:
         encoded = json.dumps(record, separators=(",", ":"), sort_keys=True, allow_nan=False)
@@ -185,6 +195,15 @@ class _Spool:
             1,
         )
         return (alerts[0] if alerts else None), offset
+
+    def read_rich_value(self) -> tuple[dict[str, Any] | None, int]:
+        values, offset = self._read_record_batch(
+            self.rich_values_path,
+            self.rich_ack_path,
+            self.rich_delivery_path,
+            1,
+        )
+        return (values[0] if values else None), offset
 
     def _read_record_batch(
         self,
@@ -240,6 +259,9 @@ class _Spool:
     def acknowledge_alert(self, offset: int) -> None:
         self._acknowledge(self.alert_ack_path, self.alert_delivery_path, offset)
 
+    def acknowledge_rich_value(self, offset: int) -> None:
+        self._acknowledge(self.rich_ack_path, self.rich_delivery_path, offset)
+
     def _acknowledge(self, ack_path: Path, delivery_path: Path, offset: int) -> None:
         with self._lock:
             if delivery_path.exists():
@@ -252,7 +274,7 @@ class _Spool:
             delivery_path.unlink(missing_ok=True)
 
     def pending(self) -> bool:
-        return self.pending_metrics() or self.pending_alerts()
+        return self.pending_metrics() or self.pending_alerts() or self.pending_rich_values()
 
     def pending_metrics(self) -> bool:
         return self._pending(self.ack_path, self.events_path)
@@ -260,12 +282,26 @@ class _Spool:
     def pending_alerts(self) -> bool:
         return self._pending(self.alert_ack_path, self.alerts_path)
 
+    def pending_rich_values(self) -> bool:
+        return self._pending(self.rich_ack_path, self.rich_values_path)
+
     def _pending(self, ack_path: Path, journal_path: Path) -> bool:
         with self._lock:
             return self._read_ack(ack_path, journal_path) < journal_path.stat().st_size
 
     def last_point(self) -> dict[str, Any] | None:
-        with self._lock, self.events_path.open("rb") as stream:
+        return self._last_record(self.events_path)
+
+    def last_rich_value(self) -> dict[str, Any] | None:
+        return self._last_record(self.rich_values_path)
+
+    def blob_path(self, digest: str) -> Path:
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise DeliveryError("rich value blob has an invalid SHA-256 digest")
+        return self.blob_root / digest
+
+    def _last_record(self, path: Path) -> dict[str, Any] | None:
+        with self._lock, path.open("rb") as stream:
             stream.seek(0, os.SEEK_END)
             end = stream.tell()
             if end == 0:
@@ -278,7 +314,7 @@ class _Spool:
                 position -= 1
             stream.seek(position)
             line = stream.readline()
-        return self._decode_record(line, end, self.events_path) if line.strip() else None
+        return self._decode_record(line, end, path) if line.strip() else None
 
     def pending_summary(self) -> dict[str, Any]:
         with self._lock:
@@ -380,7 +416,7 @@ class _DeliveryWorker(threading.Thread):
         self._wake = threading.Event()
         self._stopping = threading.Event()
         self._cancelled = threading.Event()
-        self._prefer_alert = False
+        self._delivery_cursor = 0
         self.last_error: Exception | None = None
 
     def notify(self) -> None:
@@ -407,23 +443,32 @@ class _DeliveryWorker(threading.Thread):
                 if not self._stopping.is_set():
                     time.sleep(self._flush_interval)
             try:
-                metrics_pending = self._spool.pending_metrics()
-                alerts_pending = self._spool.pending_alerts()
-                if alerts_pending and (self._prefer_alert or not metrics_pending):
+                delivery = self._next_delivery()
+                if delivery == "alert":
                     alert, next_offset = self._spool.read_alert()
                     if alert is None:
                         continue
                     self._client.create_alert(self._run_id, alert)
                     self._spool.acknowledge_alert(next_offset)
-                    self._prefer_alert = False
-                elif metrics_pending:
+                elif delivery == "rich":
+                    value, next_offset = self._spool.read_rich_value()
+                    if value is None:
+                        continue
+                    blob = value.get("blob")
+                    if blob is not None:
+                        self._client.upload_blob(
+                            self._spool.blob_path(str(blob["digest"])),
+                            blob,
+                        )
+                    self._client.create_rich_value(self._run_id, value)
+                    self._spool.acknowledge_rich_value(next_offset)
+                elif delivery == "metrics":
                     points, next_offset = self._spool.read_batch(self._batch_size)
                     if not points:
                         continue
                     request = {"batch_sequence": points[0]["sequence"], "points": points}
                     self._client.ingest_batch(self._run_id, request)
                     self._spool.acknowledge(next_offset)
-                    self._prefer_alert = alerts_pending
                 else:
                     continue
             except Exception as error:  # The durable journal remains authoritative.
@@ -436,6 +481,20 @@ class _DeliveryWorker(threading.Thread):
             else:
                 self.last_error = None
                 retry_delay = 0.25
+
+    def _next_delivery(self) -> str | None:
+        pending = (
+            self._spool.pending_metrics,
+            self._spool.pending_rich_values,
+            self._spool.pending_alerts,
+        )
+        names = ("metrics", "rich", "alert")
+        for offset in range(len(pending)):
+            index = (self._delivery_cursor + offset) % len(pending)
+            if pending[index]():
+                self._delivery_cursor = (index + 1) % len(pending)
+                return names[index]
+        return None
 
 
 class Run:
@@ -536,9 +595,13 @@ class Run:
             )
 
         last_point = self._spool.last_point()
+        last_rich_value = self._spool.last_rich_value()
         self._next_sequence = int(last_point["sequence"]) + 1 if last_point else 1
-        self._next_step = int(last_point["step"]) + 1 if last_point else 0
-        self._last_user_step = int(last_point["step"]) if last_point else None
+        last_steps = [
+            int(record["step"]) for record in (last_point, last_rich_value) if record is not None
+        ]
+        self._last_user_step = max(last_steps) if last_steps else None
+        self._next_step = self._last_user_step + 1 if self._last_user_step is not None else 0
         pending_summary = self._spool.pending_summary()
         self.summary._replace(
             _normalize_document({**self.summary.to_dict(), **pending_summary}, "summary")
@@ -738,13 +801,39 @@ class Run:
         with self._log_lock:
             if self._finished or self._finishing:
                 raise RuntimeError("cannot log while a run is finishing or finished")
-            metrics = _flatten_metrics(data)
-            if not metrics:
-                raise ValueError("log data contains no numeric scalar metrics")
+            metrics, rich_values = _flatten_log_values(data)
+            if not metrics and not rich_values:
+                raise ValueError("log data contains no supported values")
             selected_step = self._next_step if step is None else step
             _validate_step(selected_step)
-            self._append_metrics(metrics, selected_step, advance_step=True, summarize=True)
+            prepared_values = []
+            if rich_values and self.mode != "disabled":
+                assert self._spool is not None
+                for key, value in rich_values:
+                    _validate_rich_key(key)
+                    prepared_values.append((key, value._prepare(self._spool.blob_root)))
+            if metrics:
+                self._append_metrics(metrics, selected_step, advance_step=False, summarize=True)
+            if prepared_values:
+                assert self._spool is not None
+                timestamp_ms = time.time_ns() // 1_000_000
+                for key, prepared in prepared_values:
+                    self._spool.append_rich_value(
+                        {
+                            "id": _uuid7(),
+                            "key": key,
+                            "kind": prepared.kind,
+                            "step": selected_step,
+                            "timestamp_ms": timestamp_ms,
+                            "blob": prepared.blob,
+                            "metadata": _normalize_document(
+                                prepared.metadata,
+                                f"rich value '{key}' metadata",
+                            ),
+                        }
+                    )
             self._last_user_step = selected_step
+            self._next_step = selected_step + 1
         if self._worker is not None:
             self._worker.notify()
 
@@ -1147,6 +1236,47 @@ def _flatten_metrics(data: Mapping[str, Any], prefix: str = "") -> dict[str, flo
                 "rich values are not implemented yet"
             )
     return flattened
+
+
+def _flatten_log_values(
+    data: Mapping[str, Any],
+    prefix: str = "",
+) -> tuple[dict[str, float], list[tuple[str, RichValue]]]:
+    if not isinstance(data, Mapping):
+        raise TypeError("log data must be a mapping")
+    metrics: dict[str, float] = {}
+    rich_values: list[tuple[str, RichValue]] = []
+    for raw_key, value in data.items():
+        key = f"{prefix}/{raw_key}" if prefix else str(raw_key)
+        if isinstance(value, Mapping):
+            nested_metrics, nested_rich_values = _flatten_log_values(value, key)
+            metrics.update(nested_metrics)
+            rich_values.extend(nested_rich_values)
+        elif isinstance(value, RichValue):
+            rich_values.append((key, value))
+        elif isinstance(value, bool):
+            metrics[key] = float(value)
+        elif isinstance(value, (int, float)):
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError(f"metric '{key}' must be finite")
+            metrics[key] = number
+        else:
+            raise TypeError(
+                f"metric '{key}' has unsupported type {type(value).__name__}; "
+                "use a native Runloom rich value"
+            )
+    return metrics, rich_values
+
+
+def _validate_rich_key(key: str) -> None:
+    encoded = key.encode("utf-8")
+    if (
+        not encoded
+        or len(encoded) > 256
+        or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in key)
+    ):
+        raise ValueError("rich value key must contain 1 to 256 non-control bytes")
 
 
 def _collect_document_updates(

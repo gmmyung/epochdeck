@@ -17,6 +17,7 @@ anyhow = "1.0"
 arrow-array = "59.2"
 arrow-schema = "59.2"
 axum = "0.8"
+futures-util = "=0.3.31"
 parquet = { version = "59.2", features = ["arrow", "zstd"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -39,8 +40,10 @@ tower-http = { version = "0.6", features = [
   "compression-br",
   "compression-gzip",
   "request-id",
+  "fs",
   "trace",
 ] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.0", features = ["serde", "v7"] }

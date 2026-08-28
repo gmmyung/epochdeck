@@ -45,6 +45,8 @@ pub enum StorageError {
     Parquet(#[from] parquet::errors::ParquetError),
     #[error("invalid metric segment: {0}")]
     InvalidSegment(String),
+    #[error("invalid blob: {0}")]
+    InvalidBlob(String),
     #[error("metric compaction was cancelled")]
     Cancelled,
 }
@@ -54,6 +56,107 @@ pub struct StorageLayout {
     data_dir: PathBuf,
     metrics_dir: PathBuf,
     blobs_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlobStore {
+    root: Arc<PathBuf>,
+}
+
+impl BlobStore {
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: Arc::new(root.into()),
+        }
+    }
+
+    pub fn ensure(&self) -> Result<(), StorageError> {
+        for path in [self.root.as_path(), &self.staging_dir()] {
+            std::fs::create_dir_all(path).map_err(|source| StorageError::CreateDirectory {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn staging_path(&self) -> Result<PathBuf, StorageError> {
+        self.ensure()?;
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Ok(self
+            .staging_dir()
+            .join(format!("upload-{}-{sequence}.tmp", std::process::id())))
+    }
+
+    pub fn install(&self, staging_path: &Path, digest: &str) -> Result<PathBuf, StorageError> {
+        validate_blob_digest(digest)?;
+        let final_path = self.path(digest)?;
+        let parent = final_path.parent().ok_or_else(|| {
+            StorageError::InvalidBlob("blob path has no parent directory".to_owned())
+        })?;
+        std::fs::create_dir_all(parent).map_err(|source| StorageError::CreateDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        match std::fs::hard_link(staging_path, &final_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(StorageError::Io {
+                    path: final_path,
+                    source,
+                });
+            }
+        }
+        std::fs::remove_file(staging_path).map_err(|source| StorageError::Io {
+            path: staging_path.to_path_buf(),
+            source,
+        })?;
+        sync_path(&final_path)?;
+        sync_path(parent)?;
+        Ok(final_path)
+    }
+
+    pub fn path(&self, digest: &str) -> Result<PathBuf, StorageError> {
+        validate_blob_digest(digest)?;
+        Ok(self.root.join("sha256").join(&digest[..2]).join(digest))
+    }
+
+    pub fn size(&self, digest: &str) -> Result<Option<u64>, StorageError> {
+        let path = self.path(digest)?;
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+            Ok(_) => Err(StorageError::InvalidBlob(format!(
+                "blob path is not a regular file: {}",
+                path.display()
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(StorageError::Io { path, source }),
+        }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        self.root.as_path()
+    }
+
+    fn staging_dir(&self) -> PathBuf {
+        self.root.join("staging")
+    }
+}
+
+pub fn validate_blob_digest(digest: &str) -> Result<(), StorageError> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StorageError::InvalidBlob(
+            "SHA-256 digest must be 64 lowercase hexadecimal characters".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 impl StorageLayout {
@@ -376,6 +479,11 @@ impl MetricStore {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn write_batch(
@@ -1041,10 +1149,12 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use runloom_protocol::{IngestBatchRequest, MetricPoint, ProjectId, RunId};
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     use super::{
-        CompactionSource, MetricStore, MinMaxHistorySampler, SegmentSource, StorageLayout,
+        BlobStore, CompactionSource, MetricStore, MinMaxHistorySampler, SegmentSource,
+        StorageLayout,
     };
 
     #[test]
@@ -1065,6 +1175,25 @@ mod tests {
         );
         assert!(layout.metrics_dir().exists());
         assert!(layout.blob_staging_dir().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn installs_content_addressed_blobs_idempotently() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let store = BlobStore::new(directory.path());
+        let digest = format!("{:x}", Sha256::digest(b"blob-content"));
+        let first = store.staging_path()?;
+        std::fs::write(&first, b"blob-content")?;
+        let installed = store.install(&first, &digest)?;
+        let replay = store.staging_path()?;
+        std::fs::write(&replay, b"blob-content")?;
+        assert_eq!(store.install(&replay, &digest)?, installed);
+
+        assert_eq!(store.size(&digest)?, Some(12));
+        assert_eq!(std::fs::read(installed)?, b"blob-content");
+        assert!(!first.exists());
+        assert!(!replay.exists());
         Ok(())
     }
 

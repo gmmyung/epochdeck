@@ -17,6 +17,8 @@ pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
 pub const MAX_SUMMARY_BYTES: usize = 256 * 1024;
 pub const MAX_ALERT_TITLE_BYTES: usize = 256;
 pub const MAX_ALERT_TEXT_BYTES: usize = 4 * 1024;
+pub const MAX_RICH_KEY_BYTES: usize = 256;
+pub const MAX_RICH_METADATA_BYTES: usize = 256 * 1024;
 
 macro_rules! uuid_identifier {
     ($name:ident) => {
@@ -56,6 +58,9 @@ macro_rules! uuid_identifier {
 uuid_identifier!(ProjectId);
 uuid_identifier!(RunId);
 uuid_identifier!(AlertId);
+uuid_identifier!(RichValueId);
+uuid_identifier!(ArtifactId);
+uuid_identifier!(TraceSpanId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -113,6 +118,43 @@ pub enum AlertLevel {
     Info,
     Warn,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RichValueKind {
+    Image,
+    Audio,
+    Video,
+    Table,
+    Histogram,
+}
+
+impl fmt::Display for RichValueKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Image => formatter.write_str("image"),
+            Self::Audio => formatter.write_str("audio"),
+            Self::Video => formatter.write_str("video"),
+            Self::Table => formatter.write_str("table"),
+            Self::Histogram => formatter.write_str("histogram"),
+        }
+    }
+}
+
+impl FromStr for RichValueKind {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "image" => Ok(Self::Image),
+            "audio" => Ok(Self::Audio),
+            "video" => Ok(Self::Video),
+            "table" => Ok(Self::Table),
+            "histogram" => Ok(Self::Histogram),
+            _ => Err("unknown rich value kind"),
+        }
+    }
 }
 
 impl fmt::Display for AlertLevel {
@@ -313,6 +355,60 @@ pub struct CreateAlertResponse {
 pub struct AlertListResponse {
     pub alerts: Vec<AlertRecord>,
     pub next_before: Option<AlertId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRef {
+    pub digest: String,
+    pub size: u64,
+    pub mime_type: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobUploadResponse {
+    pub blob: BlobRef,
+    pub duplicate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateRichValueRequest {
+    #[serde(default)]
+    pub id: Option<RichValueId>,
+    pub key: String,
+    pub kind: RichValueKind,
+    pub step: u64,
+    pub timestamp_ms: i64,
+    #[serde(default)]
+    pub blob: Option<BlobRef>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RichValueRecord {
+    pub id: RichValueId,
+    pub run_id: RunId,
+    pub key: String,
+    pub kind: RichValueKind,
+    pub step: u64,
+    pub timestamp_ms: i64,
+    pub blob: Option<BlobRef>,
+    pub metadata: BTreeMap<String, Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateRichValueResponse {
+    pub value: RichValueRecord,
+    pub duplicate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RichValueListResponse {
+    pub values: Vec<RichValueRecord>,
+    pub next_before: Option<RichValueId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

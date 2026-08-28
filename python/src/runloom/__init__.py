@@ -2,18 +2,24 @@ from typing import Any
 
 from runloom.api import alert, current_run, finish, init, log
 from runloom.client import Health, RunloomApiError, RunloomClient
+from runloom.rich import Audio, Histogram, Image, Table, Video
 from runloom.run import DeliveryError, Run, RunConfig, RunSummary, sync_spool
 
 run: Run | None = current_run()
 
 __all__ = [
+    "Audio",
     "DeliveryError",
     "Health",
+    "Histogram",
+    "Image",
     "Run",
     "RunConfig",
     "RunSummary",
     "RunloomApiError",
     "RunloomClient",
+    "Table",
+    "Video",
     "alert",
     "current_run",
     "finish",

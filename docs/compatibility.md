@@ -23,7 +23,7 @@ usable and tested, not that the entire feature group is complete.
 | Summary | automatic latest-value summary and explicit overrides | Compatible |
 | Scalar metrics | steps, timestamps, nested keys, batching | Compatible |
 | System metrics | CPU, memory, disk, GPU when available | Compatible |
-| Rich values | images, audio, video, tables, histograms | Planned |
+| Rich values | images, audio, video, tables, histograms | Compatible |
 | Alerts | levels, titles, text, steps, timestamps | Compatible |
 | Artifacts | manifests, versions, aliases, input/output links | Planned |
 | Traces | structured spans, messages, search metadata | Planned |
@@ -44,8 +44,8 @@ deployment model.
 | Drop-in workflow | `import runloom as wandb` for common training code | Partial |
 | Run modes | online, offline, disabled, resume policies | Compatible |
 | Public API | projects, runs, filters, history, files, artifacts | Planned |
-| Media semantics | captions, grouping, sequences, native playback | Planned |
-| Tables | typed columns, incremental data, linked rich values | Planned |
+| Media semantics | captions, grouping, sequences, native playback | Partial |
+| Tables | typed columns, incremental data, linked rich values | Partial |
 | Artifacts | collections, versions, aliases, lineage, downloads | Planned |
 | Sweeps | definitions, agents, scheduling, early termination | Planned |
 | Reports | persisted dashboard/report definitions | Planned |
@@ -89,3 +89,11 @@ first user metric. Set `RUNLOOM_SYSTEM_METRICS_INTERVAL=0` to disable it. System
 samples use the most recently completed user step and never change automatic
 step progression or the run summary. Alerts use a separate fsynced journal,
 sortable UUIDv7 identities, idempotent delivery, and a bounded dashboard list.
+
+Native `Image`, `Audio`, `Video`, `Table`, and `Histogram` values share the
+durable run step with scalar values. Media and table bytes are hashed and copied
+into the local spool before `log` returns, uploaded by streaming PUT, and stored
+once in the server's SHA-256 blob root. The dashboard uses lazy images,
+metadata-only audio/video loading, HTTP range playback, bounded table previews,
+and Canvas histograms. The wider W&B media row-grouping, array conversion, and
+incremental mutable-table surface remains partial.

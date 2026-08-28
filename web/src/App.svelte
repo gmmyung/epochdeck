@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
 
   import {
+    blobUrl,
     getAlerts,
     getHealth,
     getHistory,
@@ -9,11 +10,13 @@
     getProjects,
     getRun,
     getRuns,
+    getRichValues,
     getSampledHistory,
     type Alert,
     type Health,
     type History,
     type Project,
+    type RichValue,
     type Run,
   } from "./lib/api";
   import {
@@ -23,6 +26,7 @@
     mergeHistoryDelta,
   } from "./lib/history-cache";
   import MetricChart from "./lib/MetricChart.svelte";
+  import HistogramChart from "./lib/HistogramChart.svelte";
 
   const MAX_CONCURRENT_CHART_REQUESTS = 4;
   const LIVE_REFRESH_MS = 2_000;
@@ -35,6 +39,7 @@
   let selectedRun: Run | null = null;
   let metricKeys: string[] = [];
   let alerts: Alert[] = [];
+  let richValues: RichValue[] = [];
   let histories: Record<string, History> = {};
   let historyRevisions: Record<string, number> = {};
   let loadingMetrics = new Set<string>();
@@ -91,9 +96,10 @@
     selectedRun = run;
     error = null;
     try {
-      [metricKeys, alerts] = await Promise.all([
+      [metricKeys, alerts, richValues] = await Promise.all([
         getMetricKeys(run.id, controller.signal),
         getAlerts(run.id, controller.signal),
+        getRichValues(run.id, controller.signal),
       ]);
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
@@ -105,6 +111,7 @@
     selectedRun = null;
     metricKeys = [];
     alerts = [];
+    richValues = [];
     resetChartState();
   }
 
@@ -202,7 +209,10 @@
       const revisionChanged = latest.metric_revision !== selectedRun.metric_revision;
       selectedRun = latest;
       runs = runs.map((candidate) => (candidate.id === latest.id ? latest : candidate));
-      alerts = await getAlerts(latest.id, controller.signal);
+      [alerts, richValues] = await Promise.all([
+        getAlerts(latest.id, controller.signal),
+        getRichValues(latest.id, controller.signal),
+      ]);
       if (revisionChanged) {
         metricKeys = await getMetricKeys(latest.id, controller.signal);
         for (const metric of visibleMetrics) queueMetric(metric);
@@ -228,6 +238,32 @@
 
   function formatAlertTime(timestampMs: number): string {
     return new Date(timestampMs).toLocaleString();
+  }
+
+  function metadataString(value: RichValue, key: string): string | undefined {
+    const result = value.metadata[key];
+    return typeof result === "string" ? result : undefined;
+  }
+
+  function histogramCounts(value: RichValue): number[] {
+    const counts = value.metadata.counts;
+    return Array.isArray(counts)
+      ? counts.filter((item): item is number => typeof item === "number")
+      : [];
+  }
+
+  function tableColumns(value: RichValue): string[] {
+    const columns = value.metadata.columns;
+    return Array.isArray(columns)
+      ? columns.filter((item): item is string => typeof item === "string")
+      : [];
+  }
+
+  function tablePreview(value: RichValue): unknown[][] {
+    const preview = value.metadata.preview;
+    return Array.isArray(preview)
+      ? preview.filter((item): item is unknown[] => Array.isArray(item))
+      : [];
   }
 </script>
 
@@ -348,6 +384,66 @@
                   {/each}
                 </div>
               </article>
+            {/if}
+
+            {#if richValues.length > 0}
+              <div class="metrics-heading">
+                <div>
+                  <p class="eyebrow">Native playback and previews</p>
+                  <h2>Media & data</h2>
+                </div>
+                <span>{richValues.length} most recent</span>
+              </div>
+              <div class="rich-grid">
+                {#each richValues as value (value.id)}
+                  <article class="rich-card">
+                    <div class="card-heading">
+                      <div>
+                        <small>{value.kind} · step {value.step}</small><strong>{value.key}</strong>
+                      </div>
+                      {#if value.blob}
+                        <a href={blobUrl(value.blob)} download={value.blob.file_name ?? undefined}
+                          >download</a
+                        >
+                      {/if}
+                    </div>
+                    {#if value.kind === "image" && value.blob}
+                      <img
+                        loading="lazy"
+                        src={blobUrl(value.blob)}
+                        alt={metadataString(value, "caption") ?? value.key}
+                      />
+                    {:else if value.kind === "audio" && value.blob}
+                      <audio controls preload="metadata" src={blobUrl(value.blob)}></audio>
+                    {:else if value.kind === "video" && value.blob}
+                      <!-- svelte-ignore a11y_media_has_caption -->
+                      <video controls preload="metadata" src={blobUrl(value.blob)}></video>
+                    {:else if value.kind === "histogram"}
+                      <HistogramChart counts={histogramCounts(value)} label={value.key} />
+                    {:else if value.kind === "table"}
+                      <div class="table-preview">
+                        <table>
+                          <thead
+                            ><tr
+                              >{#each tableColumns(value) as column}<th>{column}</th>{/each}</tr
+                            ></thead
+                          >
+                          <tbody>
+                            {#each tablePreview(value) as row}
+                              <tr
+                                >{#each row as cell}<td>{formatValue(cell)}</td>{/each}</tr
+                              >
+                            {/each}
+                          </tbody>
+                        </table>
+                      </div>
+                    {/if}
+                    {#if metadataString(value, "caption")}<p class="media-caption">
+                        {metadataString(value, "caption")}
+                      </p>{/if}
+                  </article>
+                {/each}
+              </div>
             {/if}
 
             <div class="metrics-heading">

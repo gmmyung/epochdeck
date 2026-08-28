@@ -15,6 +15,7 @@ assert wandb.run is run
 run.config.update({"optimizer": "adam"})
 run.config.update({"seed": 7}, allow_val_change=True)
 wandb.log({"loss": 0.25})
+wandb.log({"rollout": wandb.Video("rollout.mp4", caption="latest policy")})
 wandb.alert("Checkpoint saved", "Validation improved", level="info")
 wandb.summary["status"] = "complete"
 wandb.finish(summary={"tags": ["baseline", None]})
@@ -36,3 +37,22 @@ metric. Set `RUNLOOM_SYSTEM_METRICS_INTERVAL=0` to disable collection or a
 positive number of seconds to change the interval. System metrics do not change
 automatic steps or the user summary. Alerts accept `info`, `warn`, and `error`
 levels and use a separate durable delivery journal.
+
+Native rich values can be mixed with scalars in the same step:
+
+```python
+run.log(
+    {
+        "frame": wandb.Image("frame.png", caption="camera 0"),
+        "audio": wandb.Audio("episode.wav", sample_rate=48_000),
+        "video": wandb.Video("episode.mp4"),
+        "scores": wandb.Table(columns=["step", "score"], data=rows),
+        "rewards": wandb.Histogram(reward_values, num_bins=64),
+    }
+)
+```
+
+Media and tables are serialized into a local SHA-256 spool using bounded copy
+buffers before upload. Table iterables are consumed once and store a bounded
+dashboard preview; histogram iterables spill to a temporary file while exact
+bins are computed, so neither requires retaining a complete generator in memory.

@@ -8,10 +8,10 @@ The immediate compatibility milestone is Trackio feature parity. The long-term
 contract is practical W&B feature parity across logging, run management, rich
 media, artifacts, querying, and the dashboard.
 
-Runloom is pre-alpha. Scalar run tracking, host telemetry, durable alerts,
-bounded dashboard sampling, and background metric compaction are usable end to
-end; rich media, artifacts, authentication, sweeps, and the wider compatibility
-surface remain under active development.
+Runloom is pre-alpha. Scalar run tracking, native rich media, host telemetry,
+durable alerts, bounded dashboard sampling, and background metric compaction are
+usable end to end; artifacts, authentication, sweeps, and the wider
+compatibility surface remain under active development.
 
 ## Non-negotiable properties
 
@@ -80,6 +80,7 @@ run = wandb.init(
 )
 for step in range(1_000):
     run.log({"train": {"loss": 1 / (step + 1)}, "reward": step * 0.1})
+run.log({"rollout": wandb.Video("rollout.mp4", caption="latest policy")})
 run.alert("Checkpoint saved", "Validation improved", level="info")
 run.config.update({"optimizer": "adam"})
 run.summary["result"] = "complete"
@@ -106,8 +107,14 @@ runloom sync ~/.local/share/runloom/spool/<run-id>
 
 Metric history accepts finite numbers and booleans. Config and summary documents
 accept bounded JSON values, including strings, booleans, nulls, arrays, and
-nested objects. Unsupported rich metric values fail explicitly until their
-native implementations land.
+nested objects. Unsupported metric object types fail explicitly; native rich
+values use the types below.
+
+Rich log values use `Image`, `Audio`, `Video`, `Table`, and `Histogram`.
+Runloom copies their bytes into the durable local spool, streams uploads without
+buffering complete files, and deduplicates server content by SHA-256. Put
+`RUNLOOM_BLOBS_DIR` on HDD/ZFS while leaving the catalog and metric roots on SSD.
+The dashboard renders each type natively and video delivery supports byte ranges.
 
 ## Repository layout
 

@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use runloom_protocol::{
-    AlertId, AlertLevel, AlertRecord, CreateAlertRequest, CreateRunRequest, MAX_CONFIG_BYTES,
-    MAX_SUMMARY_BYTES, ProjectId, ProjectSummary, ResumePolicy, RunId, RunRecord, RunState,
+    AlertId, AlertLevel, AlertRecord, BlobRef, CreateAlertRequest, CreateRichValueRequest,
+    CreateRunRequest, MAX_CONFIG_BYTES, MAX_SUMMARY_BYTES, ProjectId, ProjectSummary, ResumePolicy,
+    RichValueId, RichValueKind, RichValueRecord, RunId, RunRecord, RunState,
 };
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
@@ -94,6 +95,21 @@ CREATE TABLE IF NOT EXISTS run_alerts (
 
 CREATE INDEX IF NOT EXISTS idx_run_alerts_run_id
     ON run_alerts(run_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS run_rich_values (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    step INTEGER NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    blob_json TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_rich_values_run_id
+    ON run_rich_values(run_id, id DESC);
 "#;
 
 #[derive(Debug, Error)]
@@ -344,6 +360,102 @@ impl Catalog {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(alert_from_row).collect()
+    }
+
+    pub async fn create_rich_value(
+        &self,
+        run_id: RunId,
+        request: &CreateRichValueRequest,
+    ) -> Result<(RichValueRecord, bool), CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        ensure_running(&mut transaction, run_id).await?;
+        let value_id = request.id.unwrap_or_default();
+        if let Some(existing) = load_rich_value(&mut transaction, value_id).await? {
+            let matches = existing.run_id == run_id
+                && existing.key == request.key
+                && existing.kind == request.kind
+                && existing.step == request.step
+                && existing.timestamp_ms == request.timestamp_ms
+                && existing.blob == request.blob
+                && existing.metadata == request.metadata;
+            if !matches {
+                return Err(CatalogError::Conflict(
+                    "rich value ID was reused with different contents".to_owned(),
+                ));
+            }
+            transaction.commit().await?;
+            return Ok((existing, true));
+        }
+        let blob_json = request
+            .blob
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        let metadata_json = serde_json::to_string(&request.metadata)
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        query(
+            "INSERT INTO run_rich_values \
+             (id, run_id, key, kind, step, timestamp_ms, blob_json, metadata_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)",
+        )
+        .bind(value_id.to_string())
+        .bind(run_id.to_string())
+        .bind(&request.key)
+        .bind(request.kind.to_string())
+        .bind(to_i64(request.step, "rich value step")?)
+        .bind(request.timestamp_ms)
+        .bind(blob_json)
+        .bind(metadata_json)
+        .execute(&mut *transaction)
+        .await?;
+        query(
+            "UPDATE run_revisions SET rich_data_revision = rich_data_revision + 1 WHERE run_id = ?",
+        )
+        .bind(run_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        touch_run(&mut transaction, run_id).await?;
+        let value = load_required_rich_value(&mut transaction, value_id).await?;
+        transaction.commit().await?;
+        Ok((value, false))
+    }
+
+    pub async fn list_rich_values(
+        &self,
+        run_id: RunId,
+        before: Option<RichValueId>,
+        limit: usize,
+    ) -> Result<Vec<RichValueRecord>, CatalogError> {
+        self.get_run(run_id).await?;
+        let before = before.map(|value| value.to_string());
+        let rows = query(
+            "SELECT id, run_id, key, kind, step, timestamp_ms, blob_json, metadata_json, created_at \
+             FROM run_rich_values WHERE run_id = ? AND (? IS NULL OR id < ?) \
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(run_id.to_string())
+        .bind(&before)
+        .bind(&before)
+        .bind(to_i64(limit as u64, "rich value limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(rich_value_from_row).collect()
+    }
+
+    pub async fn rich_value_next_step(&self, run_id: RunId) -> Result<u64, CatalogError> {
+        self.get_run(run_id).await?;
+        let maximum: Option<i64> =
+            query("SELECT MAX(step) AS maximum_step FROM run_rich_values WHERE run_id = ?")
+                .bind(run_id.to_string())
+                .fetch_one(&self.pool)
+                .await?
+                .get("maximum_step");
+        maximum.map_or(Ok(0), |value| {
+            from_i64(value, "rich value step")?
+                .checked_add(1)
+                .ok_or_else(|| CatalogError::InvalidData("run step overflow".to_owned()))
+        })
     }
 
     pub async fn create_or_resume_run(
@@ -1003,6 +1115,31 @@ async fn load_required_alert(
         })
 }
 
+async fn load_rich_value(
+    transaction: &mut Transaction<'_, Sqlite>,
+    value_id: RichValueId,
+) -> Result<Option<RichValueRecord>, CatalogError> {
+    let row = query(
+        "SELECT id, run_id, key, kind, step, timestamp_ms, blob_json, metadata_json, created_at \
+         FROM run_rich_values WHERE id = ?",
+    )
+    .bind(value_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.map(rich_value_from_row).transpose()
+}
+
+async fn load_required_rich_value(
+    transaction: &mut Transaction<'_, Sqlite>,
+    value_id: RichValueId,
+) -> Result<RichValueRecord, CatalogError> {
+    load_rich_value(transaction, value_id)
+        .await?
+        .ok_or_else(|| CatalogError::NotFound {
+            resource: format!("rich value {value_id}"),
+        })
+}
+
 async fn load_document(
     transaction: &mut Transaction<'_, Sqlite>,
     run_id: RunId,
@@ -1072,6 +1209,28 @@ fn alert_from_row(row: SqliteRow) -> Result<AlertRecord, CatalogError> {
             .map_err(|error| CatalogError::InvalidData(error.to_owned()))?,
         step,
         timestamp_ms: row.get("timestamp_ms"),
+        created_at: row.get("created_at"),
+    })
+}
+
+fn rich_value_from_row(row: SqliteRow) -> Result<RichValueRecord, CatalogError> {
+    let blob = row
+        .get::<Option<String>, _>("blob_json")
+        .map(|value| {
+            serde_json::from_str::<BlobRef>(&value)
+                .map_err(|error| CatalogError::InvalidData(error.to_string()))
+        })
+        .transpose()?;
+    Ok(RichValueRecord {
+        id: parse_id(row.get::<String, _>("id"), "rich value ID")?,
+        run_id: parse_id(row.get::<String, _>("run_id"), "run ID")?,
+        key: row.get("key"),
+        kind: RichValueKind::from_str(&row.get::<String, _>("kind"))
+            .map_err(|error| CatalogError::InvalidData(error.to_owned()))?,
+        step: from_i64(row.get("step"), "rich value step")?,
+        timestamp_ms: row.get("timestamp_ms"),
+        blob,
+        metadata: parse_document(row.get::<String, _>("metadata_json"), "rich metadata")?,
         created_at: row.get("created_at"),
     })
 }

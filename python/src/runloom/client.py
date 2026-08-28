@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -122,6 +123,42 @@ class RunloomClient:
         return self._request(
             "GET",
             f"/api/v1/runs/{quote(run_id, safe='')}/alerts",
+            params=params,
+        )
+
+    def upload_blob(self, path: Path, blob: dict[str, Any]) -> dict[str, Any]:
+        headers = {
+            "content-type": str(blob["mime_type"]),
+            "content-length": str(blob["size"]),
+        }
+        with path.open("rb") as stream:
+            return self._request(
+                "PUT",
+                f"/api/v1/blobs/{quote(str(blob['digest']), safe='')}",
+                headers=headers,
+                content=stream,
+            )
+
+    def create_rich_value(self, run_id: str, value: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/runs/{quote(run_id, safe='')}/rich-values",
+            json=value,
+        )
+
+    def rich_values(
+        self,
+        run_id: str,
+        *,
+        before: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        params = {"limit": limit}
+        if before is not None:
+            params["before"] = before
+        return self._request(
+            "GET",
+            f"/api/v1/runs/{quote(run_id, safe='')}/rich-values",
             params=params,
         )
 
