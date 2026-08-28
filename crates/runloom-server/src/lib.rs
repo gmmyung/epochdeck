@@ -24,14 +24,15 @@ use runloom_protocol::{
     ArtifactListResponse, ArtifactRecord, ArtifactRelation, BlobRef, BlobUploadResponse,
     ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse, CreateArtifactRequest,
     CreateArtifactResponse, CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest,
-    CreateRunResponse, FinishRunRequest, FinishRunResponse, HealthResponse, HistoryResponse,
-    IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES,
-    MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS, MAX_CONFIG_BYTES,
-    MAX_HISTORY_KEYS, MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES,
-    MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES, MetricKeyListResponse, ProjectListResponse,
-    ResumePolicy, RichValueId, RichValueKind, RichValueListResponse, RunArtifactListResponse,
-    RunId, RunListResponse, RunRecord, RunState, RunUpdateResponse, SummaryUpdateRequest,
-    UseArtifactRequest,
+    CreateRunResponse, CreateTraceSpanRequest, CreateTraceSpanResponse, FinishRunRequest,
+    FinishRunResponse, HealthResponse, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
+    MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES, MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES,
+    MAX_BATCH_POINTS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS, MAX_HISTORY_POINTS,
+    MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES,
+    MAX_TRACE_METADATA_BYTES, MetricKeyListResponse, ProjectListResponse, ResumePolicy,
+    RichValueId, RichValueKind, RichValueListResponse, RunArtifactListResponse, RunId,
+    RunListResponse, RunRecord, RunState, RunUpdateResponse, SummaryUpdateRequest, TraceSpanId,
+    TraceSpanListResponse, UseArtifactRequest,
 };
 use runloom_storage::{
     BlobStore, MetricStore, MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
@@ -59,6 +60,9 @@ const MAX_ARTIFACT_TYPE_BYTES: usize = 64;
 const MAX_ARTIFACT_ALIAS_BYTES: usize = 128;
 const MAX_ARTIFACT_PATH_BYTES: usize = 1_024;
 const MAX_ARTIFACT_DESCRIPTION_BYTES: usize = 64 * 1024;
+const MAX_TRACE_ID_BYTES: usize = 128;
+const MAX_TRACE_NAME_BYTES: usize = 256;
+const MAX_TRACE_SEARCH_BYTES: usize = 256;
 
 #[derive(Debug, Clone)]
 struct AppState {
@@ -140,6 +144,11 @@ pub fn app_with_runtime_and_blobs(
             "/api/v1/artifacts/{artifact_id}/files/{*artifact_path}",
             get(get_artifact_file),
         )
+        .route(
+            "/api/v1/runs/{run_id}/traces",
+            post(create_trace_span).get(list_trace_spans),
+        )
+        .route("/api/v1/traces/{span_id}", get(get_trace_span))
         .route("/api/v1/blobs/{digest}", put(upload_blob).get(get_blob))
         .route("/api/v1/runs/{run_id}/history", get(history))
         .with_state(AppState {
@@ -641,6 +650,73 @@ async fn get_artifact_file(
     .await
 }
 
+async fn create_trace_span(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    Json(request): Json<CreateTraceSpanRequest>,
+) -> Result<(StatusCode, Json<CreateTraceSpanResponse>), HttpError> {
+    validate_trace_span(&request)?;
+    if let Some(payload) = &request.payload {
+        let actual_size = state
+            .blobs
+            .size(&payload.digest)
+            .map_err(|error| HttpError::invalid(error.to_string()))?
+            .ok_or_else(|| HttpError::invalid("trace payload blob has not been uploaded"))?;
+        if actual_size != payload.size {
+            return Err(HttpError::invalid(
+                "trace payload size does not match uploaded content",
+            ));
+        }
+    }
+    let (span, duplicate) = state.catalog.create_trace_span(run_id, &request).await?;
+    let status = if duplicate {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(CreateTraceSpanResponse { span, duplicate })))
+}
+
+#[derive(Debug, Deserialize)]
+struct TraceListQuery {
+    before: Option<TraceSpanId>,
+    q: Option<String>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+async fn list_trace_spans(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    Query(query): Query<TraceListQuery>,
+) -> Result<Json<TraceSpanListResponse>, HttpError> {
+    validate_list_limit(query.limit)?;
+    if query.q.as_ref().is_some_and(|value| {
+        value.len() > MAX_TRACE_SEARCH_BYTES || value.chars().any(char::is_control)
+    }) {
+        return Err(HttpError::invalid(format!(
+            "trace search cannot exceed {MAX_TRACE_SEARCH_BYTES} non-control bytes"
+        )));
+    }
+    let spans = state
+        .catalog
+        .list_trace_spans(run_id, query.before, query.q.as_deref(), query.limit)
+        .await?;
+    let next_before = if spans.len() == query.limit {
+        spans.last().map(|span| span.id)
+    } else {
+        None
+    };
+    Ok(Json(TraceSpanListResponse { spans, next_before }))
+}
+
+async fn get_trace_span(
+    State(state): State<AppState>,
+    Path(span_id): Path<TraceSpanId>,
+) -> Result<Json<runloom_protocol::TraceSpanRecord>, HttpError> {
+    Ok(Json(state.catalog.get_trace_span(span_id).await?))
+}
+
 async fn upload_blob(
     State(state): State<AppState>,
     Path(digest): Path<String>,
@@ -1094,6 +1170,44 @@ fn verify_artifact_blobs(
     Ok(())
 }
 
+fn validate_trace_span(request: &CreateTraceSpanRequest) -> Result<(), HttpError> {
+    if request.trace_id.is_empty()
+        || request.trace_id.len() > MAX_TRACE_ID_BYTES
+        || request.trace_id.chars().any(char::is_control)
+    {
+        return Err(HttpError::invalid(format!(
+            "trace ID must contain 1 to {MAX_TRACE_ID_BYTES} non-control bytes"
+        )));
+    }
+    if request.name.is_empty()
+        || request.name.len() > MAX_TRACE_NAME_BYTES
+        || request.name.chars().any(char::is_control)
+    {
+        return Err(HttpError::invalid(format!(
+            "trace name must contain 1 to {MAX_TRACE_NAME_BYTES} non-control bytes"
+        )));
+    }
+    if request.start_time_ms < 0
+        || request.end_time_ms < 0
+        || request.end_time_ms < request.start_time_ms
+    {
+        return Err(HttpError::invalid(
+            "trace timestamps must be non-negative and end at or after start",
+        ));
+    }
+    validate_document_size(
+        &request.attributes,
+        "trace attributes",
+        MAX_TRACE_METADATA_BYTES,
+    )?;
+    validate_document_size(&request.preview, "trace preview", MAX_TRACE_METADATA_BYTES)?;
+    if let Some(payload) = &request.payload {
+        validate_mime_type(&payload.mime_type)?;
+        validate_file_name(payload.file_name.as_deref())?;
+    }
+    Ok(())
+}
+
 fn validate_mime_type(value: &str) -> Result<(), HttpError> {
     if value.is_empty()
         || value.len() > MAX_MIME_TYPE_BYTES
@@ -1356,11 +1470,13 @@ mod tests {
         AlertId, AlertLevel, AlertListResponse, ArtifactEntry, ArtifactListResponse, BlobRef,
         BlobUploadResponse, ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse,
         CreateArtifactRequest, CreateArtifactResponse, CreateRichValueRequest,
-        CreateRichValueResponse, CreateRunRequest, CreateRunResponse, FinishRunRequest,
-        FinishRunResponse, HealthResponse, HealthStatus, HistoryResponse, IngestBatchRequest,
-        IngestBatchResponse, MetricKeyListResponse, MetricPoint, ProjectListResponse, ResumePolicy,
-        RichValueId, RichValueKind, RichValueListResponse, RunArtifactListResponse,
-        RunListResponse, RunUpdateResponse, SummaryUpdateRequest, UseArtifactRequest,
+        CreateRichValueResponse, CreateRunRequest, CreateRunResponse, CreateTraceSpanRequest,
+        CreateTraceSpanResponse, FinishRunRequest, FinishRunResponse, HealthResponse, HealthStatus,
+        HistoryResponse, IngestBatchRequest, IngestBatchResponse, MetricKeyListResponse,
+        MetricPoint, ProjectListResponse, ResumePolicy, RichValueId, RichValueKind,
+        RichValueListResponse, RunArtifactListResponse, RunListResponse, RunUpdateResponse,
+        SummaryUpdateRequest, TraceKind, TraceSpanId, TraceSpanListResponse, TraceSpanRecord,
+        TraceStatus, UseArtifactRequest,
     };
     use runloom_storage::MetricStore;
     use sha2::{Digest, Sha256};
@@ -1731,6 +1847,78 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(to_bytes(response.into_body(), 64).await?, &video[0..=5]);
+
+        let trace_payload = br#"{"inputs":{"prompt":"reward"},"outputs":{"text":"reward is 3"},"messages":[{"role":"assistant","content":"reward is 3"}]}"#;
+        let trace_digest = format!("{:x}", Sha256::digest(trace_payload));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/v1/blobs/{trace_digest}"))
+                    .header("content-type", "application/vnd.runloom.trace+json")
+                    .header("content-length", trace_payload.len())
+                    .body(Body::from(trace_payload.as_slice()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let trace_id = TraceSpanId::new();
+        let trace_path = format!("/api/v1/runs/{}/traces", created.run.id);
+        let trace_request = CreateTraceSpanRequest {
+            id: Some(trace_id),
+            trace_id: "trace-answer".to_owned(),
+            parent_span_id: None,
+            name: "generate-answer".to_owned(),
+            kind: TraceKind::Llm,
+            status: TraceStatus::Ok,
+            start_time_ms: 2_200,
+            end_time_ms: 2_250,
+            step: Some(12),
+            attributes: BTreeMap::from([("model".to_owned(), "local-model".into())]),
+            preview: BTreeMap::from([(
+                "messages".to_owned(),
+                serde_json::json!([{"role": "assistant", "content": "reward is 3"}]),
+            )]),
+            payload: Some(BlobRef {
+                digest: trace_digest,
+                size: trace_payload.len() as u64,
+                mime_type: "application/vnd.runloom.trace+json".to_owned(),
+                file_name: None,
+            }),
+        };
+        let response = router
+            .clone()
+            .oneshot(json_request("POST", &trace_path, &trace_request)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created_trace: CreateTraceSpanResponse = response_json(response).await?;
+        assert!(!created_trace.duplicate);
+        let replayed_trace: CreateTraceSpanResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request("POST", &trace_path, &trace_request)?)
+                .await?,
+        )
+        .await?;
+        assert!(replayed_trace.duplicate);
+        assert_eq!(replayed_trace.span, created_trace.span);
+        let traces: TraceSpanListResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(format!("{trace_path}?q=assistant%20reward&limit=10"))
+                        .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(traces.spans, vec![created_trace.span.clone()]);
+        let loaded_trace: TraceSpanRecord = response_json(
+            router
+                .clone()
+                .oneshot(Request::get(format!("/api/v1/traces/{trace_id}")).body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(loaded_trace, created_trace.span);
 
         let response = router
             .clone()

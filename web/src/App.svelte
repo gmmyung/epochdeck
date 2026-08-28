@@ -14,6 +14,7 @@
     getRichValues,
     getRunArtifacts,
     getSampledHistory,
+    getTraces,
     type Alert,
     type Health,
     type History,
@@ -21,6 +22,7 @@
     type RichValue,
     type Run,
     type RunArtifact,
+    type TraceSpan,
   } from "./lib/api";
   import {
     CHART_POINT_BUDGET,
@@ -44,6 +46,9 @@
   let alerts: Alert[] = [];
   let richValues: RichValue[] = [];
   let artifacts: RunArtifact[] = [];
+  let traces: TraceSpan[] = [];
+  let traceSearch = "";
+  let traceSearchLoading = false;
   let histories: Record<string, History> = {};
   let historyRevisions: Record<string, number> = {};
   let loadingMetrics = new Set<string>();
@@ -100,11 +105,12 @@
     selectedRun = run;
     error = null;
     try {
-      [metricKeys, alerts, richValues, artifacts] = await Promise.all([
+      [metricKeys, alerts, richValues, artifacts, traces] = await Promise.all([
         getMetricKeys(run.id, controller.signal),
         getAlerts(run.id, controller.signal),
         getRichValues(run.id, controller.signal),
         getRunArtifacts(run.id, controller.signal),
+        getTraces(run.id, "", controller.signal),
       ]);
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
@@ -118,6 +124,8 @@
     alerts = [];
     richValues = [];
     artifacts = [];
+    traces = [];
+    traceSearch = "";
     resetChartState();
   }
 
@@ -215,10 +223,11 @@
       const revisionChanged = latest.metric_revision !== selectedRun.metric_revision;
       selectedRun = latest;
       runs = runs.map((candidate) => (candidate.id === latest.id ? latest : candidate));
-      [alerts, richValues, artifacts] = await Promise.all([
+      [alerts, richValues, artifacts, traces] = await Promise.all([
         getAlerts(latest.id, controller.signal),
         getRichValues(latest.id, controller.signal),
         getRunArtifacts(latest.id, controller.signal),
+        getTraces(latest.id, traceSearch, controller.signal),
       ]);
       if (revisionChanged) {
         metricKeys = await getMetricKeys(latest.id, controller.signal);
@@ -283,6 +292,35 @@
       unit += 1;
     } while (size >= 1024 && unit < units.length - 1);
     return `${size.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unit]}`;
+  }
+
+  async function searchTraces(): Promise<void> {
+    const run = selectedRun;
+    const controller = runController;
+    if (!run || !controller || traceSearchLoading) return;
+    traceSearchLoading = true;
+    try {
+      traces = await getTraces(run.id, traceSearch, controller.signal);
+    } catch (reason) {
+      if (!controller.signal.aborted) showError(reason);
+    } finally {
+      traceSearchLoading = false;
+    }
+  }
+
+  function traceDuration(span: TraceSpan): string {
+    return `${Math.max(span.end_time_ms - span.start_time_ms, 0).toLocaleString()} ms`;
+  }
+
+  function traceMessages(span: TraceSpan): Array<{ role: string; content: string }> {
+    const messages = span.preview.messages;
+    if (!Array.isArray(messages)) return [];
+    return messages.flatMap((message) => {
+      if (typeof message !== "object" || message === null) return [];
+      const candidate = message as Record<string, unknown>;
+      if (typeof candidate.role !== "string" || typeof candidate.content !== "string") return [];
+      return [{ role: candidate.role, content: candidate.content }];
+    });
   }
 </script>
 
@@ -502,6 +540,74 @@
                   </article>
                 {/each}
               </div>
+            {/if}
+
+            <div class="metrics-heading trace-heading">
+              <div>
+                <p class="eyebrow">Indexed metadata · payloads in object storage</p>
+                <h2>Traces</h2>
+              </div>
+              <form
+                class="trace-search"
+                onsubmit={(event) => {
+                  event.preventDefault();
+                  void searchTraces();
+                }}
+              >
+                <input
+                  aria-label="Search traces"
+                  placeholder="Search traces and messages"
+                  bind:value={traceSearch}
+                />
+                <button type="submit" disabled={traceSearchLoading}
+                  >{traceSearchLoading ? "Searching" : "Search"}</button
+                >
+              </form>
+            </div>
+            {#if traces.length > 0}
+              <div class="trace-list">
+                {#each traces as span (span.id)}
+                  <article class="trace-card" class:trace-error={span.status === "error"}>
+                    <div class="trace-title">
+                      <span>{span.kind}</span>
+                      <strong>{span.name}</strong>
+                      <small>{span.status} · {traceDuration(span)}</small>
+                      {#if span.payload}<a href={blobUrl(span.payload)}>payload</a>{/if}
+                    </div>
+                    <div class="trace-identifiers">
+                      <span>trace {span.trace_id}</span>
+                      {#if span.parent_span_id}<span>parent {span.parent_span_id}</span>{/if}
+                      <span>{span.step === null ? "no step" : `step ${span.step}`}</span>
+                    </div>
+                    {#if Object.keys(span.attributes).length > 0}
+                      <dl class="trace-attributes">
+                        {#each Object.entries(span.attributes) as [key, value]}
+                          <div>
+                            <dt>{key}</dt>
+                            <dd>{formatValue(value)}</dd>
+                          </div>
+                        {/each}
+                      </dl>
+                    {/if}
+                    {#if traceMessages(span).length > 0}
+                      <div class="trace-messages">
+                        {#each traceMessages(span) as message}
+                          <div>
+                            <strong>{message.role}</strong>
+                            <p>{message.content}</p>
+                          </div>
+                        {/each}
+                      </div>
+                    {/if}
+                  </article>
+                {/each}
+              </div>
+            {:else}
+              <section class="metric-empty">
+                {traceSearch.trim()
+                  ? "No traces match this search."
+                  : "No structured traces logged yet."}
+              </section>
             {/if}
 
             <div class="metrics-heading">

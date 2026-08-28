@@ -26,7 +26,7 @@ usable and tested, not that the entire feature group is complete.
 | Rich values | images, audio, video, tables, histograms | Compatible |
 | Alerts | levels, titles, text, steps, timestamps | Compatible |
 | Artifacts | manifests, versions, aliases, input/output links | Compatible |
-| Traces | structured spans, messages, search metadata | Planned |
+| Traces | structured spans, messages, search metadata | Compatible |
 | Python API | synchronous public API and background delivery | Partial |
 | Remote server | authenticated ingestion and read APIs | Partial |
 | CLI | serve, list, get, query, import, export | Partial |
@@ -104,3 +104,11 @@ IDs, and explicit input/output run links. File content reuses the rich-data CAS;
 artifact download endpoints stream files with range support. The SDK snapshots
 files into its spool before journaling a create operation and drains creates and
 lineage links fairly with metrics, rich values, and alerts.
+
+Structured traces store bounded searchable names, attributes, and message
+previews in SQLite while complete JSON inputs, outputs, and messages live in the
+content-addressed blob store. Spans have explicit trace and parent IDs, timing,
+status, kind, and the current user step. The SDK journals each finished span and
+payload before background delivery; exact request IDs make response-loss retries
+idempotent. Search uses SQLite FTS over bounded previews, so query cost and
+catalog growth do not depend on complete prompt or response payload size.

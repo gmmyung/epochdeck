@@ -7,6 +7,7 @@ from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from runloom._ids import uuid7
 from runloom.rich import _install_stream
 
 _MAX_ENTRIES = 4_096
@@ -30,7 +31,7 @@ class Artifact:
         self.type = type
         self.description = description
         self.metadata = deepcopy(dict(metadata or {}))
-        self.id = _uuid7()
+        self.id = uuid7()
         self._files: dict[str, Path] = {}
 
     def add_file(self, local_path: str | Path, *, name: str | None = None) -> Artifact:
@@ -129,9 +130,3 @@ def _validate_artifact_path(value: Any) -> None:
         raise ValueError(
             f"artifact path must be a relative POSIX path up to {_MAX_PATH_BYTES} bytes"
         )
-
-
-def _uuid7() -> str:
-    from runloom.run import _uuid7 as run_uuid7
-
-    return run_uuid7()

@@ -9,6 +9,7 @@ from typing import Any
 
 from runloom.artifact import Artifact
 from runloom.run import Mode, Resume, Run, create_run
+from runloom.trace import Trace, TraceKind
 
 _current_run: Run | None = None
 _current_run_lock = threading.Lock()
@@ -74,6 +75,28 @@ def log_artifact(
 def use_artifact(artifact: Artifact | str) -> str:
     """Record an input-artifact lineage edge on the active run."""
     return _require_current_run().use_artifact(artifact)
+
+
+def trace(
+    name: str,
+    *,
+    kind: TraceKind = "span",
+    trace_id: str | None = None,
+    parent: Trace | str | None = None,
+    attributes: Mapping[str, Any] | None = None,
+    inputs: Any = None,
+    start_time_ms: int | None = None,
+) -> Trace:
+    """Create a durable structured trace span on the active run."""
+    return _require_current_run().trace(
+        name,
+        kind=kind,
+        trace_id=trace_id,
+        parent=parent,
+        attributes=attributes,
+        inputs=inputs,
+        start_time_ms=start_time_ms,
+    )
 
 
 def finish(*, summary: Mapping[str, Any] | None = None, timeout: float = 30.0) -> None:

@@ -98,6 +98,23 @@ budget; these are metadata bounds, not file-size or retention quotas. The server
 verifies every referenced SHA-256 object before allocating the version in one
 SQLite transaction. Stable request IDs make a lost create response replay-safe.
 
+## Traces
+
+- `POST /runs/{run_id}/traces` creates a structured span.
+- `GET /runs/{run_id}/traces?limit=100&before=<span_id>` returns bounded
+  newest-first spans.
+- `GET /runs/{run_id}/traces?q=assistant+reward&limit=100` searches indexed
+  names, attributes, and bounded message previews.
+- `GET /traces/{span_id}` returns one span.
+
+Span bodies contain an optional stable UUIDv7 `id`, a caller-selected
+`trace_id`, optional `parent_span_id`, name, `span`, `llm`, `tool`, `chain`, or
+`agent` kind, `unset`, `ok`, or `error` status, start/end times, optional run
+step, bounded attributes and preview documents, and an optional uploaded JSON
+payload blob. Complete inputs, outputs, and messages belong in the payload;
+SQLite retains only the metadata needed to list and search. Exact span retries
+are idempotent, and reusing an ID with different contents returns a conflict.
+
 ## Discovery
 
 - `GET /projects?limit=100` returns bounded project summaries.

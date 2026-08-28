@@ -9,9 +9,10 @@ contract is practical W&B feature parity across logging, run management, rich
 media, artifacts, querying, and the dashboard.
 
 Runloom is pre-alpha. Scalar run tracking, native rich media, host telemetry,
-durable alerts, bounded dashboard sampling, and background metric compaction are
-usable end to end. Versioned artifacts are also usable; authentication, sweeps,
-and the wider compatibility surface remain under active development.
+durable alerts, bounded dashboard sampling, background metric compaction,
+versioned artifacts, and structured traces are usable end to end.
+Authentication, sweeps, and the wider compatibility surface remain under active
+development.
 
 ## Non-negotiable properties
 
@@ -82,6 +83,9 @@ for step in range(1_000):
     run.log({"train": {"loss": 1 / (step + 1)}, "reward": step * 0.1})
 run.log({"rollout": wandb.Video("rollout.mp4", caption="latest policy")})
 run.alert("Checkpoint saved", "Validation improved", level="info")
+with run.trace("policy-evaluation", kind="agent", inputs={"episode": 7}) as span:
+    span.add_message("assistant", "The rollout completed successfully")
+    span.set_outputs({"reward": 42.0})
 run.config.update({"optimizer": "adam"})
 run.summary["result"] = "complete"
 run.finish(summary={"tags": ["baseline", "mujoco"]})
@@ -130,6 +134,20 @@ downstream.use_artifact(artifact)  # explicit input lineage
 Artifact versions and aliases are catalog transactions; file entries reuse the
 CAS, downloads stream with byte ranges, and input/output relationships appear in
 the dashboard.
+
+Log LLM, tool, chain, or agent execution as structured spans:
+
+```python
+with run.trace("answer", kind="llm", attributes={"model": "local-model"}) as span:
+    span.set_inputs({"prompt": "Summarize the rollout"})
+    span.add_message("user", "Summarize the rollout")
+    span.add_message("assistant", "The policy remained stable.")
+    span.set_outputs({"tokens": 6})
+```
+
+Trace IDs and parent span IDs preserve call trees. Complete JSON inputs,
+outputs, and messages use content-addressed blob storage; SQLite indexes only
+bounded metadata and previews for responsive dashboard search.
 
 ## Repository layout
 

@@ -21,6 +21,7 @@ pub const MAX_RICH_KEY_BYTES: usize = 256;
 pub const MAX_RICH_METADATA_BYTES: usize = 256 * 1024;
 pub const MAX_ARTIFACT_ENTRIES: usize = 4_096;
 pub const MAX_ARTIFACT_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_TRACE_METADATA_BYTES: usize = 256 * 1024;
 
 macro_rules! uuid_identifier {
     ($name:ident) => {
@@ -137,6 +138,74 @@ pub enum RichValueKind {
 pub enum ArtifactRelation {
     Input,
     Output,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceKind {
+    Span,
+    Llm,
+    Tool,
+    Chain,
+    Agent,
+}
+
+impl fmt::Display for TraceKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Span => formatter.write_str("span"),
+            Self::Llm => formatter.write_str("llm"),
+            Self::Tool => formatter.write_str("tool"),
+            Self::Chain => formatter.write_str("chain"),
+            Self::Agent => formatter.write_str("agent"),
+        }
+    }
+}
+
+impl FromStr for TraceKind {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "span" => Ok(Self::Span),
+            "llm" => Ok(Self::Llm),
+            "tool" => Ok(Self::Tool),
+            "chain" => Ok(Self::Chain),
+            "agent" => Ok(Self::Agent),
+            _ => Err("unknown trace kind"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceStatus {
+    Unset,
+    Ok,
+    Error,
+}
+
+impl fmt::Display for TraceStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unset => formatter.write_str("unset"),
+            Self::Ok => formatter.write_str("ok"),
+            Self::Error => formatter.write_str("error"),
+        }
+    }
+}
+
+impl FromStr for TraceStatus {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "unset" => Ok(Self::Unset),
+            "ok" => Ok(Self::Ok),
+            "error" => Ok(Self::Error),
+            _ => Err("unknown trace status"),
+        }
+    }
 }
 
 impl fmt::Display for ArtifactRelation {
@@ -513,6 +582,58 @@ pub struct ArtifactLineageResponse {
     pub artifact: ArtifactRecord,
     pub input_runs: Vec<RunId>,
     pub output_runs: Vec<RunId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateTraceSpanRequest {
+    #[serde(default)]
+    pub id: Option<TraceSpanId>,
+    pub trace_id: String,
+    #[serde(default)]
+    pub parent_span_id: Option<TraceSpanId>,
+    pub name: String,
+    pub kind: TraceKind,
+    pub status: TraceStatus,
+    pub start_time_ms: i64,
+    pub end_time_ms: i64,
+    #[serde(default)]
+    pub step: Option<u64>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub preview: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub payload: Option<BlobRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceSpanRecord {
+    pub id: TraceSpanId,
+    pub run_id: RunId,
+    pub trace_id: String,
+    pub parent_span_id: Option<TraceSpanId>,
+    pub name: String,
+    pub kind: TraceKind,
+    pub status: TraceStatus,
+    pub start_time_ms: i64,
+    pub end_time_ms: i64,
+    pub step: Option<u64>,
+    pub attributes: BTreeMap<String, Value>,
+    pub preview: BTreeMap<String, Value>,
+    pub payload: Option<BlobRef>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateTraceSpanResponse {
+    pub span: TraceSpanRecord,
+    pub duplicate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceSpanListResponse {
+    pub spans: Vec<TraceSpanRecord>,
+    pub next_before: Option<TraceSpanId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

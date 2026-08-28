@@ -94,9 +94,11 @@ from metrics. The catalog contains small manifests, aliases, versions, and
 lineage edges. Uploads are streamed, hashed, deduplicated, and atomically
 installed.
 
-Video supports HTTP range delivery. Metadata extraction and thumbnail
-generation are asynchronous. Traces use their own typed segments and indexes;
-none of these paths participate in scalar metric queries.
+Video supports HTTP range delivery. Structured trace names, timing, status,
+attributes, relationships, and bounded message previews are indexed in SQLite.
+Complete trace inputs, outputs, and messages use the same content-addressed blob
+store as media and artifacts. None of these paths participate in scalar metric
+queries.
 
 ### Python SDK
 
@@ -106,8 +108,10 @@ and durable offline spooling prevents transient server failures from affecting
 training. Config updates and summary values share the durable run metadata,
 while the server applies their bounded JSON merges transactionally in SQLite.
 
-Compatibility is explicit and versioned. Unsupported semantics produce clear
-errors or warnings rather than inert arguments.
+Compatibility is explicit. The pre-alpha implementation targets one current
+behavioral shape and does not carry data or SDK compatibility scaffolding;
+unsupported semantics produce clear errors rather than inert arguments. The
+HTTP namespace remains explicitly versioned under `/api/v1`.
 
 ### Dashboard
 

@@ -189,6 +189,32 @@ class RunloomClient:
             f"/api/v1/runs/{quote(run_id, safe='')}/artifacts",
         )
 
+    def create_trace_span(self, run_id: str, span: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/runs/{quote(run_id, safe='')}/traces",
+            json=span,
+        )
+
+    def trace_spans(
+        self,
+        run_id: str,
+        *,
+        q: str | None = None,
+        before: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        params: dict[str, str | int] = {"limit": limit}
+        if q is not None:
+            params["q"] = q
+        if before is not None:
+            params["before"] = before
+        return self._request(
+            "GET",
+            f"/api/v1/runs/{quote(run_id, safe='')}/traces",
+            params=params,
+        )
+
     def history(
         self,
         run_id: str,

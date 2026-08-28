@@ -71,3 +71,20 @@ downstream.use_artifact(artifact)
 `add_dir` walks deterministically without following symlinked directories and
 manifests accept up to 4,096 unique POSIX paths. Offline use requires a concrete
 artifact object or ID; online runs may also resolve `name:alias`.
+
+Structured traces use the same durable delivery path:
+
+```python
+with run.trace("answer", kind="llm", inputs={"prompt": "hello"}) as span:
+    span.add_message("assistant", "hello back")
+    span.set_outputs({"tokens": 2})
+
+with run.trace("lookup", kind="tool", parent=span) as child:
+    child.set_inputs({"metric": "reward"})
+    child.set_outputs({"value": 12.5})
+```
+
+Kinds are `span`, `llm`, `tool`, `chain`, and `agent`. A context manager marks a
+successful span `ok` or captures an escaping exception as `error`. Inputs,
+outputs, and messages must be JSON-compatible; complete payloads are stored in
+the blob spool while bounded previews remain searchable.

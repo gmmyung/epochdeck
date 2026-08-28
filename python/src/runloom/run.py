@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import secrets
 import threading
 import time
 import uuid
@@ -12,10 +11,12 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
+from runloom._ids import uuid7
 from runloom.artifact import Artifact
 from runloom.client import RunloomApiError, RunloomClient
 from runloom.rich import RichValue
 from runloom.system_metrics import SystemMonitor, SystemSampler
+from runloom.trace import Trace, TraceKind
 
 Mode = Literal["online", "offline", "disabled"]
 Resume = Literal["never", "allow", "must"]
@@ -144,11 +145,15 @@ class _Spool:
         self.artifacts_path = self.directory / "artifacts.jsonl"
         self.artifact_ack_path = self.directory / "artifact-ack"
         self.artifact_delivery_path = self.directory / "artifact-delivery.json"
+        self.traces_path = self.directory / "traces.jsonl"
+        self.trace_ack_path = self.directory / "trace-ack"
+        self.trace_delivery_path = self.directory / "trace-delivery.json"
         self._lock = threading.Lock()
         self.events_path.touch(exist_ok=True)
         self.alerts_path.touch(exist_ok=True)
         self.rich_values_path.touch(exist_ok=True)
         self.artifacts_path.touch(exist_ok=True)
+        self.traces_path.touch(exist_ok=True)
         self.blob_root.mkdir(exist_ok=True)
 
     def read_metadata(self) -> dict[str, Any] | None:
@@ -178,6 +183,9 @@ class _Spool:
 
     def append_artifact(self, artifact: dict[str, Any]) -> None:
         self._append_record(self.artifacts_path, artifact)
+
+    def append_trace(self, trace: dict[str, Any]) -> None:
+        self._append_record(self.traces_path, trace)
 
     def _append_record(self, path: Path, record: dict[str, Any]) -> None:
         encoded = json.dumps(record, separators=(",", ":"), sort_keys=True, allow_nan=False)
@@ -221,6 +229,15 @@ class _Spool:
             1,
         )
         return (artifacts[0] if artifacts else None), offset
+
+    def read_trace(self) -> tuple[dict[str, Any] | None, int]:
+        traces, offset = self._read_record_batch(
+            self.traces_path,
+            self.trace_ack_path,
+            self.trace_delivery_path,
+            1,
+        )
+        return (traces[0] if traces else None), offset
 
     def _read_record_batch(
         self,
@@ -282,6 +299,9 @@ class _Spool:
     def acknowledge_artifact(self, offset: int) -> None:
         self._acknowledge(self.artifact_ack_path, self.artifact_delivery_path, offset)
 
+    def acknowledge_trace(self, offset: int) -> None:
+        self._acknowledge(self.trace_ack_path, self.trace_delivery_path, offset)
+
     def _acknowledge(self, ack_path: Path, delivery_path: Path, offset: int) -> None:
         with self._lock:
             if delivery_path.exists():
@@ -299,6 +319,7 @@ class _Spool:
             or self.pending_alerts()
             or self.pending_rich_values()
             or self.pending_artifacts()
+            or self.pending_traces()
         )
 
     def pending_metrics(self) -> bool:
@@ -312,6 +333,9 @@ class _Spool:
 
     def pending_artifacts(self) -> bool:
         return self._pending(self.artifact_ack_path, self.artifacts_path)
+
+    def pending_traces(self) -> bool:
+        return self._pending(self.trace_ack_path, self.traces_path)
 
     def _pending(self, ack_path: Path, journal_path: Path) -> bool:
         with self._lock:
@@ -508,6 +532,18 @@ class _DeliveryWorker(threading.Thread):
                     else:
                         raise DeliveryError("artifact journal has an unknown operation")
                     self._spool.acknowledge_artifact(next_offset)
+                elif delivery == "trace":
+                    trace, next_offset = self._spool.read_trace()
+                    if trace is None:
+                        continue
+                    blob = trace.get("payload")
+                    if blob is not None:
+                        self._client.upload_blob(
+                            self._spool.blob_path(str(blob["digest"])),
+                            blob,
+                        )
+                    self._client.create_trace_span(self._run_id, trace)
+                    self._spool.acknowledge_trace(next_offset)
                 elif delivery == "metrics":
                     points, next_offset = self._spool.read_batch(self._batch_size)
                     if not points:
@@ -533,9 +569,10 @@ class _DeliveryWorker(threading.Thread):
             self._spool.pending_metrics,
             self._spool.pending_rich_values,
             self._spool.pending_artifacts,
+            self._spool.pending_traces,
             self._spool.pending_alerts,
         )
-        names = ("metrics", "rich", "artifact", "alert")
+        names = ("metrics", "rich", "artifact", "trace", "alert")
         for offset in range(len(pending)):
             index = (self._delivery_cursor + offset) % len(pending)
             if pending[index]():
@@ -867,7 +904,7 @@ class Run:
                 for key, prepared in prepared_values:
                     self._spool.append_rich_value(
                         {
-                            "id": _uuid7(),
+                            "id": uuid7(),
                             "key": key,
                             "kind": prepared.kind,
                             "step": selected_step,
@@ -904,7 +941,7 @@ class Run:
             assert self._spool is not None
             self._spool.append_alert(
                 {
-                    "id": _uuid7(),
+                    "id": uuid7(),
                     "title": normalized_title,
                     "text": normalized_text,
                     "level": normalized_level,
@@ -954,11 +991,53 @@ class Run:
                 return artifact_id
             assert self._spool is not None
             self._spool.append_artifact(
-                {"id": _uuid7(), "operation": "use", "artifact_id": artifact_id}
+                {"id": uuid7(), "operation": "use", "artifact_id": artifact_id}
             )
         if self._worker is not None:
             self._worker.notify()
         return artifact_id
+
+    def trace(
+        self,
+        name: str,
+        *,
+        kind: TraceKind = "span",
+        trace_id: str | None = None,
+        parent: Trace | str | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        inputs: Any = None,
+        start_time_ms: int | None = None,
+    ) -> Trace:
+        with self._log_lock:
+            if self._finished or self._finishing:
+                raise RuntimeError("cannot create a trace while a run is finishing or finished")
+        return Trace(
+            name,
+            recorder=self._record_trace,
+            kind=kind,
+            trace_id=trace_id,
+            parent=parent,
+            attributes=attributes,
+            inputs=inputs,
+            start_time_ms=start_time_ms,
+        )
+
+    def _record_trace(self, trace: Trace) -> None:
+        with self._log_lock:
+            if self._finished or self._finishing:
+                raise RuntimeError("cannot finish a trace while a run is finishing or finished")
+            if self.mode == "disabled":
+                return
+            assert self._spool is not None
+            record = trace._prepare(self._spool.blob_root, self._last_user_step)
+            record["attributes"] = _normalize_document(
+                record["attributes"],
+                "trace attributes",
+            )
+            record["preview"] = _normalize_document(record["preview"], "trace preview")
+            self._spool.append_trace(record)
+        if self._worker is not None:
+            self._worker.notify()
 
     def _resolve_artifact_reference(self, reference: str) -> str:
         try:
@@ -1309,18 +1388,6 @@ def _validate_alert(title: Any, text: Any, level: Any) -> tuple[str, str, str]:
     if normalized_level not in {"info", "warn", "error"}:
         raise ValueError("alert level must be 'info', 'warn', or 'error'")
     return title, text, normalized_level
-
-
-def _uuid7() -> str:
-    timestamp_ms = time.time_ns() // 1_000_000
-    if timestamp_ms >= 1 << 48:
-        raise OverflowError("current timestamp is outside the UUIDv7 range")
-    value = timestamp_ms << 80
-    value |= 0x7 << 76
-    value |= secrets.randbits(12) << 64
-    value |= 0b10 << 62
-    value |= secrets.randbits(62)
-    return str(uuid.UUID(int=value))
 
 
 def _flatten_metrics(data: Mapping[str, Any], prefix: str = "") -> dict[str, float]:

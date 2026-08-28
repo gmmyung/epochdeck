@@ -92,6 +92,23 @@ export type RunArtifact = {
   relation: "input" | "output";
 };
 
+export type TraceSpan = {
+  id: string;
+  run_id: string;
+  trace_id: string;
+  parent_span_id: string | null;
+  name: string;
+  kind: "span" | "llm" | "tool" | "chain" | "agent";
+  status: "unset" | "ok" | "error";
+  start_time_ms: number;
+  end_time_ms: number;
+  step: number | null;
+  attributes: Record<string, unknown>;
+  preview: Record<string, unknown>;
+  payload: BlobRef | null;
+  created_at: string;
+};
+
 export function getHealth(signal?: AbortSignal): Promise<Health> {
   return getJson<Health>("/api/v1/health", signal);
 }
@@ -153,6 +170,20 @@ export async function getRunArtifacts(runId: string, signal?: AbortSignal): Prom
 export function artifactFileUrl(artifactId: string, path: string): string {
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
   return `/api/v1/artifacts/${encodeURIComponent(artifactId)}/files/${encodedPath}`;
+}
+
+export async function getTraces(
+  runId: string,
+  query = "",
+  signal?: AbortSignal,
+): Promise<TraceSpan[]> {
+  const params = new URLSearchParams({ limit: "100" });
+  if (query.trim()) params.set("q", query.trim());
+  const result = await getJson<{ spans: TraceSpan[]; next_before: string | null }>(
+    `/api/v1/runs/${encodeURIComponent(runId)}/traces?${params}`,
+    signal,
+  );
+  return result.spans;
 }
 
 export function getHistory(

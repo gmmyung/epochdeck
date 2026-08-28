@@ -79,7 +79,8 @@ body,
 }
 
 button,
-select {
+select,
+input {
   border-radius: 0;
   color: inherit;
   font: inherit;
@@ -90,7 +91,8 @@ button {
 }
 
 button:focus-visible,
-select:focus-visible {
+select:focus-visible,
+input:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
@@ -574,6 +576,148 @@ canvas {
 .artifact-files small {
   flex: 0 0 auto;
   color: var(--muted);
+}
+
+.trace-heading {
+  align-items: center;
+}
+
+.trace-search {
+  display: flex;
+  gap: 6px;
+}
+
+.trace-search input {
+  width: min(300px, 36vw);
+  min-height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  background: var(--control-bg);
+  color: var(--text);
+  font-size: 11px;
+}
+
+.trace-search button {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-size: 10px;
+}
+
+.trace-search button:hover:not(:disabled) {
+  background: var(--button-hover);
+}
+
+.trace-search button:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+.trace-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 24px;
+}
+
+.trace-card {
+  border-left: 3px solid var(--accent);
+  padding: 12px;
+}
+
+.trace-card.trace-error {
+  border-left-color: var(--danger);
+}
+
+.trace-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.trace-title > span {
+  padding: 2px 5px;
+  background: var(--accent-bg);
+  color: var(--accent-text);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.trace-title strong {
+  font-size: 12px;
+}
+
+.trace-title small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.trace-title a {
+  margin-left: auto;
+  color: var(--accent);
+  font-size: 10px;
+}
+
+.trace-identifiers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 7px;
+  color: var(--faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+}
+
+.trace-attributes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  margin: 9px 0 0;
+}
+
+.trace-attributes div {
+  display: flex;
+  gap: 5px;
+}
+
+.trace-attributes dt,
+.trace-attributes dd {
+  margin: 0;
+  font-size: 10px;
+}
+
+.trace-attributes dt {
+  color: var(--muted);
+}
+
+.trace-messages {
+  display: grid;
+  gap: 1px;
+  margin-top: 9px;
+  border: 1px solid var(--line);
+  background: var(--line);
+}
+
+.trace-messages > div {
+  display: grid;
+  grid-template-columns: 80px minmax(0, 1fr);
+  gap: 8px;
+  padding: 7px 8px;
+  background: var(--surface);
+}
+
+.trace-messages strong {
+  color: var(--muted);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.trace-messages p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  white-space: pre-wrap;
 }
 
 .metric-chart-card {

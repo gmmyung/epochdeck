@@ -11,6 +11,7 @@ import {
   getRun,
   getRuns,
   getSampledHistory,
+  getTraces,
 } from "./api";
 
 afterEach(() => {
@@ -150,6 +151,20 @@ describe("getHealth", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/runs/run%2Fid/artifacts");
     expect(artifactFileUrl("artifact/id", "checkpoints/best model.bin")).toBe(
       "/api/v1/artifacts/artifact%2Fid/files/checkpoints/best%20model.bin",
+    );
+  });
+
+  it("loads bounded traces with an encoded full-text query", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ spans: [], next_before: null }), { status: 200 }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getTraces("run/id", " assistant reward ")).resolves.toEqual([]);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/v1/runs/run%2Fid/traces?limit=100&q=assistant+reward",
     );
   });
 });
