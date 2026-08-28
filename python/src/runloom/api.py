@@ -55,6 +55,12 @@ def log(data: Mapping[str, Any], *, step: int | None = None) -> None:
     run.log(data, step=step)
 
 
+def alert(title: str, text: str = "", *, level: str = "info") -> None:
+    """Record a durable alert on the active run."""
+    run = _require_current_run()
+    run.alert(title, text, level=level)
+
+
 def finish(*, summary: Mapping[str, Any] | None = None, timeout: float = 30.0) -> None:
     """Flush and finish the active run."""
     run = _require_current_run()

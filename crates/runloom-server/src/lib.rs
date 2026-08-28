@@ -18,12 +18,13 @@ use runloom_catalog::{
     BatchRegistration, BatchStatus, Catalog, CatalogError, MAX_SEGMENTS_PER_QUERY, SegmentManifest,
 };
 use runloom_protocol::{
-    ApiError, ConfigUpdateRequest, CreateRunRequest, CreateRunResponse, FinishRunRequest,
-    FinishRunResponse, HealthResponse, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
-    MAX_BATCH_POINTS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS, MAX_HISTORY_POINTS,
-    MAX_METRICS_PER_POINT, MAX_SUMMARY_BYTES, MetricKeyListResponse, ProjectListResponse,
-    ResumePolicy, RunId, RunListResponse, RunRecord, RunState, RunUpdateResponse,
-    SummaryUpdateRequest,
+    AlertId, AlertListResponse, ApiError, ConfigUpdateRequest, CreateAlertRequest,
+    CreateAlertResponse, CreateRunRequest, CreateRunResponse, FinishRunRequest, FinishRunResponse,
+    HealthResponse, HistoryResponse, IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES,
+    MAX_ALERT_TITLE_BYTES, MAX_BATCH_POINTS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS,
+    MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MAX_SUMMARY_BYTES, MetricKeyListResponse,
+    ProjectListResponse, ResumePolicy, RunId, RunListResponse, RunRecord, RunState,
+    RunUpdateResponse, SummaryUpdateRequest,
 };
 use runloom_storage::{
     MetricStore, MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
@@ -68,6 +69,10 @@ pub fn app_with_runtime(catalog: Catalog, metrics: MetricRuntime) -> Router {
         .route("/api/v1/runs/{run_id}/metrics", get(metric_keys))
         .route("/api/v1/runs/{run_id}/batches", post(ingest_batch))
         .route("/api/v1/runs/{run_id}/finish", post(finish_run))
+        .route(
+            "/api/v1/runs/{run_id}/alerts",
+            post(create_alert).get(list_alerts),
+        )
         .route("/api/v1/runs/{run_id}/history", get(history))
         .with_state(AppState {
             catalog,
@@ -323,6 +328,49 @@ async fn finish_run(
     Ok(Json(FinishRunResponse { run }))
 }
 
+async fn create_alert(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    Json(request): Json<CreateAlertRequest>,
+) -> Result<(StatusCode, Json<CreateAlertResponse>), HttpError> {
+    validate_alert(&request)?;
+    let (alert, duplicate) = state.catalog.create_alert(run_id, &request).await?;
+    let status = if duplicate {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(CreateAlertResponse { alert, duplicate })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AlertListQuery {
+    before: Option<AlertId>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+async fn list_alerts(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    Query(query): Query<AlertListQuery>,
+) -> Result<Json<AlertListResponse>, HttpError> {
+    validate_list_limit(query.limit)?;
+    let alerts = state
+        .catalog
+        .list_alerts(run_id, query.before, query.limit)
+        .await?;
+    let next_before = if alerts.len() == query.limit {
+        alerts.last().map(|alert| alert.id)
+    } else {
+        None
+    };
+    Ok(Json(AlertListResponse {
+        alerts,
+        next_before,
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 struct HistoryQuery {
     keys: String,
@@ -457,6 +505,26 @@ fn validate_project_name(project: &str) -> Result<(), HttpError> {
         return Err(HttpError::invalid(format!(
             "project name must contain 1 to {MAX_PROJECT_NAME_BYTES} non-control bytes"
         )));
+    }
+    Ok(())
+}
+
+fn validate_alert(request: &CreateAlertRequest) -> Result<(), HttpError> {
+    if request.title.is_empty()
+        || request.title.len() > MAX_ALERT_TITLE_BYTES
+        || request.title.chars().any(char::is_control)
+    {
+        return Err(HttpError::invalid(format!(
+            "alert title must contain 1 to {MAX_ALERT_TITLE_BYTES} non-control bytes"
+        )));
+    }
+    if request.text.len() > MAX_ALERT_TEXT_BYTES {
+        return Err(HttpError::invalid(format!(
+            "alert text cannot exceed {MAX_ALERT_TEXT_BYTES} bytes"
+        )));
+    }
+    if request.timestamp_ms < 0 {
+        return Err(HttpError::invalid("alert timestamp cannot be negative"));
     }
     Ok(())
 }
@@ -601,7 +669,13 @@ fn batch_digest(request: &IngestBatchRequest) -> Result<String, HttpError> {
 fn latest_metrics(request: &IngestBatchRequest) -> BTreeMap<String, f64> {
     let mut summary = BTreeMap::new();
     for point in &request.points {
-        summary.extend(point.metrics.clone());
+        summary.extend(
+            point
+                .metrics
+                .iter()
+                .filter(|(key, _)| !key.starts_with("system/"))
+                .map(|(key, value)| (key.clone(), *value)),
+        );
     }
     summary
 }
@@ -679,7 +753,8 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use runloom_catalog::Catalog;
     use runloom_protocol::{
-        ConfigUpdateRequest, CreateRunRequest, CreateRunResponse, FinishRunRequest,
+        AlertId, AlertLevel, AlertListResponse, ConfigUpdateRequest, CreateAlertRequest,
+        CreateAlertResponse, CreateRunRequest, CreateRunResponse, FinishRunRequest,
         FinishRunResponse, HealthResponse, HealthStatus, HistoryResponse, IngestBatchRequest,
         IngestBatchResponse, MetricKeyListResponse, MetricPoint, ProjectListResponse, ResumePolicy,
         RunListResponse, RunUpdateResponse, SummaryUpdateRequest,
@@ -842,6 +917,36 @@ mod tests {
         let duplicate: IngestBatchResponse = response_json(response).await?;
         assert!(duplicate.duplicate);
         assert_eq!(duplicate.metric_revision, accepted.metric_revision);
+
+        let alert_path = format!("/api/v1/runs/{}/alerts", created.run.id);
+        let alert_request = CreateAlertRequest {
+            id: Some(AlertId::new()),
+            title: "reward stalled".to_owned(),
+            text: "No improvement in the last window".to_owned(),
+            level: AlertLevel::Warn,
+            step: Some(11),
+            timestamp_ms: 2_000,
+        };
+        let response = router
+            .clone()
+            .oneshot(json_request("POST", &alert_path, &alert_request)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created_alert: CreateAlertResponse = response_json(response).await?;
+        assert!(!created_alert.duplicate);
+        let response = router
+            .clone()
+            .oneshot(json_request("POST", &alert_path, &alert_request)?)
+            .await?;
+        let replayed_alert: CreateAlertResponse = response_json(response).await?;
+        assert!(replayed_alert.duplicate);
+        assert_eq!(replayed_alert.alert, created_alert.alert);
+        let response = router
+            .clone()
+            .oneshot(Request::get(format!("{alert_path}?limit=10")).body(Body::empty())?)
+            .await?;
+        let alerts: AlertListResponse = response_json(response).await?;
+        assert_eq!(alerts.alerts, vec![created_alert.alert]);
 
         let response = router
             .clone()

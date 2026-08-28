@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
 
   import {
+    getAlerts,
     getHealth,
     getHistory,
     getMetricKeys,
@@ -9,6 +10,7 @@
     getRun,
     getRuns,
     getSampledHistory,
+    type Alert,
     type Health,
     type History,
     type Project,
@@ -32,6 +34,7 @@
   let selectedProject = "";
   let selectedRun: Run | null = null;
   let metricKeys: string[] = [];
+  let alerts: Alert[] = [];
   let histories: Record<string, History> = {};
   let historyRevisions: Record<string, number> = {};
   let loadingMetrics = new Set<string>();
@@ -88,7 +91,10 @@
     selectedRun = run;
     error = null;
     try {
-      metricKeys = await getMetricKeys(run.id, controller.signal);
+      [metricKeys, alerts] = await Promise.all([
+        getMetricKeys(run.id, controller.signal),
+        getAlerts(run.id, controller.signal),
+      ]);
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
     }
@@ -98,6 +104,7 @@
     runController?.abort();
     selectedRun = null;
     metricKeys = [];
+    alerts = [];
     resetChartState();
   }
 
@@ -195,6 +202,7 @@
       const revisionChanged = latest.metric_revision !== selectedRun.metric_revision;
       selectedRun = latest;
       runs = runs.map((candidate) => (candidate.id === latest.id ? latest : candidate));
+      alerts = await getAlerts(latest.id, controller.signal);
       if (revisionChanged) {
         metricKeys = await getMetricKeys(latest.id, controller.signal);
         for (const metric of visibleMetrics) queueMetric(metric);
@@ -216,6 +224,10 @@
     }
     if (typeof value === "string") return value;
     return JSON.stringify(value);
+  }
+
+  function formatAlertTime(timestampMs: number): string {
+    return new Date(timestampMs).toLocaleString();
   }
 </script>
 
@@ -308,6 +320,35 @@
                 </dl>
               </article>
             </div>
+
+            {#if alerts.length > 0}
+              <article class="alerts-card">
+                <div class="card-heading">
+                  <strong>Alerts</strong>
+                  <small>{alerts.length} most recent</small>
+                </div>
+                <div class="alert-list">
+                  {#each alerts as alert (alert.id)}
+                    <div
+                      class="alert-row"
+                      class:warn={alert.level === "warn"}
+                      class:error-level={alert.level === "error"}
+                    >
+                      <span class="alert-level">{alert.level}</span>
+                      <div>
+                        <strong>{alert.title}</strong>
+                        {#if alert.text}<p>{alert.text}</p>{/if}
+                      </div>
+                      <small>
+                        {alert.step === null ? "no step" : `step ${alert.step}`} · {formatAlertTime(
+                          alert.timestamp_ms,
+                        )}
+                      </small>
+                    </div>
+                  {/each}
+                </div>
+              </article>
+            {/if}
 
             <div class="metrics-heading">
               <div>

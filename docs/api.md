@@ -42,6 +42,22 @@ include `source_last_sequence`, allowing a revision-aware client to request only
 new rows after a sampled snapshot. These response bounds are not retention
 quotas.
 
+## Monitoring
+
+- `POST /runs/{run_id}/alerts` creates an alert while a run is active.
+- `GET /runs/{run_id}/alerts?limit=100&before=<alert_id>` returns alerts newest
+  first with a bounded UUIDv7 cursor.
+
+Alert bodies contain an optional stable `id`, `title`, `text`, `level`, optional
+`step`, and `timestamp_ms`. Levels are `info`, `warn`, or `error`; titles are at
+most 256 UTF-8 bytes and text is at most 4 KiB. Repeating the same ID and body is
+idempotent. Reusing an ID with different content returns a conflict.
+
+System metrics share the scalar history API under the reserved `system/`
+namespace. The SDK records CPU, memory, disk, network, process, load-average,
+and NVIDIA GPU values when available. Samples are stored losslessly but excluded
+from the user summary and do not advance the logical training step.
+
 ## Discovery
 
 - `GET /projects?limit=100` returns bounded project summaries.

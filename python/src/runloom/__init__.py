@@ -1,6 +1,6 @@
 from typing import Any
 
-from runloom.api import current_run, finish, init, log
+from runloom.api import alert, current_run, finish, init, log
 from runloom.client import Health, RunloomApiError, RunloomClient
 from runloom.run import DeliveryError, Run, RunConfig, RunSummary, sync_spool
 
@@ -14,6 +14,7 @@ __all__ = [
     "RunSummary",
     "RunloomApiError",
     "RunloomClient",
+    "alert",
     "current_run",
     "finish",
     "init",

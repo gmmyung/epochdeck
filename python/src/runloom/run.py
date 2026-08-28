@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import secrets
 import threading
 import time
 import uuid
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from runloom.client import RunloomApiError, RunloomClient
+from runloom.system_metrics import SystemMonitor, SystemSampler
 
 Mode = Literal["online", "offline", "disabled"]
 Resume = Literal["never", "allow", "must"]
@@ -21,6 +23,10 @@ _DEFAULT_FLUSH_INTERVAL = 0.25
 _DEFAULT_FINISH_TIMEOUT = 30.0
 _MAX_DOCUMENT_BYTES = 256 * 1024
 _SPOOL_FORMAT_VERSION = 1
+_DEFAULT_SYSTEM_METRIC_INTERVAL = 15.0
+_SYSTEM_METRIC_PREFIX = "system/"
+_MAX_ALERT_TITLE_BYTES = 256
+_MAX_ALERT_TEXT_BYTES = 4_096
 
 
 class DeliveryError(RuntimeError):
@@ -126,8 +132,12 @@ class _Spool:
         self.ack_path = self.directory / "ack"
         self.metadata_path = self.directory / "run.json"
         self.delivery_path = self.directory / "delivery.json"
+        self.alerts_path = self.directory / "alerts.jsonl"
+        self.alert_ack_path = self.directory / "alert-ack"
+        self.alert_delivery_path = self.directory / "alert-delivery.json"
         self._lock = threading.Lock()
         self.events_path.touch(exist_ok=True)
+        self.alerts_path.touch(exist_ok=True)
 
     def read_metadata(self) -> dict[str, Any] | None:
         with self._lock:
@@ -146,21 +156,50 @@ class _Spool:
             _atomic_json_write(self.metadata_path, metadata)
 
     def append(self, point: dict[str, Any]) -> None:
-        encoded = json.dumps(point, separators=(",", ":"), sort_keys=True, allow_nan=False)
-        with self._lock, self.events_path.open("a", encoding="utf-8") as stream:
+        self._append_record(self.events_path, point)
+
+    def append_alert(self, alert: dict[str, Any]) -> None:
+        self._append_record(self.alerts_path, alert)
+
+    def _append_record(self, path: Path, record: dict[str, Any]) -> None:
+        encoded = json.dumps(record, separators=(",", ":"), sort_keys=True, allow_nan=False)
+        with self._lock, path.open("a", encoding="utf-8") as stream:
             stream.write(encoded)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
 
     def read_batch(self, limit: int) -> tuple[list[dict[str, Any]], int]:
+        return self._read_record_batch(
+            self.events_path,
+            self.ack_path,
+            self.delivery_path,
+            limit,
+        )
+
+    def read_alert(self) -> tuple[dict[str, Any] | None, int]:
+        alerts, offset = self._read_record_batch(
+            self.alerts_path,
+            self.alert_ack_path,
+            self.alert_delivery_path,
+            1,
+        )
+        return (alerts[0] if alerts else None), offset
+
+    def _read_record_batch(
+        self,
+        journal_path: Path,
+        ack_path: Path,
+        delivery_path: Path,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], int]:
         with self._lock:
-            offset = self._read_ack()
-            size = self.events_path.stat().st_size
-            delivery = self._read_delivery(offset, size)
+            offset = self._read_ack(ack_path, journal_path)
+            size = journal_path.stat().st_size
+            delivery = self._read_delivery(delivery_path, offset, size)
             fixed_end = int(delivery["end_offset"]) if delivery is not None else None
             points: list[dict[str, Any]] = []
-            with self.events_path.open("rb") as stream:
+            with journal_path.open("rb") as stream:
                 stream.seek(offset)
                 while len(points) < limit or fixed_end is not None:
                     if fixed_end is not None and stream.tell() >= fixed_end:
@@ -170,39 +209,60 @@ class _Spool:
                         break
                     if fixed_end is not None and stream.tell() > fixed_end:
                         raise DeliveryError(
-                            f"delivery boundary splits a journal record: {self.delivery_path}"
+                            f"delivery boundary splits a journal record: {delivery_path}"
                         )
-                    points.append(self._decode_event(line, stream.tell()))
+                    points.append(self._decode_record(line, stream.tell(), journal_path))
                 next_offset = stream.tell()
             if fixed_end is not None and next_offset != fixed_end:
-                raise DeliveryError(f"delivery boundary is outside journal: {self.delivery_path}")
+                raise DeliveryError(f"delivery boundary is outside journal: {delivery_path}")
             if points and delivery is None:
+                record_identity = points[0].get("sequence", points[0].get("id"))
+                if record_identity is None:
+                    raise DeliveryError(f"journal record has no durable identity: {journal_path}")
                 delivery = {
                     "start_offset": offset,
                     "end_offset": next_offset,
-                    "batch_sequence": int(points[0]["sequence"]),
+                    "record_identity": str(record_identity),
                 }
-                _atomic_json_write(self.delivery_path, delivery)
-            if points and int(delivery["batch_sequence"]) != int(points[0]["sequence"]):
-                raise DeliveryError(
-                    f"delivery sequence does not match journal: {self.delivery_path}"
-                )
+                _atomic_json_write(delivery_path, delivery)
+            if points:
+                expected_identity = points[0].get("sequence", points[0].get("id"))
+                stored_identity = delivery.get("record_identity", delivery.get("batch_sequence"))
+                if str(stored_identity) != str(expected_identity):
+                    raise DeliveryError(
+                        f"delivery identity does not match journal: {delivery_path}"
+                    )
             return points, next_offset
 
     def acknowledge(self, offset: int) -> None:
+        self._acknowledge(self.ack_path, self.delivery_path, offset)
+
+    def acknowledge_alert(self, offset: int) -> None:
+        self._acknowledge(self.alert_ack_path, self.alert_delivery_path, offset)
+
+    def _acknowledge(self, ack_path: Path, delivery_path: Path, offset: int) -> None:
         with self._lock:
-            if self.delivery_path.exists():
-                delivery = self._read_json_object(self.delivery_path, "delivery state")
+            if delivery_path.exists():
+                delivery = self._read_json_object(delivery_path, "delivery state")
                 if int(delivery.get("end_offset", -1)) != offset:
                     raise DeliveryError(
-                        f"acknowledgement does not match delivery boundary: {self.delivery_path}"
+                        f"acknowledgement does not match delivery boundary: {delivery_path}"
                     )
-            _atomic_text_write(self.ack_path, str(offset))
-            self.delivery_path.unlink(missing_ok=True)
+            _atomic_text_write(ack_path, str(offset))
+            delivery_path.unlink(missing_ok=True)
 
     def pending(self) -> bool:
+        return self.pending_metrics() or self.pending_alerts()
+
+    def pending_metrics(self) -> bool:
+        return self._pending(self.ack_path, self.events_path)
+
+    def pending_alerts(self) -> bool:
+        return self._pending(self.alert_ack_path, self.alerts_path)
+
+    def _pending(self, ack_path: Path, journal_path: Path) -> bool:
         with self._lock:
-            return self._read_ack() < self.events_path.stat().st_size
+            return self._read_ack(ack_path, journal_path) < journal_path.stat().st_size
 
     def last_point(self) -> dict[str, Any] | None:
         with self._lock, self.events_path.open("rb") as stream:
@@ -218,44 +278,56 @@ class _Spool:
                 position -= 1
             stream.seek(position)
             line = stream.readline()
-        return self._decode_event(line, end) if line.strip() else None
+        return self._decode_record(line, end, self.events_path) if line.strip() else None
 
     def pending_summary(self) -> dict[str, Any]:
         with self._lock:
-            offset = self._read_ack()
+            offset = self._read_ack(self.ack_path, self.events_path)
             summary: dict[str, Any] = {}
             known_keys: set[str] = set()
             with self.events_path.open("rb") as stream:
                 stream.seek(offset)
                 while line := stream.readline():
-                    event = self._decode_event(line, stream.tell())
+                    event = self._decode_record(line, stream.tell(), self.events_path)
                     metrics = event.get("metrics")
                     if not isinstance(metrics, dict):
                         raise DeliveryError(
                             f"journal event has no metric object: {self.events_path}"
                         )
-                    new_keys = metrics.keys() - known_keys
-                    summary.update(metrics)
+                    summary_metrics = {
+                        key: value
+                        for key, value in metrics.items()
+                        if not key.startswith(_SYSTEM_METRIC_PREFIX)
+                    }
+                    new_keys = summary_metrics.keys() - known_keys
+                    summary.update(summary_metrics)
                     if new_keys:
                         known_keys.update(new_keys)
                         summary = _normalize_document(summary, "summary")
             return summary
 
-    def _read_delivery(self, offset: int, size: int) -> dict[str, Any] | None:
-        if not self.delivery_path.exists():
+    def _read_delivery(
+        self,
+        delivery_path: Path,
+        offset: int,
+        size: int,
+    ) -> dict[str, Any] | None:
+        if not delivery_path.exists():
             return None
-        delivery = self._read_json_object(self.delivery_path, "delivery state")
+        delivery = self._read_json_object(delivery_path, "delivery state")
         try:
             start = int(delivery["start_offset"])
             end = int(delivery["end_offset"])
-            int(delivery["batch_sequence"])
+            identity = delivery.get("record_identity", delivery.get("batch_sequence"))
+            if not isinstance(identity, (str, int)) or isinstance(identity, bool):
+                raise TypeError
         except (KeyError, TypeError, ValueError) as error:
-            raise DeliveryError(f"invalid delivery state: {self.delivery_path}") from error
+            raise DeliveryError(f"invalid delivery state: {delivery_path}") from error
         if end <= offset:
-            self.delivery_path.unlink(missing_ok=True)
+            delivery_path.unlink(missing_ok=True)
             return None
         if start != offset or end <= start or end > size:
-            raise DeliveryError(f"delivery state is outside journal: {self.delivery_path}")
+            raise DeliveryError(f"delivery state is outside journal: {delivery_path}")
         return delivery
 
     def _read_json_object(self, path: Path, name: str) -> dict[str, Any]:
@@ -267,29 +339,25 @@ class _Spool:
             raise DeliveryError(f"invalid {name}: {path}")
         return value
 
-    def _decode_event(self, line: bytes, offset: int) -> dict[str, Any]:
+    def _decode_record(self, line: bytes, offset: int, path: Path) -> dict[str, Any]:
         try:
             value = json.loads(line)
         except json.JSONDecodeError as error:
-            raise DeliveryError(
-                f"invalid journal event ending at byte {offset}: {self.events_path}"
-            ) from error
+            raise DeliveryError(f"invalid journal event ending at byte {offset}: {path}") from error
         if not isinstance(value, dict):
-            raise DeliveryError(
-                f"invalid journal event ending at byte {offset}: {self.events_path}"
-            )
+            raise DeliveryError(f"invalid journal event ending at byte {offset}: {path}")
         return value
 
-    def _read_ack(self) -> int:
-        if not self.ack_path.exists():
+    def _read_ack(self, ack_path: Path, journal_path: Path) -> int:
+        if not ack_path.exists():
             return 0
         try:
-            offset = int(self.ack_path.read_text(encoding="ascii"))
+            offset = int(ack_path.read_text(encoding="ascii"))
         except (OSError, ValueError) as error:
-            raise DeliveryError(f"invalid spool acknowledgement: {self.ack_path}") from error
-        size = self.events_path.stat().st_size
+            raise DeliveryError(f"invalid spool acknowledgement: {ack_path}") from error
+        size = journal_path.stat().st_size
         if offset < 0 or offset > size:
-            raise DeliveryError(f"spool acknowledgement is outside journal: {self.ack_path}")
+            raise DeliveryError(f"spool acknowledgement is outside journal: {ack_path}")
         return offset
 
 
@@ -312,6 +380,7 @@ class _DeliveryWorker(threading.Thread):
         self._wake = threading.Event()
         self._stopping = threading.Event()
         self._cancelled = threading.Event()
+        self._prefer_alert = False
         self.last_error: Exception | None = None
 
     def notify(self) -> None:
@@ -337,12 +406,26 @@ class _DeliveryWorker(threading.Thread):
                 self._wake.clear()
                 if not self._stopping.is_set():
                     time.sleep(self._flush_interval)
-            points, next_offset = self._spool.read_batch(self._batch_size)
-            if not points:
-                continue
-            request = {"batch_sequence": points[0]["sequence"], "points": points}
             try:
-                self._client.ingest_batch(self._run_id, request)
+                metrics_pending = self._spool.pending_metrics()
+                alerts_pending = self._spool.pending_alerts()
+                if alerts_pending and (self._prefer_alert or not metrics_pending):
+                    alert, next_offset = self._spool.read_alert()
+                    if alert is None:
+                        continue
+                    self._client.create_alert(self._run_id, alert)
+                    self._spool.acknowledge_alert(next_offset)
+                    self._prefer_alert = False
+                elif metrics_pending:
+                    points, next_offset = self._spool.read_batch(self._batch_size)
+                    if not points:
+                        continue
+                    request = {"batch_sequence": points[0]["sequence"], "points": points}
+                    self._client.ingest_batch(self._run_id, request)
+                    self._spool.acknowledge(next_offset)
+                    self._prefer_alert = alerts_pending
+                else:
+                    continue
             except Exception as error:  # The durable journal remains authoritative.
                 self.last_error = error
                 self._wake.wait(retry_delay)
@@ -351,7 +434,6 @@ class _DeliveryWorker(threading.Thread):
                     return
                 retry_delay = min(retry_delay * 2, 5.0)
             else:
-                self._spool.acknowledge(next_offset)
                 self.last_error = None
                 retry_delay = 0.25
 
@@ -370,6 +452,8 @@ class Run:
         spool_root: Path,
         batch_size: int = _DEFAULT_BATCH_SIZE,
         flush_interval: float = _DEFAULT_FLUSH_INTERVAL,
+        system_monitor_interval: float | None = _DEFAULT_SYSTEM_METRIC_INTERVAL,
+        system_sampler: Callable[[], Mapping[str, float]] | None = None,
         transport: Any = None,
     ) -> None:
         batch_size = _validate_batch_size(batch_size, "batch_size")
@@ -392,6 +476,9 @@ class Run:
         self._worker: _DeliveryWorker | None = None
         self._spool: _Spool | None = None
         self._finish_callback: Callable[[Run], None] | None = None
+        self._system_monitor: SystemMonitor | None = None
+        self._system_monitor_interval = system_monitor_interval
+        self._system_sampler = system_sampler
         self.config = RunConfig(
             initial_config,
             self._document_lock,
@@ -406,6 +493,7 @@ class Run:
         if mode == "disabled":
             self._next_sequence = 1
             self._next_step = 0
+            self._last_user_step: int | None = None
             return
 
         self._spool = _Spool(spool_root, run_id)
@@ -450,6 +538,7 @@ class Run:
         last_point = self._spool.last_point()
         self._next_sequence = int(last_point["sequence"]) + 1 if last_point else 1
         self._next_step = int(last_point["step"]) + 1 if last_point else 0
+        self._last_user_step = int(last_point["step"]) if last_point else None
         pending_summary = self._spool.pending_summary()
         self.summary._replace(
             _normalize_document({**self.summary.to_dict(), **pending_summary}, "summary")
@@ -470,6 +559,7 @@ class Run:
         self._spool.write_metadata(metadata)
 
         if mode == "offline":
+            self._start_system_monitor()
             return
 
         self._client = RunloomClient(server_url, transport=transport)
@@ -537,6 +627,8 @@ class Run:
             server_next_step = _response_position(response, "next_step", minimum=0)
             self._next_sequence = max(self._next_sequence, server_next_sequence)
             self._next_step = max(self._next_step, server_next_step)
+            if self._next_step > 0:
+                self._last_user_step = self._next_step - 1
             self._spool.update_metadata(
                 {
                     "name": self.name,
@@ -555,7 +647,11 @@ class Run:
             self._worker.start()
             if self._spool.pending():
                 self._worker.notify()
+            self._start_system_monitor()
         except Exception:
+            if self._worker is not None:
+                self._worker.cancel()
+                self._worker.join(1)
             self._client.close()
             raise
 
@@ -568,6 +664,10 @@ class Run:
     @property
     def finished(self) -> bool:
         return self._finished
+
+    @property
+    def system_monitor_error(self) -> Exception | None:
+        return self._system_monitor.last_error if self._system_monitor is not None else None
 
     def _set_finish_callback(self, callback: Callable[[Run], None]) -> None:
         self._finish_callback = callback
@@ -642,21 +742,102 @@ class Run:
             if not metrics:
                 raise ValueError("log data contains no numeric scalar metrics")
             selected_step = self._next_step if step is None else step
-            if selected_step < 0:
-                raise ValueError("step cannot be negative")
-            point = {
-                "sequence": self._next_sequence,
-                "step": selected_step,
-                "timestamp_ms": time.time_ns() // 1_000_000,
-                "metrics": metrics,
-            }
-            if self._spool is not None:
-                self._spool.append(point)
-            self.summary._merge_local(metrics)
-            self._next_sequence += 1
-            self._next_step = selected_step + 1
+            _validate_step(selected_step)
+            self._append_metrics(metrics, selected_step, advance_step=True, summarize=True)
+            self._last_user_step = selected_step
         if self._worker is not None:
             self._worker.notify()
+
+    def alert(
+        self,
+        title: str,
+        text: str = "",
+        *,
+        level: str = "info",
+    ) -> None:
+        with self._log_lock:
+            if self._finished or self._finishing:
+                raise RuntimeError("cannot alert while a run is finishing or finished")
+            if self.mode == "disabled":
+                return
+            normalized_title, normalized_text, normalized_level = _validate_alert(
+                title,
+                text,
+                level,
+            )
+            assert self._spool is not None
+            self._spool.append_alert(
+                {
+                    "id": _uuid7(),
+                    "title": normalized_title,
+                    "text": normalized_text,
+                    "level": normalized_level,
+                    "step": self._last_user_step,
+                    "timestamp_ms": time.time_ns() // 1_000_000,
+                }
+            )
+        if self._worker is not None:
+            self._worker.notify()
+
+    def _log_system_metrics(self, data: Mapping[str, float]) -> None:
+        metrics = _flatten_metrics(data)
+        if not metrics:
+            return
+        with self._log_lock:
+            if self._finished or self._finishing:
+                return
+            if self._last_user_step is None:
+                return
+            self._append_metrics(
+                metrics,
+                self._last_user_step,
+                advance_step=False,
+                summarize=False,
+            )
+        if self._worker is not None:
+            self._worker.notify()
+
+    def _append_metrics(
+        self,
+        metrics: Mapping[str, float],
+        step: int,
+        *,
+        advance_step: bool,
+        summarize: bool,
+    ) -> None:
+        point = {
+            "sequence": self._next_sequence,
+            "step": step,
+            "timestamp_ms": time.time_ns() // 1_000_000,
+            "metrics": dict(metrics),
+        }
+        if self._spool is not None:
+            self._spool.append(point)
+        if summarize:
+            self.summary._merge_local(metrics)
+        self._next_sequence += 1
+        if advance_step:
+            self._next_step = step + 1
+
+    def _start_system_monitor(self) -> None:
+        if self._system_monitor_interval is None or self._spool is None:
+            return
+        sampler = self._system_sampler or SystemSampler(self._spool.directory).sample
+        self._system_monitor = SystemMonitor(
+            interval=self._system_monitor_interval,
+            sampler=sampler,
+            recorder=self._log_system_metrics,
+        )
+        self._system_monitor.start()
+
+    def _stop_system_monitor(self, timeout: float) -> None:
+        monitor = self._system_monitor
+        if monitor is None:
+            return
+        monitor.stop()
+        monitor.join(timeout)
+        if monitor.is_alive():
+            raise DeliveryError("timed out stopping the system metric monitor")
 
     def finish(
         self,
@@ -677,6 +858,8 @@ class Run:
             self._finishing = True
             if self._spool is not None:
                 self._spool.update_metadata({"finishing": True, "summary": final_summary})
+        deadline = time.monotonic() + timeout
+        self._stop_system_monitor(timeout)
         if self.mode == "disabled":
             self.summary._replace(final_summary)
             self._complete()
@@ -693,7 +876,7 @@ class Run:
         assert self._worker is not None
         assert self._client is not None
         self._worker.stop()
-        self._worker.join(timeout)
+        self._worker.join(max(deadline - time.monotonic(), 0))
         if self._worker.is_alive() or self._spool.pending():
             error = self._worker.last_error
             message = f"timed out with undelivered data in {self._spool.directory}"
@@ -725,6 +908,8 @@ def create_run(
     spool_root: str | Path | None = None,
     batch_size: int = _DEFAULT_BATCH_SIZE,
     flush_interval: float = _DEFAULT_FLUSH_INTERVAL,
+    system_monitor_interval: float | None = None,
+    system_sampler: Callable[[], Mapping[str, float]] | None = None,
     transport: Any = None,
 ) -> Run:
     if mode not in {"online", "offline", "disabled"}:
@@ -741,6 +926,7 @@ def create_run(
         or os.environ.get("RUNLOOM_SPOOL_DIR")
         or Path.home() / ".local" / "share" / "runloom" / "spool"
     )
+    selected_monitor_interval = _system_monitor_interval(system_monitor_interval)
     return Run(
         project=project,
         run_id=selected_id,
@@ -752,6 +938,8 @@ def create_run(
         spool_root=selected_spool_root,
         batch_size=batch_size,
         flush_interval=flush_interval,
+        system_monitor_interval=selected_monitor_interval,
+        system_sampler=system_sampler,
         transport=transport,
     )
 
@@ -880,6 +1068,64 @@ def _response_position(response: Mapping[str, Any], name: str, *, minimum: int) 
             f"server create response has no valid {name}; server and SDK versions may differ"
         )
     return value
+
+
+def _system_monitor_interval(value: float | None) -> float | None:
+    selected: float | str = (
+        os.environ.get("RUNLOOM_SYSTEM_METRICS_INTERVAL", str(_DEFAULT_SYSTEM_METRIC_INTERVAL))
+        if value is None
+        else value
+    )
+    try:
+        interval = float(selected)
+    except (TypeError, ValueError) as error:
+        raise ValueError("system metric interval must be a finite non-negative number") from error
+    if not math.isfinite(interval) or interval < 0:
+        raise ValueError("system metric interval must be a finite non-negative number")
+    return None if interval == 0 else interval
+
+
+def _validate_step(value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("step must be an integer")
+    if value < 0:
+        raise ValueError("step cannot be negative")
+
+
+def _validate_alert(title: Any, text: Any, level: Any) -> tuple[str, str, str]:
+    if not isinstance(title, str):
+        raise TypeError("alert title must be a string")
+    if not isinstance(text, str):
+        raise TypeError("alert text must be a string")
+    if not isinstance(level, str):
+        raise TypeError("alert level must be a string")
+    title_bytes = title.encode("utf-8")
+    if (
+        not title_bytes
+        or len(title_bytes) > _MAX_ALERT_TITLE_BYTES
+        or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in title)
+    ):
+        raise ValueError(
+            f"alert title must contain 1 to {_MAX_ALERT_TITLE_BYTES} non-control bytes"
+        )
+    if len(text.encode("utf-8")) > _MAX_ALERT_TEXT_BYTES:
+        raise ValueError(f"alert text cannot exceed {_MAX_ALERT_TEXT_BYTES} bytes")
+    normalized_level = level.lower()
+    if normalized_level not in {"info", "warn", "error"}:
+        raise ValueError("alert level must be 'info', 'warn', or 'error'")
+    return title, text, normalized_level
+
+
+def _uuid7() -> str:
+    timestamp_ms = time.time_ns() // 1_000_000
+    if timestamp_ms >= 1 << 48:
+        raise OverflowError("current timestamp is outside the UUIDv7 range")
+    value = timestamp_ms << 80
+    value |= 0x7 << 76
+    value |= secrets.randbits(12) << 64
+    value |= 0b10 << 62
+    value |= secrets.randbits(62)
+    return str(uuid.UUID(int=value))
 
 
 def _flatten_metrics(data: Mapping[str, Any], prefix: str = "") -> dict[str, float]:

@@ -37,6 +37,17 @@ export type History = {
   source_last_sequence: number | null;
 };
 
+export type Alert = {
+  id: string;
+  run_id: string;
+  title: string;
+  text: string;
+  level: "info" | "warn" | "error";
+  step: number | null;
+  timestamp_ms: number;
+  created_at: string;
+};
+
 export function getHealth(signal?: AbortSignal): Promise<Health> {
   return getJson<Health>("/api/v1/health", signal);
 }
@@ -64,6 +75,14 @@ export async function getMetricKeys(runId: string, signal?: AbortSignal): Promis
     signal,
   );
   return result.keys;
+}
+
+export async function getAlerts(runId: string, signal?: AbortSignal): Promise<Alert[]> {
+  const result = await getJson<{ alerts: Alert[]; next_before: string | null }>(
+    `/api/v1/runs/${encodeURIComponent(runId)}/alerts?limit=100`,
+    signal,
+  );
+  return result.alerts;
 }
 
 export function getHistory(

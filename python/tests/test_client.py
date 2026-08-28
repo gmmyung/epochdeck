@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 
@@ -77,3 +79,30 @@ def test_get_run_uses_the_public_lifecycle_endpoint() -> None:
         run = client.get_run("run-id")
 
     assert run == {"id": "run-id", "state": "finished"}
+
+
+def test_alerts_use_bounded_create_and_list_contracts() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            body = request.read()
+            return httpx.Response(201, json={"alert": json.loads(body), "duplicate": False})
+        return httpx.Response(200, json={"alerts": [], "next_before": None})
+
+    alert = {
+        "id": "019c1234-5678-7000-8000-000000000007",
+        "title": "Done",
+        "text": "Training completed",
+        "level": "info",
+        "step": 4,
+        "timestamp_ms": 1,
+    }
+    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+        client.create_alert("run/id", alert)
+        client.alerts("run/id", before=alert["id"], limit=25)
+
+    assert requests[0].url.path == "/api/v1/runs/run/id/alerts"
+    assert json.loads(requests[0].read()) == alert
+    assert dict(requests[1].url.params) == {"limit": "25", "before": alert["id"]}

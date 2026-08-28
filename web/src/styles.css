@@ -307,6 +307,57 @@ select:hover {
   margin-bottom: 24px;
 }
 
+.alerts-card {
+  margin-bottom: 24px;
+}
+
+.alert-list {
+  display: grid;
+  gap: 1px;
+  border: 1px solid var(--line);
+  background: var(--line);
+}
+
+.alert-row {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+  padding: 9px;
+  background: var(--surface);
+  border-left: 3px solid var(--accent);
+}
+
+.alert-row.warn {
+  border-left-color: #a86d00;
+}
+
+.alert-row.error-level {
+  border-left-color: var(--danger);
+}
+
+.alert-level {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.alert-row strong {
+  font-size: 11px;
+}
+
+.alert-row p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.alert-row small {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
 article {
   min-width: 0;
   padding: 14px;
@@ -514,5 +565,14 @@ dd {
 
   .card-heading select {
     width: 100%;
+  }
+
+  .alert-row {
+    grid-template-columns: 48px minmax(0, 1fr);
+  }
+
+  .alert-row small {
+    grid-column: 2;
+    white-space: normal;
   }
 }

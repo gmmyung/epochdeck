@@ -22,9 +22,9 @@ usable and tested, not that the entire feature group is complete.
 | Configuration | immutable initial config plus controlled updates | Compatible |
 | Summary | automatic latest-value summary and explicit overrides | Compatible |
 | Scalar metrics | steps, timestamps, nested keys, batching | Compatible |
-| System metrics | CPU, memory, disk, GPU when available | Planned |
+| System metrics | CPU, memory, disk, GPU when available | Compatible |
 | Rich values | images, audio, video, tables, histograms | Planned |
-| Alerts | levels, titles, text, steps, timestamps | Planned |
+| Alerts | levels, titles, text, steps, timestamps | Compatible |
 | Artifacts | manifests, versions, aliases, input/output links | Planned |
 | Traces | structured spans, messages, search metadata | Planned |
 | Python API | synchronous public API and background delivery | Partial |
@@ -83,3 +83,9 @@ controlled shallow updates, and summaries support
 bounded JSON strings, booleans, nulls, arrays, nested objects, and explicit
 overrides. Strings in metric history, media, tables, and histograms remain
 unsupported and fail explicitly.
+
+The SDK records bounded host and process telemetry every 15 seconds after the
+first user metric. Set `RUNLOOM_SYSTEM_METRICS_INTERVAL=0` to disable it. System
+samples use the most recently completed user step and never change automatic
+step progression or the run summary. Alerts use a separate fsynced journal,
+sortable UUIDv7 identities, idempotent delivery, and a bounded dashboard list.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 
 import httpx
 import pytest
@@ -258,3 +259,107 @@ def test_online_run_rejects_a_server_without_resume_positions(tmp_path) -> None:
             spool_root=tmp_path,
             transport=httpx.MockTransport(handler),
         )
+
+
+def test_system_metrics_are_durable_without_advancing_user_steps(tmp_path) -> None:
+    sampled = threading.Event()
+
+    def sample() -> dict[str, float]:
+        sampled.set()
+        return {"system/cpu_percent": 12.5, "system/process_rss_bytes": 1_024.0}
+
+    run = create_run(
+        project="robotics",
+        run_id="019c1234-5678-7000-8000-000000000005",
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0.01,
+        system_sampler=sample,
+    )
+    run.log({"loss": 1.0}, step=7)
+    assert sampled.wait(1)
+    time.sleep(0.02)
+    run.finish()
+
+    events = [
+        json.loads(line) for line in (tmp_path / run.id / "events.jsonl").read_text().splitlines()
+    ]
+    system_events = [event for event in events if "system/cpu_percent" in event["metrics"]]
+    assert system_events
+    assert {event["step"] for event in system_events} == {7}
+    assert run.summary.to_dict() == {"loss": 1.0}
+
+
+def test_alert_delivery_replays_the_same_durable_record(tmp_path) -> None:
+    received: list[dict] = []
+    first_alert_committed = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/runs"):
+            body = json.loads(request.content)
+            return httpx.Response(
+                201,
+                json={
+                    "run": {"id": body["id"], "name": "training"},
+                    "resumed": False,
+                    "next_sequence": 1,
+                    "next_step": 0,
+                },
+            )
+        if request.url.path.endswith("/alerts"):
+            body = json.loads(request.content)
+            received.append(body)
+            if len(received) == 1:
+                first_alert_committed.set()
+                raise httpx.ReadError("response lost after commit", request=request)
+            return httpx.Response(200, json={"alert": body, "duplicate": True})
+        if request.url.path.endswith("/batches"):
+            body = json.loads(request.content)
+            return httpx.Response(
+                201,
+                json={
+                    "run_id": run.id,
+                    "batch_sequence": body["batch_sequence"],
+                    "accepted_points": len(body["points"]),
+                    "duplicate": False,
+                    "metric_revision": 1,
+                },
+            )
+        if request.url.path.endswith("/finish"):
+            return httpx.Response(200, json={"run": {"state": "finished"}})
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    run = create_run(
+        project="robotics",
+        run_id="019c1234-5678-7000-8000-000000000006",
+        mode="online",
+        spool_root=tmp_path,
+        flush_interval=0,
+        system_monitor_interval=0,
+        transport=httpx.MockTransport(handler),
+    )
+    run.log({"loss": 1.0}, step=9)
+    run.alert("Training diverged", "Loss became unstable", level="WARN")
+    assert first_alert_committed.wait(2)
+    run.finish(timeout=2)
+
+    assert received[0] == received[1]
+    assert received[0]["level"] == "warn"
+    assert received[0]["step"] == 9
+    assert uuid.UUID(received[0]["id"]).version == 7
+    assert not (tmp_path / run.id / "alert-delivery.json").exists()
+
+
+def test_alerts_validate_before_touching_the_journal(tmp_path) -> None:
+    run = create_run(
+        project="robotics",
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+    with pytest.raises(ValueError, match="alert level"):
+        run.alert("Bad level", level="critical")
+    with pytest.raises(ValueError, match="non-control"):
+        run.alert("bad\ntitle")
+    assert (tmp_path / run.id / "alerts.jsonl").read_text() == ""
+    run.finish()

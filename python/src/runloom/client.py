@@ -102,6 +102,29 @@ class RunloomClient:
             json={"summary": summary},
         )
 
+    def create_alert(self, run_id: str, alert: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/runs/{quote(run_id, safe='')}/alerts",
+            json=alert,
+        )
+
+    def alerts(
+        self,
+        run_id: str,
+        *,
+        before: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        params = {"limit": limit}
+        if before is not None:
+            params["before"] = before
+        return self._request(
+            "GET",
+            f"/api/v1/runs/{quote(run_id, safe='')}/alerts",
+            params=params,
+        )
+
     def history(
         self,
         run_id: str,

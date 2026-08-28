@@ -33,7 +33,7 @@ not a reduction in the final parity goal.
 - [x] Lazy, virtualized Canvas metric charts.
 - [x] Server-side min/max downsampling.
 - [x] Per-run revision caches and realtime deltas.
-- System metrics and alerts.
+- [x] System metrics and alerts.
 
 ## Milestone 3: rich data and artifacts
 

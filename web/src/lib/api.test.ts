@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { getHealth, getHistory, getRun, getRuns, getSampledHistory } from "./api";
+import { getAlerts, getHealth, getHistory, getRun, getRuns, getSampledHistory } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -100,5 +100,17 @@ describe("getHealth", () => {
     expect(fetchMock.mock.calls[1][0]).toBe(
       "/api/v1/runs/run-id/history?keys=loss&limit=257&after=42",
     );
+  });
+
+  it("loads a bounded alert page", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ alerts: [], next_before: null }), { status: 200 }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getAlerts("run/id")).resolves.toEqual([]);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/runs/run%2Fid/alerts?limit=100");
   });
 });

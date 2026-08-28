@@ -8,10 +8,10 @@ The immediate compatibility milestone is Trackio feature parity. The long-term
 contract is practical W&B feature parity across logging, run management, rich
 media, artifacts, querying, and the dashboard.
 
-Runloom is pre-alpha. Scalar run tracking, bounded dashboard sampling, and
-background metric compaction are usable end to end; rich media, artifacts,
-authentication, sweeps, and the wider compatibility surface remain under active
-development.
+Runloom is pre-alpha. Scalar run tracking, host telemetry, durable alerts,
+bounded dashboard sampling, and background metric compaction are usable end to
+end; rich media, artifacts, authentication, sweeps, and the wider compatibility
+surface remain under active development.
 
 ## Non-negotiable properties
 
@@ -80,6 +80,7 @@ run = wandb.init(
 )
 for step in range(1_000):
     run.log({"train": {"loss": 1 / (step + 1)}, "reward": step * 0.1})
+run.alert("Checkpoint saved", "Validation improved", level="info")
 run.config.update({"optimizer": "adam"})
 run.summary["result"] = "complete"
 run.finish(summary={"tags": ["baseline", "mujoco"]})
@@ -92,6 +93,11 @@ replay the exact same batch, while the server accepts identical duplicates.
 Resume restores the local config and summary and obtains the next sequence and
 step from the server. Finish is idempotent and recoverable when its response is
 lost after the server commits it.
+
+The SDK samples host and process metrics every 15 seconds after the first user
+metric. These `system/` histories do not advance training steps or enter the
+summary. Set `RUNLOOM_SYSTEM_METRICS_INTERVAL=0` to disable collection. Alerts
+are also fsynced locally and delivered idempotently without blocking training.
 Use `mode="offline"`, then upload later with:
 
 ```bash

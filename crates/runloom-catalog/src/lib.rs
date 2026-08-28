@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use runloom_protocol::{
-    CreateRunRequest, MAX_CONFIG_BYTES, MAX_SUMMARY_BYTES, ProjectId, ProjectSummary, ResumePolicy,
-    RunId, RunRecord, RunState,
+    AlertId, AlertLevel, AlertRecord, CreateAlertRequest, CreateRunRequest, MAX_CONFIG_BYTES,
+    MAX_SUMMARY_BYTES, ProjectId, ProjectSummary, ResumePolicy, RunId, RunRecord, RunState,
 };
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
@@ -80,6 +80,20 @@ CREATE TABLE IF NOT EXISTS run_metric_keys (
     key TEXT NOT NULL,
     PRIMARY KEY(run_id, key)
 );
+
+CREATE TABLE IF NOT EXISTS run_alerts (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    title TEXT NOT NULL,
+    text TEXT NOT NULL,
+    level TEXT NOT NULL,
+    step INTEGER,
+    timestamp_ms INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_alerts_run_id
+    ON run_alerts(run_id, id DESC);
 "#;
 
 #[derive(Debug, Error)]
@@ -261,6 +275,75 @@ impl Catalog {
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows.into_iter().map(|row| row.get("key")).collect())
+    }
+
+    pub async fn create_alert(
+        &self,
+        run_id: RunId,
+        request: &CreateAlertRequest,
+    ) -> Result<(AlertRecord, bool), CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        ensure_running(&mut transaction, run_id).await?;
+        let alert_id = request.id.unwrap_or_default();
+        if let Some(existing) = load_alert(&mut transaction, alert_id).await? {
+            let matches = existing.run_id == run_id
+                && existing.title == request.title
+                && existing.text == request.text
+                && existing.level == request.level
+                && existing.step == request.step
+                && existing.timestamp_ms == request.timestamp_ms;
+            if !matches {
+                return Err(CatalogError::Conflict(
+                    "alert ID was reused with different contents".to_owned(),
+                ));
+            }
+            transaction.commit().await?;
+            return Ok((existing, true));
+        }
+        let step = request
+            .step
+            .map(|value| to_i64(value, "alert step"))
+            .transpose()?;
+        query(
+            "INSERT INTO run_alerts \
+             (id, run_id, title, text, level, step, timestamp_ms, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, current_timestamp)",
+        )
+        .bind(alert_id.to_string())
+        .bind(run_id.to_string())
+        .bind(&request.title)
+        .bind(&request.text)
+        .bind(request.level.to_string())
+        .bind(step)
+        .bind(request.timestamp_ms)
+        .execute(&mut *transaction)
+        .await?;
+        touch_run(&mut transaction, run_id).await?;
+        let alert = load_required_alert(&mut transaction, alert_id).await?;
+        transaction.commit().await?;
+        Ok((alert, false))
+    }
+
+    pub async fn list_alerts(
+        &self,
+        run_id: RunId,
+        before: Option<AlertId>,
+        limit: usize,
+    ) -> Result<Vec<AlertRecord>, CatalogError> {
+        self.get_run(run_id).await?;
+        let before = before.map(|value| value.to_string());
+        let rows = query(
+            "SELECT id, run_id, title, text, level, step, timestamp_ms, created_at \
+             FROM run_alerts WHERE run_id = ? AND (? IS NULL OR id < ?) \
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(run_id.to_string())
+        .bind(&before)
+        .bind(&before)
+        .bind(to_i64(limit as u64, "alert limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(alert_from_row).collect()
     }
 
     pub async fn create_or_resume_run(
@@ -895,6 +978,31 @@ async fn load_required_run(
         })
 }
 
+async fn load_alert(
+    transaction: &mut Transaction<'_, Sqlite>,
+    alert_id: AlertId,
+) -> Result<Option<AlertRecord>, CatalogError> {
+    let row = query(
+        "SELECT id, run_id, title, text, level, step, timestamp_ms, created_at \
+         FROM run_alerts WHERE id = ?",
+    )
+    .bind(alert_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.map(alert_from_row).transpose()
+}
+
+async fn load_required_alert(
+    transaction: &mut Transaction<'_, Sqlite>,
+    alert_id: AlertId,
+) -> Result<AlertRecord, CatalogError> {
+    load_alert(transaction, alert_id)
+        .await?
+        .ok_or_else(|| CatalogError::NotFound {
+            resource: format!("alert {alert_id}"),
+        })
+}
+
 async fn load_document(
     transaction: &mut Transaction<'_, Sqlite>,
     run_id: RunId,
@@ -947,6 +1055,24 @@ fn run_from_row(row: SqliteRow) -> Result<RunRecord, CatalogError> {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         finished_at: row.get("finished_at"),
+    })
+}
+
+fn alert_from_row(row: SqliteRow) -> Result<AlertRecord, CatalogError> {
+    let step = row
+        .get::<Option<i64>, _>("step")
+        .map(|value| from_i64(value, "alert step"))
+        .transpose()?;
+    Ok(AlertRecord {
+        id: parse_id(row.get::<String, _>("id"), "alert ID")?,
+        run_id: parse_id(row.get::<String, _>("run_id"), "run ID")?,
+        title: row.get("title"),
+        text: row.get("text"),
+        level: AlertLevel::from_str(&row.get::<String, _>("level"))
+            .map_err(|error| CatalogError::InvalidData(error.to_owned()))?,
+        step,
+        timestamp_ms: row.get("timestamp_ms"),
+        created_at: row.get("created_at"),
     })
 }
 
@@ -1109,7 +1235,9 @@ fn from_i64(value: i64, name: &str) -> Result<u64, CatalogError> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use runloom_protocol::{CreateRunRequest, ResumePolicy, RunState};
+    use runloom_protocol::{
+        AlertId, AlertLevel, CreateAlertRequest, CreateRunRequest, ResumePolicy, RunState,
+    };
     use tempfile::tempdir;
 
     use super::{Catalog, CatalogError, SegmentManifest};
@@ -1195,6 +1323,26 @@ mod tests {
             Some((3, 10))
         );
         assert_eq!(catalog.metric_extent(created.id, Some(10)).await?, None);
+
+        let alert_id = AlertId::new();
+        let alert_request = CreateAlertRequest {
+            id: Some(alert_id),
+            title: "training stalled".to_owned(),
+            text: "reward has not improved".to_owned(),
+            level: AlertLevel::Warn,
+            step: Some(9),
+            timestamp_ms: 1_000,
+        };
+        let (alert, duplicate) = catalog.create_alert(created.id, &alert_request).await?;
+        assert!(!duplicate);
+        assert_eq!(alert.id, alert_id);
+        let (replayed, duplicate) = catalog.create_alert(created.id, &alert_request).await?;
+        assert!(duplicate);
+        assert_eq!(replayed, alert);
+        assert_eq!(
+            catalog.list_alerts(created.id, None, 10).await?,
+            vec![alert]
+        );
 
         let finished = catalog
             .finish_run(

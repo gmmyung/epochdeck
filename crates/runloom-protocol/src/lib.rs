@@ -15,6 +15,8 @@ pub const MAX_HISTORY_KEYS: usize = 32;
 pub const MAX_HISTORY_POINTS: usize = 5_000;
 pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
 pub const MAX_SUMMARY_BYTES: usize = 256 * 1024;
+pub const MAX_ALERT_TITLE_BYTES: usize = 256;
+pub const MAX_ALERT_TEXT_BYTES: usize = 4 * 1024;
 
 macro_rules! uuid_identifier {
     ($name:ident) => {
@@ -53,6 +55,7 @@ macro_rules! uuid_identifier {
 
 uuid_identifier!(ProjectId);
 uuid_identifier!(RunId);
+uuid_identifier!(AlertId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -102,6 +105,37 @@ pub enum ResumePolicy {
 pub enum RunState {
     Running,
     Finished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+impl fmt::Display for AlertLevel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Info => formatter.write_str("info"),
+            Self::Warn => formatter.write_str("warn"),
+            Self::Error => formatter.write_str("error"),
+        }
+    }
+}
+
+impl FromStr for AlertLevel {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "info" => Ok(Self::Info),
+            "warn" => Ok(Self::Warn),
+            "error" => Ok(Self::Error),
+            _ => Err("unknown alert level"),
+        }
+    }
 }
 
 impl fmt::Display for RunState {
@@ -244,6 +278,43 @@ pub struct FinishRunResponse {
     pub run: RunRecord,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateAlertRequest {
+    #[serde(default)]
+    pub id: Option<AlertId>,
+    pub title: String,
+    #[serde(default)]
+    pub text: String,
+    pub level: AlertLevel,
+    #[serde(default)]
+    pub step: Option<u64>,
+    pub timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertRecord {
+    pub id: AlertId,
+    pub run_id: RunId,
+    pub title: String,
+    pub text: String,
+    pub level: AlertLevel,
+    pub step: Option<u64>,
+    pub timestamp_ms: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateAlertResponse {
+    pub alert: AlertRecord,
+    pub duplicate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertListResponse {
+    pub alerts: Vec<AlertRecord>,
+    pub next_before: Option<AlertId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistoryResponse {
     pub run_id: RunId,
@@ -281,7 +352,8 @@ mod tests {
     use std::str::FromStr;
 
     use super::{
-        HealthResponse, HealthStatus, HistoryResponse, ProjectId, ResumePolicy, RunId, RunState,
+        AlertLevel, HealthResponse, HealthStatus, HistoryResponse, ProjectId, ResumePolicy, RunId,
+        RunState,
     };
 
     #[test]
@@ -304,6 +376,7 @@ mod tests {
     fn public_enums_use_stable_wire_names() -> Result<(), serde_json::Error> {
         assert_eq!(serde_json::to_string(&ResumePolicy::Must)?, "\"must\"");
         assert_eq!(serde_json::to_string(&RunState::Finished)?, "\"finished\"");
+        assert_eq!(serde_json::to_string(&AlertLevel::Warn)?, "\"warn\"");
         Ok(())
     }
 
