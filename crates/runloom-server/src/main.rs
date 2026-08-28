@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use runloom_catalog::Catalog;
 use runloom_server::app;
-use runloom_storage::StorageLayout;
+use runloom_storage::{MetricStore, StorageLayout};
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -29,7 +29,8 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to bind Runloom server to {address}"))?;
 
     info!(%address, "Runloom server listening");
-    axum::serve(listener, app(catalog))
+    let metric_store = MetricStore::new(layout.metrics_dir());
+    axum::serve(listener, app(catalog, metric_store))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("Runloom server failed")?;

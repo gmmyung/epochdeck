@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import os
+import threading
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from runloom.run import Mode, Resume, Run, create_run
+
+_current_run: Run | None = None
+_current_run_lock = threading.Lock()
+
+
+def init(
+    *,
+    project: str,
+    name: str | None = None,
+    id: str | None = None,
+    config: Mapping[str, Any] | None = None,
+    resume: bool | str | None = None,
+    mode: Mode = "online",
+    dir: str | Path | None = None,
+    server_url: str | None = None,
+) -> Run:
+    """Create a run using the common W&B-style lifecycle arguments."""
+    global _current_run
+
+    with _current_run_lock:
+        if _current_run is not None and not _current_run.finished:
+            raise RuntimeError(
+                "a Runloom run is already active; finish it before calling init again"
+            )
+        spool_root = Path(dir) / ".runloom" / "spool" if dir is not None else None
+        _current_run = create_run(
+            project=project,
+            name=name,
+            run_id=id,
+            config=config,
+            mode=mode,
+            resume=_normalize_resume(resume),
+            server_url=server_url or os.environ.get("RUNLOOM_SERVER_URL", "http://127.0.0.1:8787"),
+            spool_root=spool_root,
+        )
+        return _current_run
+
+
+def log(data: Mapping[str, Any], *, step: int | None = None) -> None:
+    """Log scalar metrics to the active run."""
+    run = _require_current_run()
+    run.log(data, step=step)
+
+
+def finish(*, summary: Mapping[str, Any] | None = None, timeout: float = 30.0) -> None:
+    """Flush and finish the active run."""
+    global _current_run
+
+    run = _require_current_run()
+    run.finish(summary=summary, timeout=timeout)
+    with _current_run_lock:
+        if _current_run is run:
+            _current_run = None
+
+
+def _require_current_run() -> Run:
+    with _current_run_lock:
+        if _current_run is None:
+            raise RuntimeError("no active Runloom run; call runloom.init first")
+        return _current_run
+
+
+def _normalize_resume(value: bool | str | None) -> Resume:
+    if value in {None, False, "never"}:
+        return "never"
+    if value in {True, "allow", "auto"}:
+        return "allow"
+    if value == "must":
+        return "must"
+    raise ValueError("resume must be None, bool, 'never', 'allow', 'auto', or 'must'")

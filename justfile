@@ -42,3 +42,6 @@ dev-server:
 
 dev-web:
   pnpm --dir web dev
+
+benchmark-metrics rows="200000" metrics="180":
+  cargo run --release -p runloom-storage --example metric_workload -- {{ rows }} {{ metrics }}

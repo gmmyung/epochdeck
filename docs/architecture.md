@@ -52,6 +52,13 @@ Journal records are grouped by project, run, and metric signature, converted to
 Arrow record batches, and flushed as immutable Parquet segments. A catalog
 transaction makes each segment visible atomically.
 
+The Python journal is append-only and fsynced before `log` returns. Its byte
+offset advances atomically only after an idempotent server acknowledgement. The
+server writes each batch to a temporary Parquet file, syncs it, installs it with
+an atomic rename, and then commits its SQLite manifest. A client retry after a
+crash therefore either installs the missing batch or receives the same duplicate
+acknowledgement.
+
 Parquet provides typed values, compression, column projection, row-group
 statistics, immutable snapshot-friendly files, and one metric name per column
 rather than per row. Small segments are compacted in the background under

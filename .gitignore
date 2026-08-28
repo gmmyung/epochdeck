@@ -23,6 +23,7 @@ web/.svelte-kit/
 
 # Runtime data
 /data/
+.runloom/
 *.sqlite
 *.sqlite3
 *.sqlite3-shm

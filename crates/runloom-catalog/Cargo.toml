@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+runloom-protocol = { path = "../runloom-protocol" }
+serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 

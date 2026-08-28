@@ -15,13 +15,16 @@ not a reduction in the final parity goal.
 
 ## Milestone 1: run lifecycle and bounded metrics
 
-- W&B-compatible `init`, `log`, and `finish` lifecycle.
-- Online, offline, disabled, and resume modes.
-- Idempotent batch-ingest protocol and durable spool.
-- Arrow conversion and immutable Parquet segments.
-- Config, summary, nested scalar metrics, and explicit steps.
-- Metric schema and columnar series APIs.
-- Workload-shaped performance benchmarks.
+- [x] W&B-style `init`, `log`, and `finish` lifecycle for scalar runs.
+- [x] Online, offline, disabled, and explicit resume modes.
+- [x] Idempotent batch-ingest protocol and durable Python spool.
+- [x] Arrow conversion and immutable wide Parquet segments.
+- [x] Initial config, summary, nested scalar metrics, and explicit steps.
+- [x] Metric-key discovery and bounded columnar history APIs.
+- [x] Workload-shaped storage benchmark harness.
+- [ ] Config mutation and non-numeric summary semantics.
+- [ ] Background compaction and server-side min/max downsampling.
+- [ ] Full W&B lifecycle contract suite.
 
 ## Milestone 2: dashboard and monitoring
 

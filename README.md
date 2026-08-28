@@ -8,9 +8,9 @@ The immediate compatibility milestone is Trackio feature parity. The long-term
 contract is practical W&B feature parity across logging, run management, rich
 media, artifacts, querying, and the dashboard.
 
-Runloom is pre-alpha. This repository currently establishes the product
-contract, architecture, reproducible development environment, and first
-runnable vertical slice.
+Runloom is pre-alpha. Scalar run tracking is usable end to end; rich media,
+artifacts, authentication, downsampling, sweeps, and the wider compatibility
+surface remain under active development.
 
 ## Non-negotiable properties
 
@@ -46,8 +46,8 @@ control plane. The dashboard is Svelte 5 and TypeScript. The Python SDK is
 managed with uv. Nix pins all development tools.
 
 See [System architecture](docs/architecture.md), the
-[compatibility matrix](docs/compatibility.md), and the
-[initial architecture decision](docs/adr/0001-system-architecture.md).
+[compatibility matrix](docs/compatibility.md), the [HTTP API](docs/api.md), and
+[metric benchmarks](docs/benchmarks.md).
 
 ## Development
 
@@ -66,6 +66,32 @@ just dev-web
 
 The API listens on `127.0.0.1:8787` by default. The Vite development server
 proxies `/api` to it.
+
+Log a run from Python:
+
+```python
+import runloom as wandb
+
+run = wandb.init(
+    project="bello-mujoco",
+    config={"seed": 42, "learning_rate": 3e-4},
+    server_url="http://127.0.0.1:8787",
+)
+for step in range(1_000):
+    run.log({"train": {"loss": 1 / (step + 1)}, "reward": step * 0.1})
+run.finish()
+```
+
+`log` fsyncs to a local journal and returns without waiting for HTTP. A bounded
+background worker uploads batches, and acknowledged batches are replay-safe.
+Use `mode="offline"`, then upload later with:
+
+```bash
+runloom sync ~/.local/share/runloom/spool/<run-id>
+```
+
+The current scalar API accepts finite numbers and booleans. Unsupported rich
+values fail explicitly until their native implementations land.
 
 ## Repository layout
 
