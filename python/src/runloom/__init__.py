@@ -5,7 +5,8 @@ from runloom.artifact import Artifact
 from runloom.client import Health, RunloomApiError, RunloomClient
 from runloom.public_api import Api
 from runloom.rich import Audio, Histogram, Image, Table, Video
-from runloom.run import DeliveryError, Run, RunConfig, RunSummary, sync_spool
+from runloom.run import DeliveryError, Run, RunConfig, RunSummary, SweepEarlyStop, sync_spool
+from runloom.sweep import agent, sweep
 from runloom.trace import Trace
 
 run: Run | None = current_run()
@@ -23,9 +24,11 @@ __all__ = [
     "RunSummary",
     "RunloomApiError",
     "RunloomClient",
+    "SweepEarlyStop",
     "Table",
     "Trace",
     "Video",
+    "agent",
     "alert",
     "current_run",
     "finish",
@@ -33,6 +36,7 @@ __all__ = [
     "log",
     "log_artifact",
     "run",
+    "sweep",
     "sync_spool",
     "trace",
     "use_artifact",

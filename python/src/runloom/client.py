@@ -63,11 +63,55 @@ class RunloomClient:
         name: str | None,
         config: dict[str, Any],
         resume: str,
+        sweep_trial_id: str | None = None,
     ) -> dict[str, Any]:
         return self._request(
             "POST",
             f"/api/v1/projects/{quote(project, safe='')}/runs",
-            json={"id": run_id, "name": name, "config": config, "resume": resume},
+            json={
+                "id": run_id,
+                "name": name,
+                "config": config,
+                "resume": resume,
+                "sweep_trial_id": sweep_trial_id,
+            },
+        )
+
+    def create_sweep(self, project: str, sweep: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/projects/{quote(project, safe='')}/sweeps",
+            json=sweep,
+        )
+
+    def get_sweep(self, sweep_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/sweeps/{quote(sweep_id, safe='')}")
+
+    def claim_sweep_trial(self, sweep_id: str, agent_id: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/sweeps/{quote(sweep_id, safe='')}/claim",
+            json={"agent_id": agent_id},
+        )
+
+    def complete_sweep_trial(
+        self,
+        trial_id: str,
+        *,
+        state: str,
+        metric: float | None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/sweep-trials/{quote(trial_id, safe='')}/complete",
+            json={"state": state, "metric": metric},
+        )
+
+    def sweep_trials(self, sweep_id: str, *, limit: int = 100) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/v1/sweeps/{quote(sweep_id, safe='')}/trials",
+            params={"limit": limit},
         )
 
     def ingest_batch(self, run_id: str, batch: dict[str, Any]) -> dict[str, Any]:

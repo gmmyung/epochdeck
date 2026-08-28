@@ -113,6 +113,15 @@ behavioral shape and does not carry data or SDK compatibility scaffolding;
 unsupported semantics produce clear errors rather than inert arguments. The
 HTTP namespace remains explicitly versioned under `/api/v1`.
 
+### Sweep scheduler
+
+Sweep definitions, monotonic scheduler indexes, leased trials, and run bindings
+live in SQLite. Grid scheduling uses mixed-radix selection and random scheduling
+uses deterministic hashes, so neither path expands parameter combinations in
+memory. A short transaction serializes claims. Metric batch acknowledgements
+carry median-rule stop decisions back through the existing durable delivery
+worker; no polling thread or scheduler queue enters training code.
+
 ### Dashboard
 
 The Svelte dashboard initially loads project, run, and metric metadata. It

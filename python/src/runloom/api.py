@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from runloom._sweep_context import current_sweep_context
 from runloom.artifact import Artifact
 from runloom.run import Mode, Resume, Run, create_run
 from runloom.trace import Trace, TraceKind
@@ -34,17 +35,33 @@ def init(
             raise RuntimeError(
                 "a Runloom run is already active; finish it before calling init again"
             )
+        sweep_context = current_sweep_context.get()
+        selected_config = dict(config or {})
+        if sweep_context is not None:
+            conflicts = {
+                key
+                for key, value in selected_config.items()
+                if key in sweep_context.config and sweep_context.config[key] != value
+            }
+            if conflicts:
+                raise ValueError(
+                    "run config conflicts with sweep parameters: " + ", ".join(sorted(conflicts))
+                )
+            selected_config = {**selected_config, **sweep_context.config}
         spool_root = Path(dir) / ".runloom" / "spool" if dir is not None else None
         new_run = create_run(
             project=project,
             name=name,
             run_id=id,
-            config=config,
+            config=selected_config,
             mode=mode,
             resume=_normalize_resume(resume),
             server_url=server_url or os.environ.get("RUNLOOM_SERVER_URL", "http://127.0.0.1:8787"),
             spool_root=spool_root,
+            sweep_trial_id=sweep_context.trial_id if sweep_context is not None else None,
         )
+        if sweep_context is not None:
+            sweep_context.run_id = new_run.id
         new_run._set_finish_callback(_clear_current_run)
         _current_run = None if new_run.finished else new_run
         _publish_current_run(_current_run)

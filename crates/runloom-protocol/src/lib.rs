@@ -64,6 +64,8 @@ uuid_identifier!(AlertId);
 uuid_identifier!(RichValueId);
 uuid_identifier!(ArtifactId);
 uuid_identifier!(TraceSpanId);
+uuid_identifier!(SweepId);
+uuid_identifier!(SweepTrialId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -113,6 +115,130 @@ pub enum ResumePolicy {
 pub enum RunState {
     Running,
     Finished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepMethod {
+    Grid,
+    Random,
+}
+
+impl fmt::Display for SweepMethod {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Grid => formatter.write_str("grid"),
+            Self::Random => formatter.write_str("random"),
+        }
+    }
+}
+
+impl FromStr for SweepMethod {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "grid" => Ok(Self::Grid),
+            "random" => Ok(Self::Random),
+            _ => Err("unknown sweep method"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricGoal {
+    Minimize,
+    Maximize,
+}
+
+impl fmt::Display for MetricGoal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Minimize => formatter.write_str("minimize"),
+            Self::Maximize => formatter.write_str("maximize"),
+        }
+    }
+}
+
+impl FromStr for MetricGoal {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "minimize" => Ok(Self::Minimize),
+            "maximize" => Ok(Self::Maximize),
+            _ => Err("unknown metric goal"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepState {
+    Running,
+    Finished,
+    Cancelled,
+}
+
+impl fmt::Display for SweepState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Running => formatter.write_str("running"),
+            Self::Finished => formatter.write_str("finished"),
+            Self::Cancelled => formatter.write_str("cancelled"),
+        }
+    }
+}
+
+impl FromStr for SweepState {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "running" => Ok(Self::Running),
+            "finished" => Ok(Self::Finished),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err("unknown sweep state"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepTrialState {
+    Claimed,
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl fmt::Display for SweepTrialState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Claimed => formatter.write_str("claimed"),
+            Self::Running => formatter.write_str("running"),
+            Self::Completed => formatter.write_str("completed"),
+            Self::Failed => formatter.write_str("failed"),
+            Self::Stopped => formatter.write_str("stopped"),
+        }
+    }
+}
+
+impl FromStr for SweepTrialState {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "claimed" => Ok(Self::Claimed),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "stopped" => Ok(Self::Stopped),
+            _ => Err("unknown sweep trial state"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,6 +471,8 @@ pub struct CreateRunRequest {
     pub config: BTreeMap<String, Value>,
     #[serde(default)]
     pub resume: ResumePolicy,
+    #[serde(default)]
+    pub sweep_trial_id: Option<SweepTrialId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -436,6 +564,106 @@ pub struct IngestBatchResponse {
     pub accepted_points: usize,
     pub duplicate: bool,
     pub metric_revision: u64,
+    pub stop_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweepParameter {
+    pub values: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepMetric {
+    pub name: String,
+    pub goal: MetricGoal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EarlyTerminateConfig {
+    pub min_step: u64,
+    pub min_trials: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateSweepRequest {
+    #[serde(default)]
+    pub id: Option<SweepId>,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub method: SweepMethod,
+    pub metric: SweepMetric,
+    pub parameters: BTreeMap<String, SweepParameter>,
+    pub max_runs: u64,
+    #[serde(default)]
+    pub early_terminate: Option<EarlyTerminateConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweepRecord {
+    pub id: SweepId,
+    pub project_id: ProjectId,
+    pub project: String,
+    pub name: String,
+    pub method: SweepMethod,
+    pub metric: SweepMetric,
+    pub parameters: BTreeMap<String, SweepParameter>,
+    pub max_runs: u64,
+    pub next_index: u64,
+    pub early_terminate: Option<EarlyTerminateConfig>,
+    pub state: SweepState,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateSweepResponse {
+    pub sweep: SweepRecord,
+    pub duplicate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimSweepTrialRequest {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweepTrialRecord {
+    pub id: SweepTrialId,
+    pub sweep_id: SweepId,
+    pub run_id: Option<RunId>,
+    pub agent_id: String,
+    pub index: u64,
+    pub config: BTreeMap<String, Value>,
+    pub state: SweepTrialState,
+    pub stop_requested: bool,
+    pub last_step: Option<u64>,
+    pub last_metric: Option<f64>,
+    pub lease_expires_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClaimSweepTrialResponse {
+    pub sweep: SweepRecord,
+    pub trial: Option<SweepTrialRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompleteSweepTrialRequest {
+    pub state: SweepTrialState,
+    #[serde(default)]
+    pub metric: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweepListResponse {
+    pub sweeps: Vec<SweepRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweepTrialListResponse {
+    pub trials: Vec<SweepTrialRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -674,11 +902,8 @@ pub struct HistoryResponse {
     pub timestamp_ms: Vec<i64>,
     pub metrics: BTreeMap<String, Vec<Option<f64>>>,
     pub next_after: Option<u64>,
-    #[serde(default)]
     pub sampled: bool,
-    #[serde(default)]
     pub source_points: Option<u64>,
-    #[serde(default)]
     pub source_last_sequence: Option<u64>,
 }
 
@@ -703,8 +928,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::{
-        AlertLevel, HealthResponse, HealthStatus, HistoryResponse, ProjectId, ResumePolicy, RunId,
-        RunState,
+        AlertLevel, HealthResponse, HealthStatus, ProjectId, ResumePolicy, RunId, RunState,
     };
 
     #[test]
@@ -728,23 +952,6 @@ mod tests {
         assert_eq!(serde_json::to_string(&ResumePolicy::Must)?, "\"must\"");
         assert_eq!(serde_json::to_string(&RunState::Finished)?, "\"finished\"");
         assert_eq!(serde_json::to_string(&AlertLevel::Warn)?, "\"warn\"");
-        Ok(())
-    }
-
-    #[test]
-    fn history_sampling_metadata_is_backward_compatible() -> Result<(), serde_json::Error> {
-        let response: HistoryResponse = serde_json::from_value(serde_json::json!({
-            "run_id": RunId::new(),
-            "sequence": [],
-            "step": [],
-            "timestamp_ms": [],
-            "metrics": {},
-            "next_after": null
-        }))?;
-
-        assert!(!response.sampled);
-        assert_eq!(response.source_points, None);
-        assert_eq!(response.source_last_sequence, None);
         Ok(())
     }
 }

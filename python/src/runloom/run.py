@@ -36,6 +36,10 @@ class DeliveryError(RuntimeError):
     pass
 
 
+class SweepEarlyStop(RuntimeError):
+    pass
+
+
 class _RunDocument(Mapping[str, Any]):
     def __init__(self, initial: Mapping[str, Any], lock: threading.RLock) -> None:
         self._data = deepcopy(dict(initial))
@@ -458,6 +462,7 @@ class _DeliveryWorker(threading.Thread):
         spool: _Spool,
         batch_size: int,
         flush_interval: float,
+        stop_requested: Callable[[], None],
     ) -> None:
         super().__init__(name=f"runloom-{run_id[:8]}", daemon=True)
         self._client = client
@@ -465,6 +470,7 @@ class _DeliveryWorker(threading.Thread):
         self._spool = spool
         self._batch_size = batch_size
         self._flush_interval = flush_interval
+        self._stop_requested = stop_requested
         self._wake = threading.Event()
         self._stopping = threading.Event()
         self._cancelled = threading.Event()
@@ -549,7 +555,9 @@ class _DeliveryWorker(threading.Thread):
                     if not points:
                         continue
                     request = {"batch_sequence": points[0]["sequence"], "points": points}
-                    self._client.ingest_batch(self._run_id, request)
+                    response = self._client.ingest_batch(self._run_id, request)
+                    if response.get("stop_requested") is True:
+                        self._stop_requested()
                     self._spool.acknowledge(next_offset)
                 else:
                     continue
@@ -598,6 +606,7 @@ class Run:
         system_monitor_interval: float | None = _DEFAULT_SYSTEM_METRIC_INTERVAL,
         system_sampler: Callable[[], Mapping[str, float]] | None = None,
         transport: Any = None,
+        sweep_trial_id: str | None = None,
     ) -> None:
         batch_size = _validate_batch_size(batch_size, "batch_size")
         if flush_interval < 0:
@@ -622,6 +631,8 @@ class Run:
         self._system_monitor: SystemMonitor | None = None
         self._system_monitor_interval = system_monitor_interval
         self._system_sampler = system_sampler
+        self._sweep_trial_id = sweep_trial_id
+        self._stop_requested = threading.Event()
         self.config = RunConfig(
             initial_config,
             self._document_lock,
@@ -700,6 +711,7 @@ class Run:
             "resume": resume,
             "server_url": server_url,
             "batch_size": self._batch_size,
+            "sweep_trial_id": sweep_trial_id,
             "finished": False,
             "finishing": stored_finishing,
         }
@@ -717,6 +729,7 @@ class Run:
                 name=self.name,
                 config=self.config.to_dict(),
                 resume=resume,
+                sweep_trial_id=sweep_trial_id,
             )
         except RunloomApiError as error:
             try:
@@ -790,6 +803,7 @@ class Run:
                 spool=self._spool,
                 batch_size=self._batch_size,
                 flush_interval=flush_interval,
+                stop_requested=self._stop_requested.set,
             )
             self._worker.start()
             if self._spool.pending():
@@ -815,6 +829,10 @@ class Run:
     @property
     def system_monitor_error(self) -> Exception | None:
         return self._system_monitor.last_error if self._system_monitor is not None else None
+
+    @property
+    def should_stop(self) -> bool:
+        return self._stop_requested.is_set()
 
     def _set_finish_callback(self, callback: Callable[[Run], None]) -> None:
         self._finish_callback = callback
@@ -885,6 +903,8 @@ class Run:
         with self._log_lock:
             if self._finished or self._finishing:
                 raise RuntimeError("cannot log while a run is finishing or finished")
+            if self._stop_requested.is_set():
+                raise SweepEarlyStop("the sweep scheduler requested early termination")
             metrics, rich_values = _flatten_log_values(data)
             if not metrics and not rich_values:
                 raise ValueError("log data contains no supported values")
@@ -1185,6 +1205,7 @@ def create_run(
     system_monitor_interval: float | None = None,
     system_sampler: Callable[[], Mapping[str, float]] | None = None,
     transport: Any = None,
+    sweep_trial_id: str | None = None,
 ) -> Run:
     if mode not in {"online", "offline", "disabled"}:
         raise ValueError("mode must be 'online', 'offline', or 'disabled'")
@@ -1215,6 +1236,7 @@ def create_run(
         system_monitor_interval=selected_monitor_interval,
         system_sampler=system_sampler,
         transport=transport,
+        sweep_trial_id=sweep_trial_id,
     )
 
 
@@ -1253,6 +1275,7 @@ def sync_spool(
                 name=metadata.get("name"),
                 config=_normalize_document(metadata.get("config", {}), "config"),
                 resume="allow",
+                sweep_trial_id=metadata.get("sweep_trial_id"),
             )
         except RunloomApiError as error:
             if error.status_code != 409 or not finished:
@@ -1274,6 +1297,7 @@ def sync_spool(
                 "stored batch_size",
             ),
             flush_interval=0,
+            stop_requested=lambda: None,
         )
         worker.start()
         worker.stop()

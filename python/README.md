@@ -107,3 +107,24 @@ with wandb.Api() as api:
 Supported filters are project, state, exact name, literal name substring, and
 typed equality on top-level `config.*` or `summary.*` keys. Unsupported
 operators and sort orders fail explicitly.
+
+Grid and random sweeps use finite typed value sets:
+
+```python
+sweep_id = wandb.sweep(
+    {
+        "method": "random",
+        "metric": {"name": "loss", "goal": "minimize"},
+        "parameters": {"learning_rate": {"values": [1e-2, 1e-3, 1e-4]}},
+        "run_cap": 12,
+    },
+    project="demo",
+)
+wandb.agent(sweep_id, train, count=12)
+```
+
+The agent injects claimed parameters into `init`, binds the resulting run, and
+reports completion. A median early-stop signal is available as
+`run.should_stop`; logging after the signal raises `SweepEarlyStop` so the agent
+can finish the trial as stopped. Unsupported distributions fail before any
+remote request.

@@ -22,17 +22,20 @@ use runloom_catalog::{
 use runloom_protocol::{
     AlertId, AlertListResponse, ApiError, ArtifactId, ArtifactLineageResponse,
     ArtifactListResponse, ArtifactRecord, ArtifactRelation, BlobRef, BlobUploadResponse,
+    ClaimSweepTrialRequest, ClaimSweepTrialResponse, CompleteSweepTrialRequest,
     ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse, CreateArtifactRequest,
     CreateArtifactResponse, CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest,
-    CreateRunResponse, CreateTraceSpanRequest, CreateTraceSpanResponse, FinishRunRequest,
-    FinishRunResponse, HealthResponse, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
-    MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES, MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES,
-    MAX_BATCH_POINTS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS, MAX_HISTORY_POINTS,
-    MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES,
-    MAX_TRACE_METADATA_BYTES, MetricKeyListResponse, ProjectListResponse, ResumePolicy,
-    RichValueId, RichValueKind, RichValueListResponse, RunArtifactListResponse, RunId,
-    RunListResponse, RunQueryRequest, RunQueryResponse, RunRecord, RunState, RunUpdateResponse,
-    SummaryUpdateRequest, TraceSpanId, TraceSpanListResponse, UseArtifactRequest,
+    CreateRunResponse, CreateSweepRequest, CreateSweepResponse, CreateTraceSpanRequest,
+    CreateTraceSpanResponse, FinishRunRequest, FinishRunResponse, HealthResponse, HistoryResponse,
+    IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES,
+    MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS, MAX_CONFIG_BYTES,
+    MAX_HISTORY_KEYS, MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES,
+    MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES, MAX_TRACE_METADATA_BYTES, MetricKeyListResponse,
+    ProjectListResponse, ResumePolicy, RichValueId, RichValueKind, RichValueListResponse,
+    RunArtifactListResponse, RunId, RunListResponse, RunQueryRequest, RunQueryResponse, RunRecord,
+    RunState, RunUpdateResponse, SummaryUpdateRequest, SweepId, SweepListResponse, SweepTrialId,
+    SweepTrialListResponse, SweepTrialRecord, SweepTrialState, TraceSpanId, TraceSpanListResponse,
+    UseArtifactRequest,
 };
 use runloom_storage::{
     BlobStore, MetricStore, MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
@@ -63,6 +66,10 @@ const MAX_ARTIFACT_DESCRIPTION_BYTES: usize = 64 * 1024;
 const MAX_TRACE_ID_BYTES: usize = 128;
 const MAX_TRACE_NAME_BYTES: usize = 256;
 const MAX_TRACE_SEARCH_BYTES: usize = 256;
+const MAX_SWEEP_PARAMETERS: usize = 64;
+const MAX_SWEEP_VALUES: usize = 256;
+const MAX_SWEEP_RUNS: u64 = 100_000;
+const MAX_AGENT_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone)]
 struct AppState {
@@ -105,6 +112,17 @@ pub fn app_with_runtime_and_blobs(
         .route("/api/v1/health", get(health))
         .route("/api/v1/projects", get(list_projects))
         .route("/api/v1/query/runs", post(query_runs))
+        .route(
+            "/api/v1/projects/{project}/sweeps",
+            post(create_sweep).get(list_sweeps),
+        )
+        .route("/api/v1/sweeps/{sweep_id}", get(get_sweep))
+        .route("/api/v1/sweeps/{sweep_id}/claim", post(claim_sweep_trial))
+        .route("/api/v1/sweeps/{sweep_id}/trials", get(list_sweep_trials))
+        .route(
+            "/api/v1/sweep-trials/{trial_id}/complete",
+            post(complete_sweep_trial),
+        )
         .route(
             "/api/v1/projects/{project}/runs",
             post(create_run).get(list_runs),
@@ -202,6 +220,92 @@ async fn query_runs(
         None
     };
     Ok(Json(RunQueryResponse { runs, next_before }))
+}
+
+async fn create_sweep(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    Json(request): Json<CreateSweepRequest>,
+) -> Result<(StatusCode, Json<CreateSweepResponse>), HttpError> {
+    validate_project_name(&project)?;
+    validate_sweep(&request)?;
+    let (sweep, duplicate) = state.catalog.create_sweep(&project, &request).await?;
+    let status = if duplicate {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(CreateSweepResponse { sweep, duplicate })))
+}
+
+async fn get_sweep(
+    State(state): State<AppState>,
+    Path(sweep_id): Path<SweepId>,
+) -> Result<Json<runloom_protocol::SweepRecord>, HttpError> {
+    Ok(Json(state.catalog.get_sweep(sweep_id).await?))
+}
+
+async fn list_sweeps(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<SweepListResponse>, HttpError> {
+    validate_project_name(&project)?;
+    validate_list_limit(query.limit)?;
+    Ok(Json(SweepListResponse {
+        sweeps: state.catalog.list_sweeps(&project, query.limit).await?,
+    }))
+}
+
+async fn claim_sweep_trial(
+    State(state): State<AppState>,
+    Path(sweep_id): Path<SweepId>,
+    Json(request): Json<ClaimSweepTrialRequest>,
+) -> Result<Json<ClaimSweepTrialResponse>, HttpError> {
+    validate_agent_id(&request.agent_id)?;
+    let (sweep, trial) = state
+        .catalog
+        .claim_sweep_trial(sweep_id, &request.agent_id)
+        .await?;
+    Ok(Json(ClaimSweepTrialResponse { sweep, trial }))
+}
+
+async fn list_sweep_trials(
+    State(state): State<AppState>,
+    Path(sweep_id): Path<SweepId>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<SweepTrialListResponse>, HttpError> {
+    validate_list_limit(query.limit)?;
+    Ok(Json(SweepTrialListResponse {
+        trials: state
+            .catalog
+            .list_sweep_trials(sweep_id, query.limit)
+            .await?,
+    }))
+}
+
+async fn complete_sweep_trial(
+    State(state): State<AppState>,
+    Path(trial_id): Path<SweepTrialId>,
+    Json(request): Json<CompleteSweepTrialRequest>,
+) -> Result<Json<SweepTrialRecord>, HttpError> {
+    if !matches!(
+        request.state,
+        SweepTrialState::Completed | SweepTrialState::Failed | SweepTrialState::Stopped
+    ) {
+        return Err(HttpError::invalid(
+            "completed sweep trial state must be completed, failed, or stopped",
+        ));
+    }
+    if request.metric.is_some_and(|metric| !metric.is_finite()) {
+        return Err(HttpError::invalid("sweep trial metric must be finite"));
+    }
+    Ok(Json(
+        state
+            .catalog
+            .complete_sweep_trial(trial_id, &request)
+            .await?,
+    ))
 }
 
 async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
@@ -336,6 +440,15 @@ async fn ingest_batch(
         .batch_status(run_id, request.batch_sequence, &digest)
         .await?
     {
+        let latest = latest_metrics(&request);
+        let stop_requested = if let Some(point) = request.points.last() {
+            state
+                .catalog
+                .observe_sweep_metric(run_id, point.step, &latest)
+                .await?
+        } else {
+            false
+        };
         return Ok((
             StatusCode::OK,
             Json(IngestBatchResponse {
@@ -344,6 +457,7 @@ async fn ingest_batch(
                 accepted_points: request.points.len(),
                 duplicate: true,
                 metric_revision,
+                stop_requested,
             }),
         ));
     }
@@ -356,6 +470,7 @@ async fn ingest_batch(
         ));
     }
     let summary = latest_metrics(&request);
+    let observation_step = request.points.last().map(|point| point.step);
     let batch_sequence = request.batch_sequence;
     let accepted_points = request.points.len();
     let metrics = state.metrics.store().clone();
@@ -401,6 +516,14 @@ async fn ingest_batch(
             return Err(error.into());
         }
     };
+    let stop_requested = if let Some(step) = observation_step {
+        state
+            .catalog
+            .observe_sweep_metric(run_id, step, &summary)
+            .await?
+    } else {
+        false
+    };
     Ok((
         status,
         Json(IngestBatchResponse {
@@ -409,6 +532,7 @@ async fn ingest_batch(
             accepted_points,
             duplicate,
             metric_revision,
+            stop_requested,
         }),
     ))
 }
@@ -1428,6 +1552,73 @@ fn validate_run_query(request: &RunQueryRequest) -> Result<(), HttpError> {
     Ok(())
 }
 
+fn validate_sweep(request: &CreateSweepRequest) -> Result<(), HttpError> {
+    if request.name.as_ref().is_some_and(|name| {
+        name.is_empty() || name.len() > MAX_RUN_NAME_BYTES || name.chars().any(char::is_control)
+    }) {
+        return Err(HttpError::invalid(format!(
+            "sweep name must contain 1 to {MAX_RUN_NAME_BYTES} non-control bytes"
+        )));
+    }
+    if request.metric.name.is_empty()
+        || request.metric.name.len() > MAX_METRIC_KEY_BYTES
+        || request.metric.name.chars().any(char::is_control)
+    {
+        return Err(HttpError::invalid(format!(
+            "sweep metric name must contain 1 to {MAX_METRIC_KEY_BYTES} non-control bytes"
+        )));
+    }
+    if request.parameters.is_empty() || request.parameters.len() > MAX_SWEEP_PARAMETERS {
+        return Err(HttpError::invalid(format!(
+            "sweeps require 1 to {MAX_SWEEP_PARAMETERS} parameters"
+        )));
+    }
+    for (name, parameter) in &request.parameters {
+        if name.is_empty()
+            || name.len() > 256
+            || name.chars().any(char::is_control)
+            || parameter.values.is_empty()
+            || parameter.values.len() > MAX_SWEEP_VALUES
+        {
+            return Err(HttpError::invalid(format!(
+                "sweep parameters require a safe name and 1 to {MAX_SWEEP_VALUES} values"
+            )));
+        }
+    }
+    if request.max_runs == 0 || request.max_runs > MAX_SWEEP_RUNS {
+        return Err(HttpError::invalid(format!(
+            "sweep max_runs must be between 1 and {MAX_SWEEP_RUNS}"
+        )));
+    }
+    if request.early_terminate.as_ref().is_some_and(|early| {
+        early.min_trials == 0 || early.min_trials > 100 || early.min_step > u64::MAX / 2
+    }) {
+        return Err(HttpError::invalid(
+            "early termination requires min_trials between 1 and 100",
+        ));
+    }
+    let encoded = serde_json::to_vec(&request.parameters)
+        .map_err(|error| HttpError::invalid(format!("sweep is not serializable: {error}")))?;
+    if encoded.len() > MAX_CONFIG_BYTES {
+        return Err(HttpError::invalid(format!(
+            "serialized sweep parameters exceed {MAX_CONFIG_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_agent_id(agent_id: &str) -> Result<(), HttpError> {
+    if agent_id.is_empty()
+        || agent_id.len() > MAX_AGENT_ID_BYTES
+        || agent_id.chars().any(char::is_control)
+    {
+        return Err(HttpError::invalid(format!(
+            "agent ID must contain 1 to {MAX_AGENT_ID_BYTES} non-control bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn batch_digest(request: &IngestBatchRequest) -> Result<String, HttpError> {
     let encoded = serde_json::to_vec(request)
         .map_err(|error| HttpError::invalid(format!("batch is not serializable: {error}")))?;
@@ -1529,15 +1720,18 @@ mod tests {
     use runloom_catalog::Catalog;
     use runloom_protocol::{
         AlertId, AlertLevel, AlertListResponse, ArtifactEntry, ArtifactListResponse, BlobRef,
-        BlobUploadResponse, ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse,
+        BlobUploadResponse, ClaimSweepTrialRequest, ClaimSweepTrialResponse,
+        CompleteSweepTrialRequest, ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse,
         CreateArtifactRequest, CreateArtifactResponse, CreateRichValueRequest,
-        CreateRichValueResponse, CreateRunRequest, CreateRunResponse, CreateTraceSpanRequest,
-        CreateTraceSpanResponse, FinishRunRequest, FinishRunResponse, HealthResponse, HealthStatus,
-        HistoryResponse, IngestBatchRequest, IngestBatchResponse, MetricKeyListResponse,
-        MetricPoint, ProjectListResponse, ResumePolicy, RichValueId, RichValueKind,
-        RichValueListResponse, RunArtifactListResponse, RunListResponse, RunQueryRequest,
-        RunQueryResponse, RunState, RunUpdateResponse, SummaryUpdateRequest, TraceKind,
-        TraceSpanId, TraceSpanListResponse, TraceSpanRecord, TraceStatus, UseArtifactRequest,
+        CreateRichValueResponse, CreateRunRequest, CreateRunResponse, CreateSweepRequest,
+        CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse, EarlyTerminateConfig,
+        FinishRunRequest, FinishRunResponse, HealthResponse, HealthStatus, HistoryResponse,
+        IngestBatchRequest, IngestBatchResponse, MetricGoal, MetricKeyListResponse, MetricPoint,
+        ProjectListResponse, ResumePolicy, RichValueId, RichValueKind, RichValueListResponse,
+        RunArtifactListResponse, RunListResponse, RunQueryRequest, RunQueryResponse, RunState,
+        RunUpdateResponse, SummaryUpdateRequest, SweepMethod, SweepMetric, SweepParameter,
+        SweepTrialListResponse, SweepTrialState, TraceKind, TraceSpanId, TraceSpanListResponse,
+        TraceSpanRecord, TraceStatus, UseArtifactRequest,
     };
     use runloom_storage::MetricStore;
     use sha2::{Digest, Sha256};
@@ -1585,6 +1779,7 @@ mod tests {
                                 ("nullable".to_owned(), serde_json::Value::Null),
                             ]),
                             resume: ResumePolicy::Never,
+                            sweep_trial_id: None,
                         },
                     )?)
                     .await?,
@@ -1673,6 +1868,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_scheduler_claims_binds_and_requests_median_stops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let sweep_request = CreateSweepRequest {
+            id: None,
+            name: Some("optimizer-search".to_owned()),
+            method: SweepMethod::Grid,
+            metric: SweepMetric {
+                name: "loss".to_owned(),
+                goal: MetricGoal::Minimize,
+            },
+            parameters: BTreeMap::from([
+                (
+                    "learning_rate".to_owned(),
+                    SweepParameter {
+                        values: vec![0.1.into(), 0.01.into()],
+                    },
+                ),
+                (
+                    "seed".to_owned(),
+                    SweepParameter {
+                        values: vec![1.into(), 2.into()],
+                    },
+                ),
+            ]),
+            max_runs: 3,
+            early_terminate: Some(EarlyTerminateConfig {
+                min_step: 1,
+                min_trials: 1,
+            }),
+        };
+        let created: CreateSweepResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/sweep-demo/sweeps",
+                    &sweep_request,
+                )?)
+                .await?,
+        )
+        .await?;
+        assert!(!created.duplicate);
+        let replay: CreateSweepResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/sweep-demo/sweeps",
+                    &CreateSweepRequest {
+                        id: Some(created.sweep.id),
+                        ..sweep_request.clone()
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert!(replay.duplicate);
+
+        for (agent, loss, expected_stop) in [("agent-a", 0.1, false), ("agent-b", 1.0, true)] {
+            let claim: ClaimSweepTrialResponse = response_json(
+                router
+                    .clone()
+                    .oneshot(json_request(
+                        "POST",
+                        &format!("/api/v1/sweeps/{}/claim", created.sweep.id),
+                        &ClaimSweepTrialRequest {
+                            agent_id: agent.to_owned(),
+                        },
+                    )?)
+                    .await?,
+            )
+            .await?;
+            let trial = claim.trial.expect("available grid trial");
+            let run: CreateRunResponse = response_json(
+                router
+                    .clone()
+                    .oneshot(json_request(
+                        "POST",
+                        "/api/v1/projects/sweep-demo/runs",
+                        &CreateRunRequest {
+                            id: None,
+                            name: Some(format!("run-{agent}")),
+                            config: trial.config,
+                            resume: ResumePolicy::Never,
+                            sweep_trial_id: Some(trial.id),
+                        },
+                    )?)
+                    .await?,
+            )
+            .await?;
+            let accepted: IngestBatchResponse = response_json(
+                router
+                    .clone()
+                    .oneshot(json_request(
+                        "POST",
+                        &format!("/api/v1/runs/{}/batches", run.run.id),
+                        &IngestBatchRequest {
+                            batch_sequence: 1,
+                            points: vec![MetricPoint {
+                                sequence: 1,
+                                step: 1,
+                                timestamp_ms: 1,
+                                metrics: BTreeMap::from([("loss".to_owned(), loss)]),
+                            }],
+                        },
+                    )?)
+                    .await?,
+            )
+            .await?;
+            assert_eq!(accepted.stop_requested, expected_stop);
+            let terminal_state = if expected_stop {
+                SweepTrialState::Stopped
+            } else {
+                SweepTrialState::Completed
+            };
+            let completed: runloom_protocol::SweepTrialRecord = response_json(
+                router
+                    .clone()
+                    .oneshot(json_request(
+                        "POST",
+                        &format!("/api/v1/sweep-trials/{}/complete", trial.id),
+                        &CompleteSweepTrialRequest {
+                            state: terminal_state,
+                            metric: Some(loss),
+                        },
+                    )?)
+                    .await?,
+            )
+            .await?;
+            assert_eq!(completed.state, terminal_state);
+        }
+        let trials: SweepTrialListResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/sweeps/{}/trials?limit=10",
+                        created.sweep.id
+                    ))
+                    .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(trials.trials.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn lifecycle_is_idempotent_and_history_is_columnar()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
@@ -1683,6 +2030,7 @@ mod tests {
             name: Some("fast-run".to_owned()),
             config: BTreeMap::from([("seed".to_owned(), 42.into())]),
             resume: ResumePolicy::Never,
+            sweep_trial_id: None,
         };
         let response = router
             .clone()
@@ -2100,6 +2448,7 @@ mod tests {
                     name: None,
                     config: BTreeMap::new(),
                     resume: ResumePolicy::Must,
+                    sweep_trial_id: None,
                 },
             )?)
             .await?;
@@ -2253,6 +2602,7 @@ mod tests {
                     name: Some("compact-me".to_owned()),
                     config: BTreeMap::new(),
                     resume: ResumePolicy::Never,
+                    sweep_trial_id: None,
                 },
             )?)
             .await?;

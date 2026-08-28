@@ -6,12 +6,16 @@ use std::str::FromStr;
 
 use runloom_protocol::{
     AlertId, AlertLevel, AlertRecord, ArtifactEntry, ArtifactId, ArtifactRecord, ArtifactRelation,
-    BlobRef, CreateAlertRequest, CreateArtifactRequest, CreateRichValueRequest, CreateRunRequest,
-    CreateTraceSpanRequest, MAX_CONFIG_BYTES, MAX_SUMMARY_BYTES, ProjectId, ProjectSummary,
-    ResumePolicy, RichValueId, RichValueKind, RichValueRecord, RunArtifactRecord, RunId,
-    RunQueryRequest, RunRecord, RunState, TraceKind, TraceSpanId, TraceSpanRecord, TraceStatus,
+    BlobRef, CompleteSweepTrialRequest, CreateAlertRequest, CreateArtifactRequest,
+    CreateRichValueRequest, CreateRunRequest, CreateSweepRequest, CreateTraceSpanRequest,
+    EarlyTerminateConfig, MAX_CONFIG_BYTES, MAX_SUMMARY_BYTES, MetricGoal, ProjectId,
+    ProjectSummary, ResumePolicy, RichValueId, RichValueKind, RichValueRecord, RunArtifactRecord,
+    RunId, RunQueryRequest, RunRecord, RunState, SweepId, SweepMethod, SweepMetric, SweepParameter,
+    SweepRecord, SweepState, SweepTrialId, SweepTrialRecord, SweepTrialState, TraceKind,
+    TraceSpanId, TraceSpanRecord, TraceStatus,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction, query};
 use thiserror::Error;
@@ -180,6 +184,45 @@ CREATE VIRTUAL TABLE IF NOT EXISTS trace_search USING fts5(
     search_text,
     tokenize = 'unicode61'
 );
+
+CREATE TABLE IF NOT EXISTS sweeps (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    method TEXT NOT NULL,
+    metric_name TEXT NOT NULL,
+    metric_goal TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    max_runs INTEGER NOT NULL,
+    next_index INTEGER NOT NULL DEFAULT 0,
+    early_terminate_json TEXT,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sweeps_project_id
+    ON sweeps(project_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS sweep_trials (
+    id TEXT PRIMARY KEY,
+    sweep_id TEXT NOT NULL REFERENCES sweeps(id),
+    run_id TEXT UNIQUE REFERENCES runs(id),
+    agent_id TEXT NOT NULL,
+    trial_index INTEGER NOT NULL,
+    config_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    stop_requested INTEGER NOT NULL DEFAULT 0,
+    last_step INTEGER,
+    last_metric REAL,
+    lease_expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(sweep_id, trial_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sweep_trials_sweep_id
+    ON sweep_trials(sweep_id, id DESC);
 "#;
 
 #[derive(Debug, Error)]
@@ -433,6 +476,309 @@ impl Catalog {
             .push_bind(to_i64(request.limit as u64, "run query limit")?);
         let rows = query.build().fetch_all(&self.pool).await?;
         rows.into_iter().map(run_from_row).collect()
+    }
+
+    pub async fn create_sweep(
+        &self,
+        project_name: &str,
+        request: &CreateSweepRequest,
+    ) -> Result<(SweepRecord, bool), CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        let project_id = ensure_project(&mut transaction, project_name).await?;
+        let sweep_id = request.id.unwrap_or_default();
+        if let Some(existing) = load_sweep(&mut transaction, sweep_id).await? {
+            let name_matches = request
+                .name
+                .as_ref()
+                .is_none_or(|name| *name == existing.name);
+            let matches = existing.project_id == project_id
+                && name_matches
+                && existing.method == request.method
+                && existing.metric == request.metric
+                && existing.parameters == request.parameters
+                && existing.max_runs == request.max_runs
+                && existing.early_terminate == request.early_terminate;
+            if !matches {
+                return Err(CatalogError::Conflict(
+                    "sweep ID was reused with different contents".to_owned(),
+                ));
+            }
+            transaction.commit().await?;
+            return Ok((existing, true));
+        }
+        let short_id: String = sweep_id.to_string().chars().take(8).collect();
+        let name = request
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("sweep-{short_id}"));
+        let parameters_json = serde_json::to_string(&request.parameters)
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        let early_terminate_json = request
+            .early_terminate
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        query(
+            "INSERT INTO sweeps \
+             (id, project_id, name, method, metric_name, metric_goal, parameters_json, max_runs, \
+              next_index, early_terminate_json, state, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'running', current_timestamp)",
+        )
+        .bind(sweep_id.to_string())
+        .bind(project_id.to_string())
+        .bind(name)
+        .bind(request.method.to_string())
+        .bind(&request.metric.name)
+        .bind(request.metric.goal.to_string())
+        .bind(parameters_json)
+        .bind(to_i64(request.max_runs, "sweep max runs")?)
+        .bind(early_terminate_json)
+        .execute(&mut *transaction)
+        .await?;
+        let sweep = load_required_sweep(&mut transaction, sweep_id).await?;
+        transaction.commit().await?;
+        Ok((sweep, false))
+    }
+
+    pub async fn get_sweep(&self, sweep_id: SweepId) -> Result<SweepRecord, CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        let sweep = load_required_sweep(&mut transaction, sweep_id).await?;
+        transaction.commit().await?;
+        Ok(sweep)
+    }
+
+    pub async fn list_sweeps(
+        &self,
+        project_name: &str,
+        limit: usize,
+    ) -> Result<Vec<SweepRecord>, CatalogError> {
+        let rows = query(
+            "SELECT s.id, s.project_id, p.name AS project, s.name, s.method, s.metric_name, \
+                    s.metric_goal, s.parameters_json, s.max_runs, s.next_index, \
+                    s.early_terminate_json, s.state, s.created_at \
+             FROM sweeps s JOIN projects p ON p.id = s.project_id \
+             WHERE p.name = ? ORDER BY s.id DESC LIMIT ?",
+        )
+        .bind(project_name)
+        .bind(to_i64(limit as u64, "sweep list limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(sweep_from_row).collect()
+    }
+
+    pub async fn claim_sweep_trial(
+        &self,
+        sweep_id: SweepId,
+        agent_id: &str,
+    ) -> Result<(SweepRecord, Option<SweepTrialRecord>), CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        query("UPDATE sweeps SET next_index = next_index WHERE id = ?")
+            .bind(sweep_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        let mut sweep = load_required_sweep(&mut transaction, sweep_id).await?;
+        if sweep.state != SweepState::Running {
+            transaction.commit().await?;
+            return Ok((sweep, None));
+        }
+        let expired = query(
+            "SELECT id FROM sweep_trials \
+             WHERE sweep_id = ? AND state = 'claimed' AND run_id IS NULL \
+                   AND lease_expires_at <= current_timestamp \
+             ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(sweep_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(expired) = expired {
+            let trial_id: SweepTrialId =
+                parse_id(expired.get::<String, _>("id"), "sweep trial ID")?;
+            query(
+                "UPDATE sweep_trials SET agent_id = ?, lease_expires_at = datetime('now', '+60 seconds'), \
+                        updated_at = current_timestamp WHERE id = ?",
+            )
+            .bind(agent_id)
+            .bind(trial_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+            let trial = load_required_sweep_trial(&mut transaction, trial_id).await?;
+            transaction.commit().await?;
+            return Ok((sweep, Some(trial)));
+        }
+        let configuration_count = sweep_configuration_count(&sweep)?;
+        let limit = if sweep.method == SweepMethod::Grid {
+            sweep.max_runs.min(configuration_count)
+        } else {
+            sweep.max_runs
+        };
+        if sweep.next_index >= limit {
+            query("UPDATE sweeps SET state = 'finished' WHERE id = ?")
+                .bind(sweep_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+            sweep = load_required_sweep(&mut transaction, sweep_id).await?;
+            transaction.commit().await?;
+            return Ok((sweep, None));
+        }
+        let index = sweep.next_index;
+        let config = sweep_configuration(&sweep, index)?;
+        let config_json = serde_json::to_string(&config)
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        let trial_id = SweepTrialId::new();
+        query(
+            "INSERT INTO sweep_trials \
+             (id, sweep_id, agent_id, trial_index, config_json, state, stop_requested, \
+              lease_expires_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, 'claimed', 0, datetime('now', '+60 seconds'), \
+                     current_timestamp, current_timestamp)",
+        )
+        .bind(trial_id.to_string())
+        .bind(sweep_id.to_string())
+        .bind(agent_id)
+        .bind(to_i64(index, "sweep trial index")?)
+        .bind(config_json)
+        .execute(&mut *transaction)
+        .await?;
+        query("UPDATE sweeps SET next_index = next_index + 1 WHERE id = ?")
+            .bind(sweep_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        sweep = load_required_sweep(&mut transaction, sweep_id).await?;
+        let trial = load_required_sweep_trial(&mut transaction, trial_id).await?;
+        transaction.commit().await?;
+        Ok((sweep, Some(trial)))
+    }
+
+    pub async fn complete_sweep_trial(
+        &self,
+        trial_id: SweepTrialId,
+        request: &CompleteSweepTrialRequest,
+    ) -> Result<SweepTrialRecord, CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        let existing = load_required_sweep_trial(&mut transaction, trial_id).await?;
+        if matches!(
+            existing.state,
+            SweepTrialState::Completed | SweepTrialState::Failed | SweepTrialState::Stopped
+        ) {
+            let metric_matches = request.metric.is_none() || request.metric == existing.last_metric;
+            if existing.state != request.state || !metric_matches {
+                return Err(CatalogError::Conflict(
+                    "completed sweep trial cannot change terminal result".to_owned(),
+                ));
+            }
+            transaction.commit().await?;
+            return Ok(existing);
+        }
+        query(
+            "UPDATE sweep_trials SET state = ?, last_metric = COALESCE(?, last_metric), \
+                    updated_at = current_timestamp, finished_at = current_timestamp \
+             WHERE id = ?",
+        )
+        .bind(request.state.to_string())
+        .bind(request.metric)
+        .bind(trial_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        let trial = load_required_sweep_trial(&mut transaction, trial_id).await?;
+        transaction.commit().await?;
+        Ok(trial)
+    }
+
+    pub async fn list_sweep_trials(
+        &self,
+        sweep_id: SweepId,
+        limit: usize,
+    ) -> Result<Vec<SweepTrialRecord>, CatalogError> {
+        self.get_sweep(sweep_id).await?;
+        let rows = query(
+            "SELECT id, sweep_id, run_id, agent_id, trial_index, config_json, state, \
+                    stop_requested, last_step, last_metric, lease_expires_at, created_at, \
+                    updated_at, finished_at FROM sweep_trials WHERE sweep_id = ? \
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(sweep_id.to_string())
+        .bind(to_i64(limit as u64, "sweep trial list limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(sweep_trial_from_row).collect()
+    }
+
+    pub async fn observe_sweep_metric(
+        &self,
+        run_id: RunId,
+        step: u64,
+        metrics: &BTreeMap<String, f64>,
+    ) -> Result<bool, CatalogError> {
+        let row = query(
+            "SELECT t.id, t.sweep_id, t.stop_requested, s.metric_name, s.metric_goal, \
+                    s.early_terminate_json FROM sweep_trials t \
+             JOIN sweeps s ON s.id = t.sweep_id WHERE t.run_id = ? AND t.state = 'running'",
+        )
+        .bind(run_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        if row.get::<bool, _>("stop_requested") {
+            return Ok(true);
+        }
+        let metric_name: String = row.get("metric_name");
+        let Some(metric) = metrics.get(&metric_name).copied() else {
+            return Ok(false);
+        };
+        let trial_id: SweepTrialId = parse_id(row.get::<String, _>("id"), "sweep trial ID")?;
+        let sweep_id: SweepId = parse_id(row.get::<String, _>("sweep_id"), "sweep ID")?;
+        query(
+            "UPDATE sweep_trials SET last_step = ?, last_metric = ?, updated_at = current_timestamp \
+             WHERE id = ?",
+        )
+        .bind(to_i64(step, "sweep observation step")?)
+        .bind(metric)
+        .bind(trial_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        let Some(early_json) = row.get::<Option<String>, _>("early_terminate_json") else {
+            return Ok(false);
+        };
+        let early: EarlyTerminateConfig = serde_json::from_str(&early_json)
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        if step < early.min_step {
+            return Ok(false);
+        }
+        let peers = query(
+            "SELECT last_metric FROM sweep_trials \
+             WHERE sweep_id = ? AND id != ? AND last_metric IS NOT NULL \
+                   AND last_step >= ? AND state IN ('running', 'completed') \
+             ORDER BY last_metric",
+        )
+        .bind(sweep_id.to_string())
+        .bind(trial_id.to_string())
+        .bind(to_i64(early.min_step, "sweep early termination step")?)
+        .fetch_all(&self.pool)
+        .await?;
+        if peers.len() < early.min_trials {
+            return Ok(false);
+        }
+        let peer_metrics = peers
+            .into_iter()
+            .map(|peer| peer.get::<f64, _>("last_metric"))
+            .collect::<Vec<_>>();
+        let median = peer_metrics[peer_metrics.len() / 2];
+        let goal = MetricGoal::from_str(&row.get::<String, _>("metric_goal"))
+            .map_err(|error| CatalogError::InvalidData(error.to_owned()))?;
+        let stop = match goal {
+            MetricGoal::Minimize => metric > median,
+            MetricGoal::Maximize => metric < median,
+        };
+        if stop {
+            query("UPDATE sweep_trials SET stop_requested = 1 WHERE id = ?")
+                .bind(trial_id.to_string())
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(stop)
     }
 
     pub async fn metric_keys(&self, run_id: RunId) -> Result<Vec<String>, CatalogError> {
@@ -1010,6 +1356,23 @@ impl Catalog {
                     "finished runs cannot be resumed".to_owned(),
                 ));
             }
+            if let Some(trial_id) = request.sweep_trial_id {
+                let bound_run: Option<String> = query(
+                    "SELECT run_id FROM sweep_trials WHERE id = ? AND sweep_id IN \
+                     (SELECT id FROM sweeps WHERE project_id = ?)",
+                )
+                .bind(trial_id.to_string())
+                .bind(project_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+                .and_then(|row| row.get("run_id"));
+                let run_id_text = run_id.to_string();
+                if bound_run.as_deref() != Some(run_id_text.as_str()) {
+                    return Err(CatalogError::Conflict(
+                        "resumed run is not bound to the requested sweep trial".to_owned(),
+                    ));
+                }
+            }
             transaction.commit().await?;
             return Ok((existing, true));
         }
@@ -1047,6 +1410,9 @@ impl Catalog {
             .bind(config_json)
             .execute(&mut *transaction)
             .await?;
+        if let Some(trial_id) = request.sweep_trial_id {
+            bind_sweep_trial(&mut transaction, trial_id, project_id, run_id).await?;
+        }
 
         let run =
             load_run(&mut transaction, run_id)
@@ -1947,6 +2313,188 @@ fn trace_match_query(value: &str) -> String {
         .join(" AND ")
 }
 
+async fn load_sweep(
+    transaction: &mut Transaction<'_, Sqlite>,
+    sweep_id: SweepId,
+) -> Result<Option<SweepRecord>, CatalogError> {
+    let row = query(
+        "SELECT s.id, s.project_id, p.name AS project, s.name, s.method, s.metric_name, \
+                s.metric_goal, s.parameters_json, s.max_runs, s.next_index, \
+                s.early_terminate_json, s.state, s.created_at \
+         FROM sweeps s JOIN projects p ON p.id = s.project_id WHERE s.id = ?",
+    )
+    .bind(sweep_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.map(sweep_from_row).transpose()
+}
+
+async fn load_required_sweep(
+    transaction: &mut Transaction<'_, Sqlite>,
+    sweep_id: SweepId,
+) -> Result<SweepRecord, CatalogError> {
+    load_sweep(transaction, sweep_id)
+        .await?
+        .ok_or_else(|| CatalogError::NotFound {
+            resource: format!("sweep {sweep_id}"),
+        })
+}
+
+async fn load_required_sweep_trial(
+    transaction: &mut Transaction<'_, Sqlite>,
+    trial_id: SweepTrialId,
+) -> Result<SweepTrialRecord, CatalogError> {
+    let row = query(
+        "SELECT id, sweep_id, run_id, agent_id, trial_index, config_json, state, \
+                stop_requested, last_step, last_metric, lease_expires_at, created_at, \
+                updated_at, finished_at FROM sweep_trials WHERE id = ?",
+    )
+    .bind(trial_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| CatalogError::NotFound {
+        resource: format!("sweep trial {trial_id}"),
+    })?;
+    sweep_trial_from_row(row)
+}
+
+async fn bind_sweep_trial(
+    transaction: &mut Transaction<'_, Sqlite>,
+    trial_id: SweepTrialId,
+    project_id: ProjectId,
+    run_id: RunId,
+) -> Result<(), CatalogError> {
+    let row = query(
+        "SELECT t.run_id, t.state FROM sweep_trials t JOIN sweeps s ON s.id = t.sweep_id \
+         WHERE t.id = ? AND s.project_id = ?",
+    )
+    .bind(trial_id.to_string())
+    .bind(project_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| CatalogError::NotFound {
+        resource: format!("sweep trial {trial_id} in run project"),
+    })?;
+    let state = SweepTrialState::from_str(&row.get::<String, _>("state"))
+        .map_err(|error| CatalogError::InvalidData(error.to_owned()))?;
+    let bound_run: Option<String> = row.get("run_id");
+    if state != SweepTrialState::Claimed || bound_run.is_some() {
+        return Err(CatalogError::Conflict(
+            "sweep trial is not available for run binding".to_owned(),
+        ));
+    }
+    query(
+        "UPDATE sweep_trials SET run_id = ?, state = 'running', \
+                lease_expires_at = datetime('now', '+100 years'), updated_at = current_timestamp \
+         WHERE id = ?",
+    )
+    .bind(run_id.to_string())
+    .bind(trial_id.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+fn sweep_from_row(row: SqliteRow) -> Result<SweepRecord, CatalogError> {
+    let parameters = serde_json::from_str::<BTreeMap<String, SweepParameter>>(
+        &row.get::<String, _>("parameters_json"),
+    )
+    .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+    let early_terminate = row
+        .get::<Option<String>, _>("early_terminate_json")
+        .map(|value| serde_json::from_str::<EarlyTerminateConfig>(&value))
+        .transpose()
+        .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+    Ok(SweepRecord {
+        id: parse_id(row.get::<String, _>("id"), "sweep ID")?,
+        project_id: parse_id(row.get::<String, _>("project_id"), "project ID")?,
+        project: row.get("project"),
+        name: row.get("name"),
+        method: SweepMethod::from_str(&row.get::<String, _>("method"))
+            .map_err(|error| CatalogError::InvalidData(error.to_owned()))?,
+        metric: SweepMetric {
+            name: row.get("metric_name"),
+            goal: MetricGoal::from_str(&row.get::<String, _>("metric_goal"))
+                .map_err(|error| CatalogError::InvalidData(error.to_owned()))?,
+        },
+        parameters,
+        max_runs: from_i64(row.get("max_runs"), "sweep max runs")?,
+        next_index: from_i64(row.get("next_index"), "sweep next index")?,
+        early_terminate,
+        state: SweepState::from_str(&row.get::<String, _>("state"))
+            .map_err(|error| CatalogError::InvalidData(error.to_owned()))?,
+        created_at: row.get("created_at"),
+    })
+}
+
+fn sweep_trial_from_row(row: SqliteRow) -> Result<SweepTrialRecord, CatalogError> {
+    Ok(SweepTrialRecord {
+        id: parse_id(row.get::<String, _>("id"), "sweep trial ID")?,
+        sweep_id: parse_id(row.get::<String, _>("sweep_id"), "sweep ID")?,
+        run_id: row
+            .get::<Option<String>, _>("run_id")
+            .map(|value| parse_id(value, "run ID"))
+            .transpose()?,
+        agent_id: row.get("agent_id"),
+        index: from_i64(row.get("trial_index"), "sweep trial index")?,
+        config: parse_document(row.get::<String, _>("config_json"), "sweep trial config")?,
+        state: SweepTrialState::from_str(&row.get::<String, _>("state"))
+            .map_err(|error| CatalogError::InvalidData(error.to_owned()))?,
+        stop_requested: row.get("stop_requested"),
+        last_step: row
+            .get::<Option<i64>, _>("last_step")
+            .map(|value| from_i64(value, "sweep trial step"))
+            .transpose()?,
+        last_metric: row.get("last_metric"),
+        lease_expires_at: row.get("lease_expires_at"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        finished_at: row.get("finished_at"),
+    })
+}
+
+fn sweep_configuration_count(sweep: &SweepRecord) -> Result<u64, CatalogError> {
+    sweep
+        .parameters
+        .values()
+        .try_fold(1u64, |count, parameter| {
+            count
+                .checked_mul(parameter.values.len() as u64)
+                .ok_or_else(|| CatalogError::Limit("sweep grid is too large".to_owned()))
+        })
+}
+
+fn sweep_configuration(
+    sweep: &SweepRecord,
+    index: u64,
+) -> Result<BTreeMap<String, Value>, CatalogError> {
+    let mut configuration = BTreeMap::new();
+    let mut grid_index = index;
+    for (name, parameter) in &sweep.parameters {
+        let value_index = match sweep.method {
+            SweepMethod::Grid => {
+                let selected = grid_index % parameter.values.len() as u64;
+                grid_index /= parameter.values.len() as u64;
+                selected as usize
+            }
+            SweepMethod::Random => {
+                let mut digest = Sha256::new();
+                digest.update(sweep.id.to_string());
+                digest.update(index.to_be_bytes());
+                digest.update(name.as_bytes());
+                let bytes = digest.finalize();
+                let selected =
+                    u64::from_be_bytes(bytes[..8].try_into().map_err(|_| {
+                        CatalogError::InvalidData("invalid sweep digest".to_owned())
+                    })?);
+                (selected % parameter.values.len() as u64) as usize
+            }
+        };
+        configuration.insert(name.clone(), parameter.values[value_index].clone());
+    }
+    Ok(configuration)
+}
+
 fn push_json_equality<'args>(
     query: &mut QueryBuilder<'args, Sqlite>,
     column: &str,
@@ -2142,6 +2690,7 @@ mod tests {
             name: Some("training".to_owned()),
             config: BTreeMap::from([("seed".to_owned(), 7.into())]),
             resume: ResumePolicy::Never,
+            sweep_trial_id: None,
         };
         let (created, resumed) = catalog.create_or_resume_run("robotics", &request).await?;
         assert!(!resumed);
@@ -2278,6 +2827,7 @@ mod tests {
             name: None,
             config: BTreeMap::new(),
             resume: ResumePolicy::Must,
+            sweep_trial_id: None,
         };
         let result = catalog.create_or_resume_run("robotics", &request).await;
         assert!(matches!(result, Err(CatalogError::NotFound { .. })));
@@ -2298,6 +2848,7 @@ mod tests {
                     name: None,
                     config: BTreeMap::new(),
                     resume: ResumePolicy::Never,
+                    sweep_trial_id: None,
                 },
             )
             .await?;

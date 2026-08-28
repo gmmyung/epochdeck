@@ -47,7 +47,7 @@ deployment model.
 | Media semantics | captions, grouping, sequences, native playback | Partial |
 | Tables | typed columns, incremental data, linked rich values | Partial |
 | Artifacts | collections, versions, aliases, lineage, downloads | Compatible |
-| Sweeps | definitions, agents, scheduling, early termination | Planned |
+| Sweeps | definitions, agents, scheduling, early termination | Partial |
 | Reports | persisted dashboard/report definitions | Planned |
 | Groups and jobs | group, job type, tags, notes, ownership metadata | Planned |
 | Importers | W&B API and export formats with resumable checkpoints | Planned |
@@ -118,3 +118,12 @@ single-run lookup, full-resolution history scans, artifacts, and traces. Filters
 currently support state, name, and typed top-level config/summary equality. The
 wider W&B filter language, general run-file surface, and alternate ordering are
 not yet implemented and fail explicitly.
+
+Sweep definitions and trial claims are durable SQLite transactions. Grid and
+random schedulers select from finite typed `values` sets without materializing
+the Cartesian product. Agents lease claims, bind exactly one run, report a
+terminal result idempotently, and inherit the scheduled config through ordinary
+`runloom.init`. Optional median stopping compares bounded peer observations;
+the batch acknowledgement sets `run.should_stop`, and the next `log` raises
+`SweepEarlyStop`. Continuous distributions, Hyperband, and process-level remote
+agents remain outside the current partial W&B surface and fail explicitly.
