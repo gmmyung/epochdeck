@@ -34,6 +34,7 @@ export type History = {
   next_after: number | null;
   sampled: boolean;
   source_points: number | null;
+  source_last_sequence: number | null;
 };
 
 export function getHealth(signal?: AbortSignal): Promise<Health> {
@@ -53,6 +54,10 @@ export async function getRuns(project: string, signal?: AbortSignal): Promise<Ru
   return result.runs;
 }
 
+export function getRun(runId: string, signal?: AbortSignal): Promise<Run> {
+  return getJson<Run>(`/api/v1/runs/${encodeURIComponent(runId)}`, signal);
+}
+
 export async function getMetricKeys(runId: string, signal?: AbortSignal): Promise<string[]> {
   const result = await getJson<{ run_id: string; keys: string[] }>(
     `/api/v1/runs/${encodeURIComponent(runId)}/metrics`,
@@ -66,8 +71,10 @@ export function getHistory(
   keys: string[],
   limit = 5_000,
   signal?: AbortSignal,
+  after?: number,
 ): Promise<History> {
   const query = new URLSearchParams({ keys: keys.join(","), limit: String(limit) });
+  if (after !== undefined) query.set("after", String(after));
   return getJson<History>(`/api/v1/runs/${encodeURIComponent(runId)}/history?${query}`, signal);
 }
 

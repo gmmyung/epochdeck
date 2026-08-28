@@ -300,19 +300,16 @@ select:hover {
   background: var(--success);
 }
 
-.cards {
+.document-cards {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  margin-bottom: 24px;
 }
 
 article {
   min-width: 0;
   padding: 14px;
-}
-
-.chart-card {
-  grid-column: 1 / -1;
 }
 
 .card-heading {
@@ -345,10 +342,66 @@ article {
 
 canvas {
   width: 100%;
-  height: clamp(240px, 36vh, 390px);
+  height: 240px;
   display: block;
   border: 1px solid var(--line);
   background: var(--surface);
+}
+
+.metrics-heading {
+  min-height: 54px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 10px;
+}
+
+.metrics-heading h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.metrics-heading > span,
+.loading-label {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.metric-chart-card {
+  min-height: 338px;
+  content-visibility: auto;
+  contain: layout paint style;
+  contain-intrinsic-size: auto 338px;
+}
+
+.chart-placeholder {
+  height: 240px;
+  display: grid;
+  place-content: center;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.metric-empty {
+  min-height: 180px;
+  display: grid;
+  place-content: center;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .chart-footer {
@@ -433,7 +486,8 @@ dd {
     overflow-x: auto;
   }
 
-  .cards {
+  .document-cards,
+  .metric-grid {
     grid-template-columns: 1fr;
   }
 

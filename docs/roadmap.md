@@ -30,9 +30,9 @@ not a reduction in the final parity goal.
 ## Milestone 2: dashboard and monitoring
 
 - [x] Project and run navigation.
-- Lazy, virtualized Canvas metric charts.
+- [x] Lazy, virtualized Canvas metric charts.
 - [x] Server-side min/max downsampling.
-- Per-run revision caches and realtime deltas.
+- [x] Per-run revision caches and realtime deltas.
 - System metrics and alerts.
 
 ## Milestone 3: rich data and artifacts

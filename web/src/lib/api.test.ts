@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { getHealth, getHistory, getRuns, getSampledHistory } from "./api";
+import { getHealth, getHistory, getRun, getRuns, getSampledHistory } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -68,6 +68,37 @@ describe("getHealth", () => {
     expect(fetchMock.mock.calls[1][0]).toBe("/api/v1/runs/run-id/history?keys=loss&limit=500");
     expect(fetchMock.mock.calls[2][0]).toBe(
       "/api/v1/runs/run-id/history?keys=loss&max_points=1200",
+    );
+  });
+
+  it("loads one run and encodes a bounded delta cursor", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "run-id", metric_revision: 4 }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            run_id: "run-id",
+            sequence: [],
+            step: [],
+            timestamp_ms: [],
+            metrics: { loss: [] },
+            next_after: null,
+            source_last_sequence: 42,
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getRun("run-id");
+    await getHistory("run-id", ["loss"], 257, undefined, 42);
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/runs/run-id");
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "/api/v1/runs/run-id/history?keys=loss&limit=257&after=42",
     );
   });
 });

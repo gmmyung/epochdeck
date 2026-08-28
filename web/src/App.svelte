@@ -3,8 +3,10 @@
 
   import {
     getHealth,
+    getHistory,
     getMetricKeys,
     getProjects,
+    getRun,
     getRuns,
     getSampledHistory,
     type Health,
@@ -12,6 +14,17 @@
     type Project,
     type Run,
   } from "./lib/api";
+  import {
+    CHART_POINT_BUDGET,
+    DELTA_POINT_BUDGET,
+    HistoryCache,
+    mergeHistoryDelta,
+  } from "./lib/history-cache";
+  import MetricChart from "./lib/MetricChart.svelte";
+
+  const MAX_CONCURRENT_CHART_REQUESTS = 4;
+  const LIVE_REFRESH_MS = 2_000;
+  const historyCache = new HistoryCache();
 
   let health: Health | null = null;
   let projects: Project[] = [];
@@ -19,28 +32,26 @@
   let selectedProject = "";
   let selectedRun: Run | null = null;
   let metricKeys: string[] = [];
-  let selectedMetric = "";
-  let history: History | null = null;
+  let histories: Record<string, History> = {};
+  let historyRevisions: Record<string, number> = {};
+  let loadingMetrics = new Set<string>();
+  let visibleMetrics = new Set<string>();
+  let pendingMetrics: string[] = [];
+  let activeChartRequests = 0;
+  let refreshingRun = false;
   let error: string | null = null;
   let loading = true;
-  let canvas: HTMLCanvasElement;
-  let chartRevision = 0;
   let projectController: AbortController | null = null;
   let runController: AbortController | null = null;
 
   onMount(() => {
     const controller = new AbortController();
-    const resize = () => (chartRevision += 1);
-    const theme = window.matchMedia("(prefers-color-scheme: dark)");
-    window.addEventListener("resize", resize);
-    theme.addEventListener("change", resize);
+    const refreshTimer = window.setInterval(refreshSelectedRun, LIVE_REFRESH_MS);
     Promise.all([getHealth(controller.signal), getProjects(controller.signal)])
       .then(async ([healthResult, projectResult]) => {
         health = healthResult;
         projects = projectResult;
-        if (projects[0]) {
-          await chooseProject(projects[0].name);
-        }
+        if (projects[0]) await chooseProject(projects[0].name);
       })
       .catch(showError)
       .finally(() => {
@@ -50,30 +61,20 @@
       controller.abort();
       projectController?.abort();
       runController?.abort();
-      window.removeEventListener("resize", resize);
-      theme.removeEventListener("change", resize);
+      window.clearInterval(refreshTimer);
     };
   });
-
-  $: if (canvas && history && selectedMetric && chartRevision >= 0) {
-    drawChart(canvas, history.step, history.metrics[selectedMetric] ?? []);
-  }
 
   async function chooseProject(name: string): Promise<void> {
     projectController?.abort();
     const controller = new AbortController();
     projectController = controller;
     selectedProject = name;
-    selectedRun = null;
-    metricKeys = [];
-    selectedMetric = "";
-    history = null;
+    resetRunSelection();
     error = null;
     try {
       runs = await getRuns(name, controller.signal);
-      if (runs[0]) {
-        await chooseRun(runs[0]);
-      }
+      if (runs[0]) await chooseRun(runs[0]);
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
     }
@@ -83,92 +84,130 @@
     runController?.abort();
     const controller = new AbortController();
     runController = controller;
+    resetChartState();
     selectedRun = run;
-    history = null;
-    selectedMetric = "";
     error = null;
     try {
       metricKeys = await getMetricKeys(run.id, controller.signal);
-      if (metricKeys[0]) {
-        selectedMetric = metricKeys[0];
-        await loadMetric(metricKeys[0], controller.signal);
+    } catch (reason) {
+      if (!controller.signal.aborted) showError(reason);
+    }
+  }
+
+  function resetRunSelection(): void {
+    runController?.abort();
+    selectedRun = null;
+    metricKeys = [];
+    resetChartState();
+  }
+
+  function resetChartState(): void {
+    histories = {};
+    historyRevisions = {};
+    loadingMetrics = new Set();
+    visibleMetrics = new Set();
+    pendingMetrics = [];
+  }
+
+  function chartVisible(metric: string): void {
+    if (!visibleMetrics.has(metric)) visibleMetrics = new Set([...visibleMetrics, metric]);
+    queueMetric(metric);
+  }
+
+  function queueMetric(metric: string): void {
+    const run = selectedRun;
+    if (!run || historyRevisions[metric] === run.metric_revision) return;
+    if (loadingMetrics.has(metric) || pendingMetrics.includes(metric)) return;
+    pendingMetrics = [...pendingMetrics, metric];
+    drainMetricQueue();
+  }
+
+  function drainMetricQueue(): void {
+    while (activeChartRequests < MAX_CONCURRENT_CHART_REQUESTS && pendingMetrics.length > 0) {
+      const metric = pendingMetrics[0];
+      pendingMetrics = pendingMetrics.slice(1);
+      const run = selectedRun;
+      const controller = runController;
+      if (!run || !controller) continue;
+      activeChartRequests += 1;
+      loadingMetrics = new Set([...loadingMetrics, metric]);
+      void loadMetric(run, metric, controller.signal)
+        .catch((reason) => {
+          if (!controller.signal.aborted) showError(reason);
+        })
+        .finally(() => {
+          activeChartRequests -= 1;
+          const nextLoading = new Set(loadingMetrics);
+          nextLoading.delete(metric);
+          loadingMetrics = nextLoading;
+          drainMetricQueue();
+        });
+    }
+  }
+
+  async function loadMetric(run: Run, metric: string, signal: AbortSignal): Promise<void> {
+    const revision = run.metric_revision;
+    const cached = historyCache.get(run.id, metric, revision);
+    if (cached) {
+      publishHistory(run.id, metric, revision, cached);
+      return;
+    }
+
+    const current = histories[metric];
+    let result: History | undefined;
+    if (current?.source_last_sequence !== null && current?.source_last_sequence !== undefined) {
+      const delta = await getHistory(
+        run.id,
+        [metric],
+        DELTA_POINT_BUDGET + 1,
+        signal,
+        current.source_last_sequence,
+      );
+      if (
+        delta.next_after === null &&
+        delta.sequence.length <= DELTA_POINT_BUDGET &&
+        current.sequence.length + delta.sequence.length <= CHART_POINT_BUDGET + DELTA_POINT_BUDGET
+      ) {
+        result = mergeHistoryDelta(current, delta, metric);
+      }
+    }
+    if (!result) {
+      result = await getSampledHistory(run.id, [metric], CHART_POINT_BUDGET, signal);
+    }
+    historyCache.set(run.id, metric, revision, result);
+    publishHistory(run.id, metric, revision, result);
+  }
+
+  function publishHistory(runId: string, metric: string, revision: number, result: History): void {
+    if (selectedRun?.id !== runId) return;
+    histories = { ...histories, [metric]: result };
+    historyRevisions = { ...historyRevisions, [metric]: revision };
+  }
+
+  async function refreshSelectedRun(): Promise<void> {
+    const run = selectedRun;
+    const controller = runController;
+    if (!run || !controller || refreshingRun || run.state !== "running") return;
+    refreshingRun = true;
+    try {
+      const latest = await getRun(run.id, controller.signal);
+      if (selectedRun?.id !== latest.id) return;
+      const revisionChanged = latest.metric_revision !== selectedRun.metric_revision;
+      selectedRun = latest;
+      runs = runs.map((candidate) => (candidate.id === latest.id ? latest : candidate));
+      if (revisionChanged) {
+        metricKeys = await getMetricKeys(latest.id, controller.signal);
+        for (const metric of visibleMetrics) queueMetric(metric);
       }
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
+    } finally {
+      refreshingRun = false;
     }
-  }
-
-  async function metricChanged(event: Event): Promise<void> {
-    const metric = (event.currentTarget as HTMLSelectElement).value;
-    selectedMetric = metric;
-    runController?.abort();
-    const controller = new AbortController();
-    runController = controller;
-    try {
-      await loadMetric(metric, controller.signal);
-    } catch (reason) {
-      if (!controller.signal.aborted) showError(reason);
-    }
-  }
-
-  async function loadMetric(metric: string, signal: AbortSignal): Promise<void> {
-    if (!selectedRun) return;
-    history = await getSampledHistory(selectedRun.id, [metric], 2_000, signal);
   }
 
   function showError(reason: unknown): void {
     error = reason instanceof Error ? reason.message : "Unable to reach Runloom";
-  }
-
-  function drawChart(
-    target: HTMLCanvasElement,
-    steps: number[],
-    values: Array<number | null>,
-  ): void {
-    const width = Math.max(target.clientWidth, 1);
-    const height = Math.max(target.clientHeight, 1);
-    const ratio = window.devicePixelRatio || 1;
-    target.width = Math.floor(width * ratio);
-    target.height = Math.floor(height * ratio);
-    const context = target.getContext("2d");
-    if (!context) return;
-    context.scale(ratio, ratio);
-    context.clearRect(0, 0, width, height);
-    const points = values
-      .map((value, index) => ({ x: steps[index], y: value }))
-      .filter((point): point is { x: number; y: number } => point.y !== null);
-    if (points.length === 0) return;
-
-    const padding = 24;
-    const minX = Math.min(...points.map((point) => point.x));
-    const maxX = Math.max(...points.map((point) => point.x));
-    const minY = Math.min(...points.map((point) => point.y));
-    const maxY = Math.max(...points.map((point) => point.y));
-    const xRange = maxX - minX || 1;
-    const yRange = maxY - minY || 1;
-
-    const styles = getComputedStyle(target);
-    context.strokeStyle = styles.getPropertyValue("--chart-grid").trim() || "#d9dde0";
-    context.lineWidth = 1;
-    for (let line = 0; line <= 4; line += 1) {
-      const y = padding + ((height - padding * 2) * line) / 4;
-      context.beginPath();
-      context.moveTo(padding, y);
-      context.lineTo(width - padding, y);
-      context.stroke();
-    }
-
-    context.strokeStyle = styles.getPropertyValue("--accent").trim() || "#2766ad";
-    context.lineWidth = 1.75;
-    context.lineJoin = "round";
-    context.beginPath();
-    points.forEach((point, index) => {
-      const x = padding + ((point.x - minX) / xRange) * (width - padding * 2);
-      const y = height - padding - ((point.y - minY) / yRange) * (height - padding * 2);
-      if (index === 0) context.moveTo(x, y);
-      else context.lineTo(x, y);
-    });
-    context.stroke();
   }
 
   function formatValue(value: unknown): string {
@@ -198,9 +237,7 @@
   </header>
 
   <main class="content">
-    {#if error}
-      <div class="error" role="alert">{error}</div>
-    {/if}
+    {#if error}<div class="error" role="alert">{error}</div>{/if}
 
     {#if loading}
       <section class="empty">Loading the loom…</section>
@@ -246,31 +283,7 @@
               >
             </div>
 
-            <div class="cards">
-              <article class="chart-card">
-                <div class="card-heading">
-                  <div>
-                    <small>Metric history</small>
-                    <strong>{selectedMetric || "No metrics logged"}</strong>
-                  </div>
-                  {#if metricKeys.length > 0}
-                    <select aria-label="Metric" value={selectedMetric} onchange={metricChanged}>
-                      {#each metricKeys as metric}
-                        <option value={metric}>{metric}</option>
-                      {/each}
-                    </select>
-                  {/if}
-                </div>
-                <canvas bind:this={canvas} aria-label={`${selectedMetric} history chart`}></canvas>
-                <div class="chart-footer">
-                  <span
-                    >{history?.sequence.length ?? 0} extrema from
-                    {(history?.source_points ?? 0).toLocaleString()} source points</span
-                  >
-                  <span>min/max sampled · 2,000 point budget</span>
-                </div>
-              </article>
-
+            <div class="document-cards">
               <article>
                 <div class="card-heading"><strong>Summary</strong></div>
                 <dl>
@@ -295,6 +308,28 @@
                 </dl>
               </article>
             </div>
+
+            <div class="metrics-heading">
+              <div>
+                <p class="eyebrow">Bounded histories</p>
+                <h2>Metrics</h2>
+              </div>
+              <span>{metricKeys.length.toLocaleString()} keys · four concurrent queries</span>
+            </div>
+            {#if metricKeys.length > 0}
+              <div class="metric-grid">
+                {#each metricKeys as metric (metric)}
+                  <MetricChart
+                    {metric}
+                    history={histories[metric]}
+                    loading={loadingMetrics.has(metric)}
+                    onvisible={chartVisible}
+                  />
+                {/each}
+              </div>
+            {:else}
+              <section class="metric-empty">No scalar metrics logged yet.</section>
+            {/if}
           {:else}
             <section class="empty">This project has no runs.</section>
           {/if}

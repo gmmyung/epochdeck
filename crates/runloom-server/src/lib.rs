@@ -401,6 +401,7 @@ async fn sampled_history(
             next_after: None,
             sampled: true,
             source_points: Some(0),
+            source_last_sequence: None,
         });
     };
     let mut sampler = MinMaxHistorySampler::new(

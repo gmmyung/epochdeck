@@ -345,6 +345,7 @@ impl MinMaxHistorySampler {
             next_after: None,
             sampled: true,
             source_points: Some(self.source_points),
+            source_last_sequence: Some(self.last_sequence),
         }
     }
 
@@ -468,6 +469,7 @@ impl MetricStore {
             next_after: None,
             sampled: false,
             source_points: None,
+            source_last_sequence: None,
         };
 
         for segment in segments {
@@ -480,6 +482,7 @@ impl MetricStore {
         if response.sequence.len() == limit {
             response.next_after = response.sequence.last().copied();
         }
+        response.source_last_sequence = response.sequence.last().copied();
         Ok(response)
     }
 

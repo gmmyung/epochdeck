@@ -37,8 +37,10 @@ contents returns a conflict. History requests accept at most 32 columns and
 `max_points` selects spike-preserving display sampling, and the two parameters
 are mutually exclusive. Sampled responses set `sampled` and `source_points`;
 full-resolution pages continue with the returned `next_after` cursor. A sampled
-budget must allow at least two extrema per requested metric. These response
-bounds are not retention quotas.
+budget must allow at least two extrema per requested metric. History responses
+include `source_last_sequence`, allowing a revision-aware client to request only
+new rows after a sampled snapshot. These response bounds are not retention
+quotas.
 
 ## Discovery
 

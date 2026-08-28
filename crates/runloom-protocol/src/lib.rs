@@ -256,6 +256,8 @@ pub struct HistoryResponse {
     pub sampled: bool,
     #[serde(default)]
     pub source_points: Option<u64>,
+    #[serde(default)]
+    pub source_last_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,6 +320,7 @@ mod tests {
 
         assert!(!response.sampled);
         assert_eq!(response.source_points, None);
+        assert_eq!(response.source_last_sequence, None);
         Ok(())
     }
 }
