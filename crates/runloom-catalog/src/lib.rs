@@ -22,6 +22,7 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction, query};
 use thiserror::Error;
 
 pub const MAX_SEGMENTS_PER_QUERY: usize = 256;
+pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 
 const CATALOG_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
@@ -256,6 +257,10 @@ pub enum CatalogError {
     Limit(String),
     #[error("invalid catalog data: {0}")]
     InvalidData(String),
+    #[error(
+        "catalog schema version {found} is incompatible with this pre-alpha binary (expected {expected}); restore a matching backup or reset the storage roots"
+    )]
+    SchemaVersion { found: i64, expected: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,6 +362,22 @@ impl Catalog {
     }
 
     async fn initialize(&self) -> Result<(), CatalogError> {
+        let version: i64 = query("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await?
+            .get(0);
+        let table_count: i64 = query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_one(&self.pool)
+        .await?
+        .get(0);
+        if version != i64::from(CATALOG_SCHEMA_VERSION) && !(version == 0 && table_count == 0) {
+            return Err(CatalogError::SchemaVersion {
+                found: version,
+                expected: CATALOG_SCHEMA_VERSION,
+            });
+        }
         for statement in CATALOG_SCHEMA
             .split(';')
             .map(str::trim)
@@ -364,7 +385,23 @@ impl Catalog {
         {
             query(statement).execute(&self.pool).await?;
         }
+        if version == 0 {
+            query(&format!("PRAGMA user_version = {CATALOG_SCHEMA_VERSION}"))
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
+    }
+
+    pub async fn schema_version(&self) -> Result<u32, CatalogError> {
+        let version: i64 = query("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await?
+            .get(0);
+        u32::try_from(version).map_err(|_| CatalogError::SchemaVersion {
+            found: version,
+            expected: CATALOG_SCHEMA_VERSION,
+        })
     }
 
     pub async fn health_check(&self) -> Result<(), CatalogError> {
@@ -2876,6 +2913,7 @@ mod tests {
     use runloom_protocol::{
         AlertId, AlertLevel, CreateAlertRequest, CreateRunRequest, ResumePolicy, RunState,
     };
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use tempfile::tempdir;
 
     use super::{Catalog, CatalogError, SegmentManifest};
@@ -2884,6 +2922,7 @@ mod tests {
     async fn creates_resumes_and_finishes_a_run() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        assert_eq!(catalog.schema_version().await?, 1);
         let request = CreateRunRequest {
             id: None,
             name: Some("training".to_owned()),
@@ -3014,6 +3053,34 @@ mod tests {
             )
             .await;
         assert!(matches!(late_update, Err(CatalogError::Conflict(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_unversioned_existing_pre_alpha_catalogs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("catalog.sqlite3");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        sqlx::query("CREATE TABLE legacy (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await?;
+        pool.close().await;
+
+        let result = Catalog::open(path).await;
+        assert!(matches!(
+            result,
+            Err(CatalogError::SchemaVersion {
+                found: 0,
+                expected: 1
+            })
+        ));
         Ok(())
     }
 

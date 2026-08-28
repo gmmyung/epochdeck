@@ -55,6 +55,9 @@ class RunloomClient:
             status=payload["status"],
         )
 
+    def diagnostics(self) -> dict[str, Any]:
+        return self._request("GET", "/api/v1/diagnostics")
+
     def create_run(
         self,
         *,

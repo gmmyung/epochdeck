@@ -8,7 +8,7 @@ bootstrap:
   uv sync --project python --all-groups
   pnpm --dir web install
 
-check: dependency-guard workflow-check rust-check python-check web-check
+check: dependency-guard workflow-check dashboard-build rust-check python-check web-check
 
 dependency-guard:
   ./scripts/check-forbidden-dependencies.sh
@@ -30,6 +30,12 @@ web-check:
   pnpm --dir web check
   pnpm --dir web test
   pnpm --dir web build
+
+dashboard-build:
+  pnpm --dir web build
+
+single-binary: dashboard-build
+  cargo build --release -p runloom-server --features embedded-dashboard
 
 format:
   cargo fmt --all

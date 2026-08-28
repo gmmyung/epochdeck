@@ -34,8 +34,8 @@ usable and tested, not that the entire feature group is complete.
 | Import/export | lossless local export and resumable import | Partial |
 
 Features tied specifically to third-party hosting platforms are deliberately
-excluded. Runloom provides its own server, storage roots, authentication, and
-deployment model.
+excluded. Runloom provides its own server, storage roots, and deployment model;
+the documented pre-alpha deployment uses Tailnet policy as its access boundary.
 
 ## W&B parity roadmap
 

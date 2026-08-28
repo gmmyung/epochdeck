@@ -6,12 +6,17 @@ pub use compaction::{CompactionConfig, MetricRuntime, run_compaction_worker};
 #[cfg(test)]
 use compaction::{CompactionOutcome, compact_once};
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, Request, StatusCode};
+#[cfg(feature = "embedded-dashboard")]
+use axum::http::{HeaderValue, Uri, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
@@ -26,21 +31,24 @@ use runloom_protocol::{
     ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse, CreateArtifactRequest,
     CreateArtifactResponse, CreateReportRequest, CreateReportResponse, CreateRichValueRequest,
     CreateRichValueResponse, CreateRunRequest, CreateRunResponse, CreateSweepRequest,
-    CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse, FinishRunRequest,
-    FinishRunResponse, HealthResponse, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
-    MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES, MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES,
-    MAX_BATCH_POINTS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS, MAX_HISTORY_POINTS,
-    MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES,
-    MAX_TRACE_METADATA_BYTES, MetricKeyListResponse, ProjectListResponse, ReportId, ReportLayout,
-    ReportListResponse, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId, RichValueKind,
-    RichValueListResponse, RunArtifactListResponse, RunId, RunListResponse, RunQueryRequest,
-    RunQueryResponse, RunRecord, RunState, RunUpdateResponse, SummaryUpdateRequest, SweepId,
-    SweepListResponse, SweepTrialId, SweepTrialListResponse, SweepTrialRecord, SweepTrialState,
-    TraceSpanId, TraceSpanListResponse, UpdateReportRequest, UseArtifactRequest,
+    CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse, DiagnosticsResponse,
+    FinishRunRequest, FinishRunResponse, HealthResponse, HistoryResponse, IngestBatchRequest,
+    IngestBatchResponse, MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES, MAX_ARTIFACT_ENTRIES,
+    MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS,
+    MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES,
+    MAX_SUMMARY_BYTES, MAX_TRACE_METADATA_BYTES, MetricKeyListResponse, ProjectListResponse,
+    ReportId, ReportLayout, ReportListResponse, ReportPanelKind, ReportRecord, ResumePolicy,
+    RichValueId, RichValueKind, RichValueListResponse, RunArtifactListResponse, RunId,
+    RunListResponse, RunQueryRequest, RunQueryResponse, RunRecord, RunState, RunUpdateResponse,
+    SlowRequestRecord, SummaryUpdateRequest, SweepId, SweepListResponse, SweepTrialId,
+    SweepTrialListResponse, SweepTrialRecord, SweepTrialState, TraceSpanId, TraceSpanListResponse,
+    UpdateReportRequest, UseArtifactRequest,
 };
 use runloom_storage::{
     BlobStore, MetricStore, MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
 };
+#[cfg(feature = "embedded-dashboard")]
+use rust_embed::RustEmbed;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -74,6 +82,9 @@ const MAX_AGENT_ID_BYTES: usize = 128;
 const MAX_REPORT_PANELS: usize = 32;
 const MAX_REPORT_METRICS: usize = 8;
 const MAX_REPORT_MARKDOWN_BYTES: usize = 64 * 1024;
+const DEFAULT_SLOW_REQUEST_MS: u64 = 1_000;
+const MAX_RECENT_SLOW_REQUESTS: usize = 64;
+const MAX_DIAGNOSTIC_PATH_BYTES: usize = 512;
 
 #[derive(Debug, Clone)]
 struct AppState {
@@ -82,6 +93,47 @@ struct AppState {
     blobs: BlobStore,
     ingest_permits: Arc<Semaphore>,
     query_permits: Arc<Semaphore>,
+    telemetry: Arc<RequestTelemetry>,
+}
+
+#[derive(Debug)]
+struct RequestTelemetry {
+    started_at: Instant,
+    slow_threshold: Duration,
+    requests_total: AtomicU64,
+    requests_active: AtomicU64,
+    server_errors_total: AtomicU64,
+    slow_requests_total: AtomicU64,
+    history_queries_total: AtomicU64,
+    history_query_duration_ms_total: AtomicU64,
+    history_query_duration_ms_max: AtomicU64,
+    recent_slow_requests: Mutex<VecDeque<SlowRequestRecord>>,
+}
+
+impl RequestTelemetry {
+    fn from_environment() -> Self {
+        let threshold_ms = std::env::var("RUNLOOM_SLOW_REQUEST_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=60_000).contains(value))
+            .unwrap_or(DEFAULT_SLOW_REQUEST_MS);
+        Self::new(Duration::from_millis(threshold_ms))
+    }
+
+    fn new(slow_threshold: Duration) -> Self {
+        Self {
+            started_at: Instant::now(),
+            slow_threshold,
+            requests_total: AtomicU64::new(0),
+            requests_active: AtomicU64::new(0),
+            server_errors_total: AtomicU64::new(0),
+            slow_requests_total: AtomicU64::new(0),
+            history_queries_total: AtomicU64::new(0),
+            history_query_duration_ms_total: AtomicU64::new(0),
+            history_query_duration_ms_max: AtomicU64::new(0),
+            recent_slow_requests: Mutex::new(VecDeque::with_capacity(MAX_RECENT_SLOW_REQUESTS)),
+        }
+    }
 }
 
 pub fn app(catalog: Catalog, metrics: MetricStore) -> Router {
@@ -112,8 +164,10 @@ pub fn app_with_runtime_and_blobs(
     metrics: MetricRuntime,
     blobs: BlobStore,
 ) -> Router {
-    Router::new()
+    let telemetry = Arc::new(RequestTelemetry::from_environment());
+    let router = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/diagnostics", get(diagnostics))
         .route("/api/v1/projects", get(list_projects))
         .route("/api/v1/query/runs", post(query_runs))
         .route(
@@ -188,10 +242,172 @@ pub fn app_with_runtime_and_blobs(
             blobs,
             ingest_permits: Arc::new(Semaphore::new(INGEST_WORKERS)),
             query_permits: Arc::new(Semaphore::new(QUERY_WORKERS)),
+            telemetry: Arc::clone(&telemetry),
         })
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(telemetry, record_request));
+    #[cfg(feature = "embedded-dashboard")]
+    let router = router.fallback(embedded_dashboard);
+    router
+}
+
+#[cfg(feature = "embedded-dashboard")]
+#[derive(RustEmbed)]
+#[folder = "../../web/dist"]
+struct DashboardAssets;
+
+#[cfg(feature = "embedded-dashboard")]
+async fn embedded_dashboard(uri: Uri) -> Response {
+    let requested = uri.path().trim_start_matches('/');
+    if requested == "api" || requested.starts_with("api/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let asset_name = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+    let selected = DashboardAssets::get(asset_name)
+        .map(|asset| (asset_name, asset))
+        .or_else(|| {
+            if asset_name.contains('.') {
+                None
+            } else {
+                DashboardAssets::get("index.html").map(|asset| ("index.html", asset))
+            }
+        });
+    let Some((name, asset)) = selected else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response = Body::from(asset.data).into_response();
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
+    if let Ok(value) = HeaderValue::from_str(mime.as_ref()) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(if name == "index.html" {
+            "no-cache"
+        } else {
+            "public, max-age=31536000, immutable"
+        }),
+    );
+    response
+}
+
+struct ActiveRequestGuard(Arc<RequestTelemetry>);
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.0.requests_active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn record_request(
+    State(telemetry): State<Arc<RequestTelemetry>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    telemetry.requests_total.fetch_add(1, Ordering::Relaxed);
+    telemetry.requests_active.fetch_add(1, Ordering::Relaxed);
+    let _active_guard = ActiveRequestGuard(Arc::clone(&telemetry));
+    let method = request.method().to_string();
+    let path = truncate_diagnostic_path(request.uri().path());
+    let history_query = path.ends_with("/history");
+    let started_at = Instant::now();
+    let response = next.run(request).await;
+    let elapsed = started_at.elapsed();
+    let duration_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+    let status = response.status();
+    if status.is_server_error() {
+        telemetry
+            .server_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if history_query {
+        telemetry
+            .history_queries_total
+            .fetch_add(1, Ordering::Relaxed);
+        telemetry
+            .history_query_duration_ms_total
+            .fetch_add(duration_ms, Ordering::Relaxed);
+        telemetry
+            .history_query_duration_ms_max
+            .fetch_max(duration_ms, Ordering::Relaxed);
+    }
+    if elapsed >= telemetry.slow_threshold {
+        telemetry
+            .slow_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let record = SlowRequestRecord {
+            method: method.clone(),
+            path: path.clone(),
+            status: status.as_u16(),
+            duration_ms,
+            timestamp_ms,
+        };
+        if let Ok(mut recent) = telemetry.recent_slow_requests.lock() {
+            if recent.len() == MAX_RECENT_SLOW_REQUESTS {
+                recent.pop_front();
+            }
+            recent.push_back(record);
+        }
+        tracing::warn!(%method, %path, status = status.as_u16(), duration_ms, "slow request");
+    }
+    response
+}
+
+fn truncate_diagnostic_path(value: &str) -> String {
+    if value.len() <= MAX_DIAGNOSTIC_PATH_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_DIAGNOSTIC_PATH_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+async fn diagnostics(
+    State(state): State<AppState>,
+) -> Result<Json<DiagnosticsResponse>, HttpError> {
+    let telemetry = &state.telemetry;
+    let recent_slow_requests = telemetry
+        .recent_slow_requests
+        .lock()
+        .map(|recent| recent.iter().cloned().collect())
+        .unwrap_or_default();
+    Ok(Json(DiagnosticsResponse {
+        service: "runloom".to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        schema_version: state.catalog.schema_version().await?,
+        uptime_seconds: telemetry.started_at.elapsed().as_secs(),
+        requests_total: telemetry.requests_total.load(Ordering::Relaxed),
+        requests_active: telemetry.requests_active.load(Ordering::Relaxed),
+        server_errors_total: telemetry.server_errors_total.load(Ordering::Relaxed),
+        slow_requests_total: telemetry.slow_requests_total.load(Ordering::Relaxed),
+        slow_request_threshold_ms: telemetry
+            .slow_threshold
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+        history_queries_total: telemetry.history_queries_total.load(Ordering::Relaxed),
+        history_query_duration_ms_total: telemetry
+            .history_query_duration_ms_total
+            .load(Ordering::Relaxed),
+        history_query_duration_ms_max: telemetry
+            .history_query_duration_ms_max
+            .load(Ordering::Relaxed),
+        ingest_permits_available: state.ingest_permits.available_permits(),
+        query_permits_available: state.query_permits.available_permits(),
+        recent_slow_requests,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1914,7 +2130,8 @@ impl From<CatalogError> for HttpError {
             CatalogError::Limit(_) => Self::invalid(error.to_string()),
             CatalogError::CreateDirectory { .. }
             | CatalogError::Database(_)
-            | CatalogError::InvalidData(_) => Self::internal(error.to_string()),
+            | CatalogError::InvalidData(_)
+            | CatalogError::SchemaVersion { .. } => Self::internal(error.to_string()),
         }
     }
 }
@@ -1942,15 +2159,15 @@ mod tests {
         CreateArtifactRequest, CreateArtifactResponse, CreateReportRequest, CreateReportResponse,
         CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest, CreateRunResponse,
         CreateSweepRequest, CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse,
-        EarlyTerminateConfig, FinishRunRequest, FinishRunResponse, HealthResponse, HealthStatus,
-        HistoryResponse, IngestBatchRequest, IngestBatchResponse, MetricGoal,
-        MetricKeyListResponse, MetricPoint, ProjectListResponse, ReportLayout, ReportListResponse,
-        ReportPanel, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId, RichValueKind,
-        RichValueListResponse, RunArtifactListResponse, RunListResponse, RunQueryRequest,
-        RunQueryResponse, RunState, RunUpdateResponse, SummaryUpdateRequest, SweepMethod,
-        SweepMetric, SweepParameter, SweepTrialListResponse, SweepTrialState, TraceKind,
-        TraceSpanId, TraceSpanListResponse, TraceSpanRecord, TraceStatus, UpdateReportRequest,
-        UseArtifactRequest,
+        DiagnosticsResponse, EarlyTerminateConfig, FinishRunRequest, FinishRunResponse,
+        HealthResponse, HealthStatus, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
+        MetricGoal, MetricKeyListResponse, MetricPoint, ProjectListResponse, ReportLayout,
+        ReportListResponse, ReportPanel, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId,
+        RichValueKind, RichValueListResponse, RunArtifactListResponse, RunListResponse,
+        RunQueryRequest, RunQueryResponse, RunState, RunUpdateResponse, SummaryUpdateRequest,
+        SweepMethod, SweepMetric, SweepParameter, SweepTrialListResponse, SweepTrialState,
+        TraceKind, TraceSpanId, TraceSpanListResponse, TraceSpanRecord, TraceStatus,
+        UpdateReportRequest, UseArtifactRequest,
     };
     use runloom_storage::MetricStore;
     use sha2::{Digest, Sha256};
@@ -1965,7 +2182,9 @@ mod tests {
     async fn health_checks_the_catalog() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let response = app(catalog, MetricStore::new(directory.path().join("metrics")))
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let response = router
+            .clone()
             .oneshot(Request::get("/api/v1/health").body(Body::empty())?)
             .await?;
 
@@ -1973,6 +2192,100 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await?;
         let health: HealthResponse = serde_json::from_slice(&body)?;
         assert_eq!(health.status, HealthStatus::Healthy);
+        let diagnostics: DiagnosticsResponse = response_json(
+            router
+                .oneshot(Request::get("/api/v1/diagnostics").body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(diagnostics.schema_version, 1);
+        assert_eq!(diagnostics.requests_total, 2);
+        assert_eq!(diagnostics.requests_active, 1);
+        assert_eq!(diagnostics.query_permits_available, super::QUERY_WORKERS);
+        Ok(())
+    }
+
+    #[cfg(feature = "embedded-dashboard")]
+    #[tokio::test]
+    async fn embedded_dashboard_serves_assets_and_spa_routes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        for path in ["/", "/projects/demo"] {
+            let response = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-cache")
+            );
+            let body = to_bytes(response.into_body(), 1024 * 1024).await?;
+            assert!(String::from_utf8_lossy(&body).contains("<title>Runloom</title>"));
+        }
+        let missing_asset = router
+            .clone()
+            .oneshot(Request::get("/missing.js").body(Body::empty())?)
+            .await?;
+        assert_eq!(missing_asset.status(), StatusCode::NOT_FOUND);
+        let missing_api = router
+            .oneshot(Request::get("/api/v1/missing").body(Body::empty())?)
+            .await?;
+        assert_eq!(missing_api.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_telemetry_keeps_bounded_slow_history_diagnostics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let telemetry = Arc::new(super::RequestTelemetry::new(Duration::ZERO));
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/runs/example/history",
+                axum::routing::get(|| async {}),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&telemetry),
+                super::record_request,
+            ));
+        let response = router
+            .oneshot(Request::get("/api/v1/runs/example/history").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            telemetry
+                .requests_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            telemetry
+                .requests_active
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            telemetry
+                .slow_requests_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            telemetry
+                .history_queries_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let recent = telemetry
+            .recent_slow_requests
+            .lock()
+            .map_err(|_| std::io::Error::other("slow request diagnostics lock was poisoned"))?;
+        assert_eq!(recent.len(), 1);
         Ok(())
     }
 

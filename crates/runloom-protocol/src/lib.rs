@@ -95,6 +95,34 @@ impl HealthResponse {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlowRequestRecord {
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub duration_ms: u64,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticsResponse {
+    pub service: String,
+    pub version: String,
+    pub schema_version: u32,
+    pub uptime_seconds: u64,
+    pub requests_total: u64,
+    pub requests_active: u64,
+    pub server_errors_total: u64,
+    pub slow_requests_total: u64,
+    pub slow_request_threshold_ms: u64,
+    pub history_queries_total: u64,
+    pub history_query_duration_ms_total: u64,
+    pub history_query_duration_ms_max: u64,
+    pub ingest_permits_available: usize,
+    pub query_permits_available: usize,
+    pub recent_slow_requests: Vec<SlowRequestRecord>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthStatus {

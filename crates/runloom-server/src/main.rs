@@ -1,6 +1,8 @@
+use std::fs::OpenOptions;
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use runloom_catalog::Catalog;
 use runloom_server::{
     CompactionConfig, MetricRuntime, app_with_runtime_and_blobs, run_compaction_worker,
@@ -19,6 +21,19 @@ async fn main() -> Result<()> {
     layout
         .ensure()
         .context("failed to initialize storage roots")?;
+    let storage_lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(layout.lock_path())
+        .context("failed to open the Runloom storage lock")?;
+    FileExt::try_lock_exclusive(&storage_lock).with_context(|| {
+        format!(
+            "Runloom storage is already active: {}",
+            layout.lock_path().display()
+        )
+    })?;
     let catalog = Catalog::open(layout.catalog_path())
         .await
         .context("failed to initialize catalog")?;

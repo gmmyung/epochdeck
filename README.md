@@ -12,8 +12,8 @@ Runloom is pre-alpha. Scalar run tracking, native rich media, host telemetry,
 durable alerts, bounded dashboard sampling, background metric compaction,
 versioned artifacts, and structured traces are usable end to end. Finite sweeps
 and persisted reports are also usable. Authentication, import/export,
-production packaging, and the wider compatibility surface remain under active
-development.
+multi-user authorization and the wider compatibility surface remain under
+active development.
 
 ## Non-negotiable properties
 
@@ -50,7 +50,9 @@ managed with uv. Nix pins all development tools.
 
 See [System architecture](docs/architecture.md), the
 [compatibility matrix](docs/compatibility.md), the [HTTP API](docs/api.md), and
-[metric benchmarks](docs/benchmarks.md).
+[metric benchmarks](docs/benchmarks.md). Production setup is covered by the
+[Tailnet deployment](docs/deployment.md) and [operations](docs/operations.md)
+runbooks.
 
 ## Development
 
@@ -58,6 +60,7 @@ See [System architecture](docs/architecture.md), the
 nix develop
 just bootstrap
 just check
+just single-binary
 ```
 
 Run the API and dashboard in separate terminals:

@@ -173,6 +173,8 @@ Report list responses use the same `next_before` cursor convention.
 - `GET /projects/{project}/runs?limit=100` returns bounded run records.
 - `POST /query/runs` returns a bounded, cursor-paginated run query.
 - `GET /health` checks the service and SQLite catalog.
+- `GET /diagnostics` returns bounded process, queue, schema, and slow-request
+  telemetry.
 
 Run query bodies accept optional `project`, `state`, exact `name`, literal
 `name_contains`, top-level `config_equals` and `summary_equals` JSON maps,
@@ -183,3 +185,7 @@ unimplemented comparison operators and alternate sort orders explicitly.
 
 Authentication and stable external deployment guarantees are not implemented
 yet. Keep the current server on a trusted interface or Tailnet.
+
+Diagnostics retain only the most recent 64 slow requests in memory. The default
+slow threshold is 1,000 ms and `RUNLOOM_SLOW_REQUEST_MS` accepts values from 1
+to 60,000. Counters reset on process restart and do not add a telemetry database.

@@ -34,6 +34,32 @@ def test_health_is_an_explicit_subcommand(monkeypatch) -> None:
     }
 
 
+def test_doctor_returns_bounded_server_diagnostics(monkeypatch) -> None:
+    diagnostics = {
+        "service": "runloom",
+        "version": "0.1.0",
+        "schema_version": 1,
+        "requests_total": 12,
+        "recent_slow_requests": [],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/diagnostics"
+        return httpx.Response(200, json=diagnostics)
+
+    original_client = httpx.Client
+
+    def client_with_mock_transport(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client_with_mock_transport)
+    result = CliRunner().invoke(app, ["doctor", "--server-url", "http://runloom.test"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == diagnostics
+
+
 def test_runs_command_sends_typed_document_filters(monkeypatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"

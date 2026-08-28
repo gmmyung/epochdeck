@@ -6,12 +6,12 @@ not a reduction in the final parity goal.
 
 ## Milestone 0: foundation
 
-- Reproducible Nix development shell.
-- Rust health API and SQLite catalog.
-- Python health client and CLI.
-- Standalone Svelte dashboard shell.
-- Dependency guard against prohibited hosting integrations.
-- CI for Rust, Python, and web validation.
+- [x] Reproducible Nix development shell.
+- [x] Rust health API and SQLite catalog.
+- [x] Python health client and CLI.
+- [x] Standalone Svelte dashboard shell.
+- [x] Dependency guard against prohibited hosting integrations.
+- [x] CI for Rust, Python, and web validation.
 
 ## Milestone 1: run lifecycle and bounded metrics
 
@@ -51,7 +51,7 @@ not a reduction in the final parity goal.
 
 ## Milestone 5: production operations
 
-- Single-binary build with embedded dashboard.
-- Tailnet-only deployment and systemd documentation.
-- Coordinated catalog, segments, and blob backup/restore.
-- Slow-query diagnostics, telemetry, and upgrade migrations.
+- [x] Single-binary build with embedded dashboard.
+- [x] Tailnet-only deployment and systemd documentation.
+- [x] Coordinated catalog, segments, and blob backup/restore.
+- [x] Slow-query diagnostics, bounded telemetry, and explicit pre-alpha schema checks.

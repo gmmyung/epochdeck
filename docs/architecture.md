@@ -32,9 +32,9 @@ manifests, authentication, and HTTP delivery. Tokio and Axum provide the runtime
 and HTTP boundary. CPU-heavy encoding and query work runs in bounded worker pools
 rather than on async executor threads.
 
-The production artifact will be one binary containing the dashboard assets. It
-must not require an external database, queue, or object store for single-node
-operation.
+The `embedded-dashboard` production feature packages the built dashboard into
+the server binary. Single-node operation requires no external database, queue,
+object store, or runtime web directory.
 
 ### Catalog and ingest journal
 
@@ -149,10 +149,10 @@ large report cannot turn into an unbounded fan-out or duplicate source data.
 
 ### Dashboard
 
-The Svelte dashboard initially loads project, run, report, and metric metadata. It
-requests values only for visible charts and selected metrics. Off-screen charts
-are virtualized, Arrow decoding happens in a Web Worker, numeric series stay in
-typed arrays, and charts render with Canvas.
+The Svelte dashboard initially loads project, run, report, and metric metadata.
+It requests values only for visible charts and selected metrics. Off-screen
+charts use browser content visibility and intersection observers; bounded
+columnar JSON responses render directly with Canvas.
 
 Realtime updates are deltas keyed by run sequence. The dashboard never polls
 complete histories.
@@ -174,6 +174,11 @@ RUNLOOM_BLOBS_DIR/
 
 The data and metric roots belong on SSD. The blob root can be a bind-mounted ZFS
 dataset on high-capacity disks.
+
+The server holds `RUNLOOM_DATA_DIR/runloom.lock` while active. Physical backup
+and restore take the same advisory lock, use a verified streaming inventory, and
+therefore cannot race catalog or immutable-file mutation. Portable project
+exports remain available through the HTTP API while the server is running.
 
 ## Performance budgets
 

@@ -207,6 +207,11 @@ impl StorageLayout {
     }
 
     #[must_use]
+    pub fn lock_path(&self) -> PathBuf {
+        self.data_dir.join("runloom.lock")
+    }
+
+    #[must_use]
     pub fn journal_dir(&self) -> PathBuf {
         self.data_dir.join("journal")
     }

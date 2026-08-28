@@ -1,0 +1,36 @@
+[Unit]
+Description=Runloom experiment tracking server
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+User=runloom
+Group=runloom
+EnvironmentFile=/etc/runloom/runloom.env
+ExecStart=/usr/local/bin/runloom-server
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=90s
+StateDirectory=runloom
+UMask=0027
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/runloom /srv/runloom
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

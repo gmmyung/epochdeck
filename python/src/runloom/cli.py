@@ -7,6 +7,7 @@ from typing import Annotated
 
 import typer
 
+from runloom.backup import StorageRoots, backup_storage, restore_storage
 from runloom.client import RunloomClient
 from runloom.exporter import export_project
 from runloom.public_api import Api
@@ -42,6 +43,20 @@ def health(
             sort_keys=True,
         )
     )
+
+
+@app.command("doctor")
+def doctor_command(
+    server_url: str = typer.Option(
+        "http://127.0.0.1:8787",
+        envvar="RUNLOOM_SERVER_URL",
+        help="Runloom server base URL.",
+    ),
+) -> None:
+    """Show bounded server, queue, schema, and slow-request diagnostics."""
+    with RunloomClient(server_url) as client:
+        result = client.diagnostics()
+    typer.echo(json.dumps(result, sort_keys=True))
 
 
 @app.command()
@@ -242,6 +257,35 @@ def import_wandb_command(
     )
     if result.failed:
         raise typer.Exit(code=1)
+
+
+@app.command("backup")
+def backup_command(
+    destination: Annotated[
+        Path,
+        typer.Argument(help="New physical backup directory to create."),
+    ],
+) -> None:
+    """Back up catalog, raw metrics, journals, and all CAS bytes while stopped."""
+    manifest = backup_storage(StorageRoots.from_environment(), destination)
+    typer.echo(json.dumps(manifest, sort_keys=True))
+
+
+@app.command("restore")
+def restore_command(
+    bundle: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Physical Runloom backup directory.",
+        ),
+    ],
+) -> None:
+    """Verify and restore a physical backup into empty storage roots while stopped."""
+    manifest = restore_storage(bundle, StorageRoots.from_environment())
+    typer.echo(json.dumps(manifest, sort_keys=True))
 
 
 def _parse_json_filters(values: list[str], name: str) -> dict[str, object]:
