@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/runloom-catalog",
+  "crates/runloom-protocol",
+  "crates/runloom-server",
+  "crates/runloom-storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1.0"
+axum = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio",
+  "sqlite",
+] }
+thiserror = "2.0"
+tokio = { version = "1.0", features = [
+  "fs",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+] }
+tower-http = { version = "0.6", features = [
+  "compression-br",
+  "compression-gzip",
+  "request-id",
+  "trace",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.0", features = ["serde", "v7"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "warn"
