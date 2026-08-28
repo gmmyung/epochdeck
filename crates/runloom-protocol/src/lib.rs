@@ -176,6 +176,8 @@ pub struct CreateRunRequest {
 pub struct CreateRunResponse {
     pub run: RunRecord,
     pub resumed: bool,
+    pub next_sequence: u64,
+    pub next_step: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

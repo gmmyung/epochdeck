@@ -7,7 +7,7 @@ import time
 import httpx
 import pytest
 
-from runloom.run import create_run, sync_spool
+from runloom.run import DeliveryError, create_run, sync_spool
 
 
 def test_online_run_batches_nested_metrics_without_blocking_on_upload(tmp_path) -> None:
@@ -26,6 +26,8 @@ def test_online_run_batches_nested_metrics_without_blocking_on_upload(tmp_path) 
                         "name": "training",
                     },
                     "resumed": False,
+                    "next_sequence": 1,
+                    "next_step": 0,
                 },
             )
         if request.url.path.endswith("/batches"):
@@ -110,7 +112,15 @@ def test_offline_run_keeps_a_durable_journal(tmp_path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request.url.path)
         if request.url.path.endswith("/runs"):
-            return httpx.Response(201, json={"run": {"name": "training"}, "resumed": False})
+            return httpx.Response(
+                201,
+                json={
+                    "run": {"name": "training"},
+                    "resumed": False,
+                    "next_sequence": 1,
+                    "next_step": 0,
+                },
+            )
         if request.url.path.endswith("/batches"):
             batch = json.loads(request.content)
             return httpx.Response(
@@ -168,7 +178,15 @@ def test_online_documents_use_authoritative_server_state(tmp_path) -> None:
         requests.append(f"{request.method} {request.url.path}")
         body = json.loads(request.content) if request.content else {}
         if request.url.path.endswith("/runs"):
-            return httpx.Response(200, json={"run": response_run(), "resumed": True})
+            return httpx.Response(
+                200,
+                json={
+                    "run": response_run(),
+                    "resumed": True,
+                    "next_sequence": 1,
+                    "next_step": 0,
+                },
+            )
         if request.url.path.endswith("/config"):
             server_config.update(body["updates"])
             return httpx.Response(200, json={"run": response_run()})
@@ -219,3 +237,24 @@ def test_documents_reject_non_json_values_before_writing(tmp_path) -> None:
             spool_root=tmp_path,
         )
     assert list(tmp_path.iterdir()) == []
+
+
+def test_online_run_rejects_a_server_without_resume_positions(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(
+            201,
+            json={
+                "run": {"id": body["id"], "name": "outdated-server"},
+                "resumed": False,
+            },
+        )
+
+    with pytest.raises(DeliveryError, match="server and SDK versions may differ"):
+        create_run(
+            project="robotics",
+            run_id="019c1234-5678-7000-8000-000000000004",
+            mode="online",
+            spool_root=tmp_path,
+            transport=httpx.MockTransport(handler),
+        )

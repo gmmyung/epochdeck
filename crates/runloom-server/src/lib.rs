@@ -25,7 +25,9 @@ use runloom_protocol::{
     ResumePolicy, RunId, RunListResponse, RunRecord, RunState, RunUpdateResponse,
     SummaryUpdateRequest,
 };
-use runloom_storage::{MetricStore, MinMaxHistorySampler, SegmentSource, StorageError};
+use runloom_storage::{
+    MetricStore, MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -134,7 +136,51 @@ async fn create_run(
     } else {
         StatusCode::CREATED
     };
-    Ok((status, Json(CreateRunResponse { run, resumed })))
+    let (next_sequence, next_step) = if resumed {
+        next_run_position(&state, run.id).await?
+    } else {
+        (1, 0)
+    };
+    Ok((
+        status,
+        Json(CreateRunResponse {
+            run,
+            resumed,
+            next_sequence,
+            next_step,
+        }),
+    ))
+}
+
+async fn next_run_position(state: &AppState, run_id: RunId) -> Result<(u64, u64), HttpError> {
+    let _snapshot = state.metrics.read_snapshot().await;
+    let Some(segment) = state.catalog.last_segment(run_id).await? else {
+        return Ok((1, 0));
+    };
+    let metrics = state.metrics.store().clone();
+    let _permit = Arc::clone(&state.query_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
+    let tail =
+        tokio::task::spawn_blocking(move || metrics.read_segment_tail(&segment.relative_path))
+            .await
+            .map_err(|error| {
+                HttpError::internal(format!("resume query worker failed: {error}"))
+            })??;
+    next_position(tail)
+}
+
+fn next_position(tail: SegmentTail) -> Result<(u64, u64), HttpError> {
+    let next_sequence = tail
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| HttpError::internal("run sequence overflow"))?;
+    let next_step = tail
+        .step
+        .checked_add(1)
+        .ok_or_else(|| HttpError::internal("run step overflow"))?;
+    Ok((next_sequence, next_step))
 }
 
 async fn get_run(
@@ -682,6 +728,9 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::CREATED);
         let created: CreateRunResponse = response_json(response).await?;
+        assert!(!created.resumed);
+        assert_eq!(created.next_sequence, 1);
+        assert_eq!(created.next_step, 0);
 
         let config_path = format!("/api/v1/runs/{}/config", created.run.id);
         let response = router
@@ -764,13 +813,13 @@ mod tests {
             points: vec![
                 MetricPoint {
                     sequence: 1,
-                    step: 0,
+                    step: 10,
                     timestamp_ms: 1_000,
                     metrics: BTreeMap::from([("loss".to_owned(), 2.0), ("reward".to_owned(), 3.0)]),
                 },
                 MetricPoint {
                     sequence: 2,
-                    step: 1,
+                    step: 11,
                     timestamp_ms: 2_000,
                     metrics: BTreeMap::from([("loss".to_owned(), 1.0)]),
                 },
@@ -792,6 +841,24 @@ mod tests {
         let duplicate: IngestBatchResponse = response_json(response).await?;
         assert!(duplicate.duplicate);
         assert_eq!(duplicate.metric_revision, accepted.metric_revision);
+
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/v1/projects/robotics/runs",
+                &CreateRunRequest {
+                    id: Some(created.run.id),
+                    name: None,
+                    config: BTreeMap::new(),
+                    resume: ResumePolicy::Must,
+                },
+            )?)
+            .await?;
+        let resumed: CreateRunResponse = response_json(response).await?;
+        assert!(resumed.resumed);
+        assert_eq!(resumed.next_sequence, 3);
+        assert_eq!(resumed.next_step, 12);
 
         let history_path = format!("/api/v1/runs/{}/history?keys=loss&limit=1", created.run.id);
         let response = router
@@ -871,6 +938,28 @@ mod tests {
             finished.run.summary["tags"],
             serde_json::json!(["fast", null])
         );
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &finish_path,
+                &FinishRunRequest {
+                    summary: BTreeMap::from([("status".to_owned(), "complete".into())]),
+                },
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &finish_path,
+                &FinishRunRequest {
+                    summary: BTreeMap::from([("status".to_owned(), "changed".into())]),
+                },
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let rejected_batch = IngestBatchRequest {
             batch_sequence: 2,
             points: vec![MetricPoint {

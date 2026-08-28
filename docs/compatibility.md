@@ -18,10 +18,10 @@ usable and tested, not that the entire feature group is complete.
 
 | Feature group | Required behavior | Status |
 |---|---|---|
-| Run lifecycle | `init`, `log`, `finish`, resume, stable run IDs | Partial |
-| Configuration | immutable initial config plus controlled updates | Partial |
-| Summary | automatic latest-value summary and explicit overrides | Partial |
-| Scalar metrics | steps, timestamps, nested keys, batching | Partial |
+| Run lifecycle | `init`, `log`, `finish`, resume, stable run IDs | Compatible |
+| Configuration | immutable initial config plus controlled updates | Compatible |
+| Summary | automatic latest-value summary and explicit overrides | Compatible |
+| Scalar metrics | steps, timestamps, nested keys, batching | Compatible |
 | System metrics | CPU, memory, disk, GPU when available | Planned |
 | Rich values | images, audio, video, tables, histograms | Planned |
 | Alerts | levels, titles, text, steps, timestamps | Planned |
@@ -42,7 +42,7 @@ deployment model.
 | Feature group | Required behavior | Status |
 |---|---|---|
 | Drop-in workflow | `import runloom as wandb` for common training code | Partial |
-| Run modes | online, offline, disabled, resume policies | Partial |
+| Run modes | online, offline, disabled, resume policies | Compatible |
 | Public API | projects, runs, filters, history, files, artifacts | Planned |
 | Media semantics | captions, grouping, sequences, native playback | Planned |
 | Tables | typed columns, incremental data, linked rich values | Planned |
@@ -51,14 +51,23 @@ deployment model.
 | Reports | persisted dashboard/report definitions | Planned |
 | Groups and jobs | group, job type, tags, notes, ownership metadata | Planned |
 | Importers | W&B API and export formats with resumable checkpoints | Planned |
-| Compatibility errors | explicit diagnostics for unsupported behavior | Planned |
+| Compatibility errors | explicit diagnostics for unsupported behavior | Partial |
 
 ## Test strategy
 
-The compatibility suite will run equivalent user-level scenarios against a
-reference implementation and Runloom, normalize nondeterministic identifiers,
-and compare observable results. Golden protocol fixtures cover offline queues,
-server restarts, duplicate delivery, partial uploads, and interrupted imports.
+The scalar lifecycle suite executes user-level workflows through the public
+Python and HTTP boundaries and compares their observable sequences, steps,
+metric keys, config, summary, and terminal state with checked-in golden data.
+It covers online logging, offline restart, durable batch replay after a lost
+response, authoritative remote resume positions, repeated offline sync,
+idempotent finish, and recovery when a finish response is lost after commit.
+The fixture is versioned at
+`python/tests/contracts/fixtures/scalar_lifecycle.json`.
+
+Future feature groups will add equivalent reference-implementation scenarios,
+normalizing nondeterministic identifiers before comparison. A compatible row
+above applies only to its documented required behavior; it does not imply rich
+values, artifacts, sweeps, reports, or the complete W&B API.
 
 Unsupported arguments must fail or warn explicitly. Runloom will not silently
 accept inert compatibility flags.

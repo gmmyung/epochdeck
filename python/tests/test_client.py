@@ -65,3 +65,15 @@ def test_document_updates_use_explicit_patch_contracts() -> None:
     assert requests[1].method == "PATCH"
     assert requests[1].url.path == "/api/v1/runs/run-id/summary"
     assert requests[1].read() == b'{"updates":{"status":"complete"}}'
+
+
+def test_get_run_uses_the_public_lifecycle_endpoint() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/v1/runs/run-id"
+        return httpx.Response(200, json={"id": "run-id", "state": "finished"})
+
+    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+        run = client.get_run("run-id")
+
+    assert run == {"id": "run-id", "state": "finished"}

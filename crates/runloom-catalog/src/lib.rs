@@ -546,7 +546,19 @@ impl Catalog {
         summary_values: &BTreeMap<String, Value>,
     ) -> Result<RunRecord, CatalogError> {
         let mut transaction = self.pool.begin().await?;
-        load_required_run(&mut transaction, run_id).await?;
+        let existing = load_required_run(&mut transaction, run_id).await?;
+        if existing.state == RunState::Finished {
+            if summary_values
+                .iter()
+                .any(|(key, value)| existing.summary.get(key) != Some(value))
+            {
+                return Err(CatalogError::Conflict(
+                    "a finished run cannot be finished again with a different summary".to_owned(),
+                ));
+            }
+            transaction.commit().await?;
+            return Ok(existing);
+        }
         merge_summary_document(&mut transaction, run_id, summary_values).await?;
         query("UPDATE runs SET state = 'finished', updated_at = current_timestamp WHERE id = ?")
             .bind(run_id.to_string())
@@ -588,6 +600,20 @@ impl Catalog {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(segment_from_row).collect()
+    }
+
+    pub async fn last_segment(&self, run_id: RunId) -> Result<Option<SegmentRecord>, CatalogError> {
+        self.get_run(run_id).await?;
+        query(
+            "SELECT id, signature, relative_path, first_sequence, last_sequence, row_count, byte_size \
+             FROM metric_segments WHERE run_id = ? \
+             ORDER BY last_sequence DESC, id DESC LIMIT 1",
+        )
+        .bind(run_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .map(segment_from_row)
+        .transpose()
     }
 
     pub async fn next_compaction_candidate(
@@ -1180,6 +1206,20 @@ mod tests {
         assert_eq!(finished.summary["status"], "complete");
         assert_eq!(finished.summary["tags"], serde_json::json!(["fast", null]));
         assert!(finished.finished_at.is_some());
+        let repeated = catalog
+            .finish_run(
+                created.id,
+                &BTreeMap::from([("status".to_owned(), "complete".into())]),
+            )
+            .await?;
+        assert_eq!(repeated, finished);
+        let changed_finish = catalog
+            .finish_run(
+                created.id,
+                &BTreeMap::from([("status".to_owned(), "changed".into())]),
+            )
+            .await;
+        assert!(matches!(changed_finish, Err(CatalogError::Conflict(_))));
         let late_update = catalog
             .update_summary(
                 created.id,

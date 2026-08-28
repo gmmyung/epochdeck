@@ -86,7 +86,12 @@ run.finish(summary={"tags": ["baseline", "mujoco"]})
 ```
 
 `log` fsyncs to a local journal and returns without waiting for HTTP. A bounded
-background worker uploads batches, and acknowledged batches are replay-safe.
+background worker uploads batches, persists each in-flight byte range, and only
+advances its acknowledgement after a successful response. Restarts therefore
+replay the exact same batch, while the server accepts identical duplicates.
+Resume restores the local config and summary and obtains the next sequence and
+step from the server. Finish is idempotent and recoverable when its response is
+lost after the server commits it.
 Use `mode="offline"`, then upload later with:
 
 ```bash

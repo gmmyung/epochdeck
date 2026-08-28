@@ -13,9 +13,13 @@ The pre-alpha API is versioned under `/api/v1`. Request bodies are capped at
 - `POST /runs/{run_id}/finish` atomically marks a run finished.
 
 Create bodies accept `id`, `name`, `config`, and `resume`. Resume is one of
-`never`, `allow`, or `must`. Config and summary documents accept JSON scalars,
-arrays, and objects up to 256 KiB after merging. Mutation is shallow by top-level
-key. A finished run cannot accept new metrics or document updates.
+`never`, `allow`, or `must`. Create responses include `next_sequence` and
+`next_step`; clients must use these authoritative positions when appending to a
+resumed run. Config and summary documents accept JSON scalars, arrays, and
+objects up to 256 KiB after merging. Mutation is shallow by top-level key. A
+finished run cannot accept new metrics or document updates. Repeating finish
+with the same summary is idempotent; trying to change a finished summary returns
+a conflict.
 
 ## Metrics
 

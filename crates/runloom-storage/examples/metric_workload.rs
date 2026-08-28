@@ -98,6 +98,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         5_000,
     )?;
     let query_elapsed = query_started.elapsed();
+    let resume_started = Instant::now();
+    let latest_segment = segments
+        .last()
+        .ok_or("benchmark produced no metric segments")?;
+    let tail = store.read_segment_tail(&latest_segment.relative_path)?;
+    let resume_elapsed = resume_started.elapsed();
+    if tail.sequence != rows as u64 || tail.step != rows as u64 - 1 {
+        return Err("resume tail did not match the final metric point".into());
+    }
 
     println!(
         "rows={rows} metrics={metric_count} segments_before={} segments_after={}",
@@ -119,6 +128,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         query_elapsed.as_secs_f64(),
         history.source_points.unwrap_or_default(),
         history.sequence.len()
+    );
+    println!(
+        "resume_tail_seconds={:.3} sequence={} step={}",
+        resume_elapsed.as_secs_f64(),
+        tail.sequence,
+        tail.step
     );
     Ok(())
 }

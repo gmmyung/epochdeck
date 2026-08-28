@@ -72,6 +72,9 @@ class RunloomClient:
     def ingest_batch(self, run_id: str, batch: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", f"/api/v1/runs/{run_id}/batches", json=batch)
 
+    def get_run(self, run_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/runs/{run_id}")
+
     def update_config(
         self,
         run_id: str,

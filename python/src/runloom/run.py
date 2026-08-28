@@ -11,7 +11,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
-from runloom.client import RunloomClient
+from runloom.client import RunloomApiError, RunloomClient
 
 Mode = Literal["online", "offline", "disabled"]
 Resume = Literal["never", "allow", "must"]
@@ -20,6 +20,7 @@ _DEFAULT_BATCH_SIZE = 64
 _DEFAULT_FLUSH_INTERVAL = 0.25
 _DEFAULT_FINISH_TIMEOUT = 30.0
 _MAX_DOCUMENT_BYTES = 256 * 1024
+_SPOOL_FORMAT_VERSION = 1
 
 
 class DeliveryError(RuntimeError):
@@ -124,8 +125,15 @@ class _Spool:
         self.events_path = self.directory / "events.jsonl"
         self.ack_path = self.directory / "ack"
         self.metadata_path = self.directory / "run.json"
+        self.delivery_path = self.directory / "delivery.json"
         self._lock = threading.Lock()
         self.events_path.touch(exist_ok=True)
+
+    def read_metadata(self) -> dict[str, Any] | None:
+        with self._lock:
+            if not self.metadata_path.exists():
+                return None
+            return self._read_json_object(self.metadata_path, "run metadata")
 
     def write_metadata(self, metadata: dict[str, Any]) -> None:
         with self._lock:
@@ -133,7 +141,7 @@ class _Spool:
 
     def update_metadata(self, updates: Mapping[str, Any]) -> None:
         with self._lock:
-            metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            metadata = self._read_json_object(self.metadata_path, "run metadata")
             metadata.update(deepcopy(dict(updates)))
             _atomic_json_write(self.metadata_path, metadata)
 
@@ -148,20 +156,49 @@ class _Spool:
     def read_batch(self, limit: int) -> tuple[list[dict[str, Any]], int]:
         with self._lock:
             offset = self._read_ack()
+            size = self.events_path.stat().st_size
+            delivery = self._read_delivery(offset, size)
+            fixed_end = int(delivery["end_offset"]) if delivery is not None else None
             points: list[dict[str, Any]] = []
             with self.events_path.open("rb") as stream:
                 stream.seek(offset)
-                while len(points) < limit:
+                while len(points) < limit or fixed_end is not None:
+                    if fixed_end is not None and stream.tell() >= fixed_end:
+                        break
                     line = stream.readline()
                     if not line:
                         break
-                    points.append(json.loads(line))
+                    if fixed_end is not None and stream.tell() > fixed_end:
+                        raise DeliveryError(
+                            f"delivery boundary splits a journal record: {self.delivery_path}"
+                        )
+                    points.append(self._decode_event(line, stream.tell()))
                 next_offset = stream.tell()
+            if fixed_end is not None and next_offset != fixed_end:
+                raise DeliveryError(f"delivery boundary is outside journal: {self.delivery_path}")
+            if points and delivery is None:
+                delivery = {
+                    "start_offset": offset,
+                    "end_offset": next_offset,
+                    "batch_sequence": int(points[0]["sequence"]),
+                }
+                _atomic_json_write(self.delivery_path, delivery)
+            if points and int(delivery["batch_sequence"]) != int(points[0]["sequence"]):
+                raise DeliveryError(
+                    f"delivery sequence does not match journal: {self.delivery_path}"
+                )
             return points, next_offset
 
     def acknowledge(self, offset: int) -> None:
         with self._lock:
+            if self.delivery_path.exists():
+                delivery = self._read_json_object(self.delivery_path, "delivery state")
+                if int(delivery.get("end_offset", -1)) != offset:
+                    raise DeliveryError(
+                        f"acknowledgement does not match delivery boundary: {self.delivery_path}"
+                    )
             _atomic_text_write(self.ack_path, str(offset))
+            self.delivery_path.unlink(missing_ok=True)
 
     def pending(self) -> bool:
         with self._lock:
@@ -181,7 +218,67 @@ class _Spool:
                 position -= 1
             stream.seek(position)
             line = stream.readline()
-        return json.loads(line) if line.strip() else None
+        return self._decode_event(line, end) if line.strip() else None
+
+    def pending_summary(self) -> dict[str, Any]:
+        with self._lock:
+            offset = self._read_ack()
+            summary: dict[str, Any] = {}
+            known_keys: set[str] = set()
+            with self.events_path.open("rb") as stream:
+                stream.seek(offset)
+                while line := stream.readline():
+                    event = self._decode_event(line, stream.tell())
+                    metrics = event.get("metrics")
+                    if not isinstance(metrics, dict):
+                        raise DeliveryError(
+                            f"journal event has no metric object: {self.events_path}"
+                        )
+                    new_keys = metrics.keys() - known_keys
+                    summary.update(metrics)
+                    if new_keys:
+                        known_keys.update(new_keys)
+                        summary = _normalize_document(summary, "summary")
+            return summary
+
+    def _read_delivery(self, offset: int, size: int) -> dict[str, Any] | None:
+        if not self.delivery_path.exists():
+            return None
+        delivery = self._read_json_object(self.delivery_path, "delivery state")
+        try:
+            start = int(delivery["start_offset"])
+            end = int(delivery["end_offset"])
+            int(delivery["batch_sequence"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise DeliveryError(f"invalid delivery state: {self.delivery_path}") from error
+        if end <= offset:
+            self.delivery_path.unlink(missing_ok=True)
+            return None
+        if start != offset or end <= start or end > size:
+            raise DeliveryError(f"delivery state is outside journal: {self.delivery_path}")
+        return delivery
+
+    def _read_json_object(self, path: Path, name: str) -> dict[str, Any]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise DeliveryError(f"invalid {name}: {path}") from error
+        if not isinstance(value, dict):
+            raise DeliveryError(f"invalid {name}: {path}")
+        return value
+
+    def _decode_event(self, line: bytes, offset: int) -> dict[str, Any]:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise DeliveryError(
+                f"invalid journal event ending at byte {offset}: {self.events_path}"
+            ) from error
+        if not isinstance(value, dict):
+            raise DeliveryError(
+                f"invalid journal event ending at byte {offset}: {self.events_path}"
+            )
+        return value
 
     def _read_ack(self) -> int:
         if not self.ack_path.exists():
@@ -275,8 +372,7 @@ class Run:
         flush_interval: float = _DEFAULT_FLUSH_INTERVAL,
         transport: Any = None,
     ) -> None:
-        if batch_size < 1 or batch_size > 1_024:
-            raise ValueError("batch_size must be between 1 and 1024")
+        batch_size = _validate_batch_size(batch_size, "batch_size")
         if flush_interval < 0:
             raise ValueError("flush_interval cannot be negative")
         initial_config = _normalize_document(config, "config")
@@ -295,6 +391,7 @@ class Run:
         self._client: RunloomClient | None = None
         self._worker: _DeliveryWorker | None = None
         self._spool: _Spool | None = None
+        self._finish_callback: Callable[[Run], None] | None = None
         self.config = RunConfig(
             initial_config,
             self._document_lock,
@@ -312,19 +409,63 @@ class Run:
             return
 
         self._spool = _Spool(spool_root, run_id)
+        stored_metadata = self._spool.read_metadata()
+        stored_finishing = False
+        if stored_metadata is not None:
+            _validate_spool_identity(stored_metadata, project, run_id)
+            stored_finished = _metadata_flag(stored_metadata, "finished")
+            stored_finishing = _metadata_flag(stored_metadata, "finishing")
+            if resume == "never":
+                raise DeliveryError(
+                    "run spool already exists; use resume='allow' or 'must': "
+                    f"{self._spool.directory}"
+                )
+            if stored_finished:
+                raise DeliveryError(
+                    f"finished run spool cannot be resumed: {self._spool.directory}"
+                )
+            stored_config = _normalize_document(stored_metadata.get("config", {}), "config")
+            if initial_config and initial_config != stored_config:
+                raise DeliveryError(
+                    "resume config differs from the durable spool; resume first, then use "
+                    "run.config.update(..., allow_val_change=True)"
+                )
+            self.config._replace(stored_config)
+            self.summary._replace(
+                _normalize_document(stored_metadata.get("summary", {}), "summary")
+            )
+            stored_name = stored_metadata.get("name")
+            if stored_name is not None and not isinstance(stored_name, str):
+                raise DeliveryError("stored run name must be a string or null")
+            self.name = stored_name if stored_name is not None else name
+            self._batch_size = _validate_batch_size(
+                stored_metadata.get("batch_size", batch_size),
+                "stored batch_size",
+            )
+        elif mode == "offline" and resume == "must":
+            raise DeliveryError(
+                f"resume='must' requires an existing spool: {self._spool.directory}"
+            )
+
         last_point = self._spool.last_point()
         self._next_sequence = int(last_point["sequence"]) + 1 if last_point else 1
         self._next_step = int(last_point["step"]) + 1 if last_point else 0
+        pending_summary = self._spool.pending_summary()
+        self.summary._replace(
+            _normalize_document({**self.summary.to_dict(), **pending_summary}, "summary")
+        )
         metadata = {
+            "format_version": _SPOOL_FORMAT_VERSION,
             "project": project,
             "id": run_id,
-            "name": name,
+            "name": self.name,
             "config": self.config.to_dict(),
             "summary": self.summary.to_dict(),
             "resume": resume,
             "server_url": server_url,
-            "batch_size": batch_size,
+            "batch_size": self._batch_size,
             "finished": False,
+            "finishing": stored_finishing,
         }
         self._spool.write_metadata(metadata)
 
@@ -336,38 +477,87 @@ class Run:
             response = self._client.create_run(
                 project=project,
                 run_id=run_id,
-                name=name,
+                name=self.name,
                 config=self.config.to_dict(),
                 resume=resume,
             )
+        except RunloomApiError as error:
+            try:
+                if (
+                    stored_metadata is not None
+                    and stored_finishing
+                    and error.status_code == 409
+                    and not self._spool.pending()
+                ):
+                    existing = self._client.get_run(run_id)
+                    actual_summary = _normalize_document(existing.get("summary", {}), "summary")
+                    expected_summary = self.summary.to_dict()
+                    if existing.get("state") == "finished" and all(
+                        actual_summary.get(key) == value for key, value in expected_summary.items()
+                    ):
+                        self.name = str(existing["name"])
+                        self.config._replace(
+                            _normalize_document(existing.get("config", {}), "config")
+                        )
+                        self.summary._replace(actual_summary)
+                        self._spool.update_metadata(
+                            {
+                                "name": self.name,
+                                "config": self.config.to_dict(),
+                                "summary": actual_summary,
+                                "finished": True,
+                                "finishing": False,
+                            }
+                        )
+                        self._finished = True
+                        return
+            finally:
+                self._client.close()
+            raise
         except Exception:
             self._client.close()
             raise
-        server_run = response["run"]
-        self.name = str(server_run["name"])
-        self.config._replace(
-            _normalize_document(server_run.get("config", self.config.to_dict()), "config")
-        )
-        self.summary._replace(
-            _normalize_document(server_run.get("summary", self.summary.to_dict()), "summary")
-        )
-        self._spool.update_metadata(
-            {
-                "name": self.name,
-                "config": self.config.to_dict(),
-                "summary": self.summary.to_dict(),
-            }
-        )
-        self._worker = _DeliveryWorker(
-            client=self._client,
-            run_id=run_id,
-            spool=self._spool,
-            batch_size=batch_size,
-            flush_interval=flush_interval,
-        )
-        self._worker.start()
-        if self._spool.pending():
-            self._worker.notify()
+        try:
+            server_run = response["run"]
+            self.name = str(server_run["name"])
+            self.config._replace(
+                _normalize_document(server_run.get("config", self.config.to_dict()), "config")
+            )
+            server_summary = _normalize_document(
+                server_run.get("summary", {}),
+                "summary",
+            )
+            self.summary._replace(
+                _normalize_document(
+                    {**server_summary, **self.summary.to_dict(), **pending_summary},
+                    "summary",
+                )
+            )
+            server_next_sequence = _response_position(response, "next_sequence", minimum=1)
+            server_next_step = _response_position(response, "next_step", minimum=0)
+            self._next_sequence = max(self._next_sequence, server_next_sequence)
+            self._next_step = max(self._next_step, server_next_step)
+            self._spool.update_metadata(
+                {
+                    "name": self.name,
+                    "config": self.config.to_dict(),
+                    "summary": self.summary.to_dict(),
+                    "finishing": False,
+                }
+            )
+            self._worker = _DeliveryWorker(
+                client=self._client,
+                run_id=run_id,
+                spool=self._spool,
+                batch_size=self._batch_size,
+                flush_interval=flush_interval,
+            )
+            self._worker.start()
+            if self._spool.pending():
+                self._worker.notify()
+        except Exception:
+            self._client.close()
+            raise
 
     def __enter__(self) -> Run:
         return self
@@ -378,6 +568,17 @@ class Run:
     @property
     def finished(self) -> bool:
         return self._finished
+
+    def _set_finish_callback(self, callback: Callable[[Run], None]) -> None:
+        self._finish_callback = callback
+
+    def _complete(self) -> None:
+        self._finished = True
+        self._finishing = False
+        callback = self._finish_callback
+        self._finish_callback = None
+        if callback is not None:
+            callback(self)
 
     def _update_config(self, updates: dict[str, Any], allow_val_change: bool) -> None:
         with self._log_lock:
@@ -474,17 +675,19 @@ class Run:
                 "summary",
             )
             self._finishing = True
+            if self._spool is not None:
+                self._spool.update_metadata({"finishing": True, "summary": final_summary})
         if self.mode == "disabled":
             self.summary._replace(final_summary)
-            self._finished = True
-            self._finishing = False
+            self._complete()
             return
         assert self._spool is not None
         if self.mode == "offline":
             self.summary._replace(final_summary)
-            self._spool.update_metadata({"finished": True, "summary": final_summary})
-            self._finished = True
-            self._finishing = False
+            self._spool.update_metadata(
+                {"finished": True, "finishing": False, "summary": final_summary}
+            )
+            self._complete()
             return
 
         assert self._worker is not None
@@ -503,10 +706,11 @@ class Run:
             "summary",
         )
         self.summary._replace(authoritative_summary)
-        self._spool.update_metadata({"finished": True, "summary": authoritative_summary})
+        self._spool.update_metadata(
+            {"finished": True, "finishing": False, "summary": authoritative_summary}
+        )
         self._client.close()
-        self._finished = True
-        self._finishing = False
+        self._complete()
 
 
 def create_run(
@@ -529,6 +733,8 @@ def create_run(
         raise ValueError("resume must be 'never', 'allow', or 'must'")
     if resume == "must" and run_id is None:
         raise ValueError("resume='must' requires an explicit run_id")
+    if mode == "disabled" and resume != "never":
+        raise ValueError("disabled mode does not support resume policies")
     selected_id = run_id or str(uuid.uuid4())
     selected_spool_root = Path(
         spool_root
@@ -558,29 +764,53 @@ def sync_spool(
     transport: Any = None,
 ) -> str:
     spool_directory = Path(directory)
+    if timeout <= 0:
+        raise ValueError("sync timeout must be positive")
     metadata_path = spool_directory / "run.json"
     if not metadata_path.is_file():
         raise DeliveryError(f"offline run metadata was not found: {metadata_path}")
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    run_id = str(metadata["id"])
-    if spool_directory.name != run_id:
-        raise DeliveryError("spool directory name does not match its run ID")
-    selected_server = server_url or str(metadata["server_url"])
+    spool = _Spool(spool_directory.parent, spool_directory.name)
+    metadata = spool.read_metadata()
+    if metadata is None:
+        raise DeliveryError(f"offline run metadata was not found: {spool.metadata_path}")
+    run_id = spool_directory.name
+    project = metadata.get("project")
+    if not isinstance(project, str) or not project:
+        raise DeliveryError("run spool metadata has no valid project")
+    _validate_spool_identity(metadata, project, run_id)
+    finished = _metadata_flag(metadata, "finished")
+    selected_server = server_url if server_url is not None else metadata.get("server_url")
+    if not isinstance(selected_server, str) or not selected_server:
+        raise DeliveryError("run spool metadata has no valid server URL")
     client = RunloomClient(selected_server, transport=transport)
-    spool = _Spool(spool_directory.parent, run_id)
     try:
-        client.create_run(
-            project=str(metadata["project"]),
-            run_id=run_id,
-            name=metadata.get("name"),
-            config=_normalize_document(metadata.get("config", {}), "config"),
-            resume="allow",
-        )
+        try:
+            client.create_run(
+                project=project,
+                run_id=run_id,
+                name=metadata.get("name"),
+                config=_normalize_document(metadata.get("config", {}), "config"),
+                resume="allow",
+            )
+        except RunloomApiError as error:
+            if error.status_code != 409 or not finished:
+                raise
+            existing = client.get_run(run_id)
+            expected_summary = _normalize_document(metadata.get("summary", {}), "summary")
+            actual_summary = _normalize_document(existing.get("summary", {}), "summary")
+            if existing.get("state") != "finished" or any(
+                actual_summary.get(key) != value for key, value in expected_summary.items()
+            ):
+                raise
+            return run_id
         worker = _DeliveryWorker(
             client=client,
             run_id=run_id,
             spool=spool,
-            batch_size=int(metadata.get("batch_size", _DEFAULT_BATCH_SIZE)),
+            batch_size=_validate_batch_size(
+                metadata.get("batch_size", _DEFAULT_BATCH_SIZE),
+                "stored batch_size",
+            ),
             flush_interval=0,
         )
         worker.start()
@@ -593,14 +823,63 @@ def sync_spool(
             if worker.last_error is not None:
                 message = f"{message}: {worker.last_error}"
             raise DeliveryError(message)
-        if bool(metadata.get("finished")):
+        if finished:
             client.finish_run(
                 run_id,
                 _normalize_document(metadata.get("summary", {}), "summary"),
             )
+        else:
+            summary = _normalize_document(metadata.get("summary", {}), "summary")
+            if summary:
+                client.update_summary(run_id, summary)
     finally:
         client.close()
     return run_id
+
+
+def _validate_spool_identity(metadata: Mapping[str, Any], project: str, run_id: str) -> None:
+    format_version = metadata.get("format_version", _SPOOL_FORMAT_VERSION)
+    stored_project = metadata.get("project")
+    stored_id = metadata.get("id")
+    if (
+        isinstance(format_version, bool)
+        or not isinstance(format_version, int)
+        or not isinstance(stored_project, str)
+        or not stored_project
+        or not isinstance(stored_id, str)
+        or not stored_id
+    ):
+        raise DeliveryError("run spool metadata is missing its identity")
+    if format_version != _SPOOL_FORMAT_VERSION:
+        raise DeliveryError(
+            f"unsupported spool format version {format_version}; expected {_SPOOL_FORMAT_VERSION}"
+        )
+    if stored_project != project or stored_id != run_id:
+        raise DeliveryError("run spool identity does not match the requested project and run ID")
+
+
+def _metadata_flag(metadata: Mapping[str, Any], name: str) -> bool:
+    value = metadata.get(name, False)
+    if not isinstance(value, bool):
+        raise DeliveryError(f"run spool metadata field '{name}' must be boolean")
+    return value
+
+
+def _validate_batch_size(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer between 1 and 1024")
+    if value < 1 or value > 1_024:
+        raise ValueError(f"{name} must be between 1 and 1024")
+    return value
+
+
+def _response_position(response: Mapping[str, Any], name: str, *, minimum: int) -> int:
+    value = response.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise DeliveryError(
+            f"server create response has no valid {name}; server and SDK versions may differ"
+        )
+    return value
 
 
 def _flatten_metrics(data: Mapping[str, Any], prefix: str = "") -> dict[str, float]:

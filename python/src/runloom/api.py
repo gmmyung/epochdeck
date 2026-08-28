@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from collections.abc import Mapping
 from pathlib import Path
@@ -32,7 +33,7 @@ def init(
                 "a Runloom run is already active; finish it before calling init again"
             )
         spool_root = Path(dir) / ".runloom" / "spool" if dir is not None else None
-        _current_run = create_run(
+        new_run = create_run(
             project=project,
             name=name,
             run_id=id,
@@ -42,7 +43,10 @@ def init(
             server_url=server_url or os.environ.get("RUNLOOM_SERVER_URL", "http://127.0.0.1:8787"),
             spool_root=spool_root,
         )
-        return _current_run
+        new_run._set_finish_callback(_clear_current_run)
+        _current_run = None if new_run.finished else new_run
+        _publish_current_run(_current_run)
+        return new_run
 
 
 def log(data: Mapping[str, Any], *, step: int | None = None) -> None:
@@ -53,20 +57,36 @@ def log(data: Mapping[str, Any], *, step: int | None = None) -> None:
 
 def finish(*, summary: Mapping[str, Any] | None = None, timeout: float = 30.0) -> None:
     """Flush and finish the active run."""
-    global _current_run
-
     run = _require_current_run()
     run.finish(summary=summary, timeout=timeout)
+
+
+def _clear_current_run(run: Run) -> None:
+    global _current_run
+
     with _current_run_lock:
         if _current_run is run:
             _current_run = None
+            _publish_current_run(None)
+
+
+def current_run() -> Run | None:
+    """Return the active run without creating compatibility state."""
+    with _current_run_lock:
+        return _current_run
 
 
 def _require_current_run() -> Run:
-    with _current_run_lock:
-        if _current_run is None:
-            raise RuntimeError("no active Runloom run; call runloom.init first")
-        return _current_run
+    run = current_run()
+    if run is None:
+        raise RuntimeError("no active Runloom run; call runloom.init first")
+    return run
+
+
+def _publish_current_run(run: Run | None) -> None:
+    package = sys.modules.get("runloom")
+    if package is not None:
+        package.__dict__["run"] = run
 
 
 def _normalize_resume(value: bool | str | None) -> Resume:

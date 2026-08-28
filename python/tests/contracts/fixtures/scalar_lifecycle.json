@@ -1,0 +1,28 @@
+{
+  "contract": "wandb-compatible-scalar-lifecycle-v1",
+  "online": {
+    "sequence": [1, 2, 3],
+    "step": [0, 7, 8],
+    "metric_keys": ["flag", "reward", "train/loss"],
+    "summary": {
+      "flag": 1.0,
+      "result": "complete",
+      "reward": 3.0,
+      "tags": ["baseline", null],
+      "train/loss": 1.0
+    }
+  },
+  "offline_restart": {
+    "sequence": [1, 2],
+    "step": [5, 6],
+    "summary": {
+      "loss": 1.0,
+      "reward": 4.0,
+      "status": "recovered"
+    }
+  },
+  "remote_resume": {
+    "sequence": 9,
+    "step": 43
+  }
+}

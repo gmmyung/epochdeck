@@ -11,7 +11,9 @@ use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, UInt64
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
+};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use runloom_protocol::{HistoryResponse, IngestBatchRequest, ProjectId, RunId};
@@ -136,6 +138,12 @@ pub struct WrittenSegment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentSource {
     pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentTail {
+    pub sequence: u64,
+    pub step: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -488,6 +496,63 @@ impl MetricStore {
             MinMaxHistorySampler::new(run_id, keys, first_sequence, last_sequence, max_points)?;
         sampler.read_segments(self, segments)?;
         Ok(sampler.finish())
+    }
+
+    pub fn read_segment_tail(&self, relative_path: &str) -> Result<SegmentTail, StorageError> {
+        let path = self.resolve_segment(relative_path)?;
+        let file = File::open(&path).map_err(|source| StorageError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let row_group_index = builder
+            .metadata()
+            .num_row_groups()
+            .checked_sub(1)
+            .ok_or_else(|| StorageError::InvalidSegment("metric segment is empty".to_owned()))?;
+        let row_count = usize::try_from(builder.metadata().row_group(row_group_index).num_rows())
+            .map_err(|_| {
+            StorageError::InvalidSegment("metric row group is too large".to_owned())
+        })?;
+        if row_count == 0 {
+            return Err(StorageError::InvalidSegment(
+                "metric segment has an empty final row group".to_owned(),
+            ));
+        }
+        let schema = builder.schema();
+        let projection = ProjectionMask::roots(
+            builder.parquet_schema(),
+            vec![
+                schema.index_of(SEQUENCE_COLUMN)?,
+                schema.index_of(STEP_COLUMN)?,
+            ],
+        );
+        let mut selectors = Vec::with_capacity(2);
+        if row_count > 1 {
+            selectors.push(RowSelector::skip(row_count - 1));
+        }
+        selectors.push(RowSelector::select(1));
+        let mut reader = builder
+            .with_projection(projection)
+            .with_row_groups(vec![row_group_index])
+            .with_row_selection(RowSelection::from(selectors))
+            .with_batch_size(1)
+            .build()?;
+        let batch = reader
+            .next()
+            .transpose()?
+            .ok_or_else(|| StorageError::InvalidSegment("metric segment is empty".to_owned()))?;
+        if batch.num_rows() != 1 {
+            return Err(StorageError::InvalidSegment(
+                "metric tail selection did not return one row".to_owned(),
+            ));
+        }
+        let sequence = required_array::<UInt64Array>(&batch, SEQUENCE_COLUMN)?;
+        let step = required_array::<UInt64Array>(&batch, STEP_COLUMN)?;
+        Ok(SegmentTail {
+            sequence: sequence.value(0),
+            step: step.value(0),
+        })
     }
 
     pub fn compact_segments(
@@ -1175,6 +1240,13 @@ mod tests {
         assert_eq!(compacted.last_sequence, 6);
         assert_eq!(compacted.row_count, 6);
         assert_eq!(replayed, compacted);
+        assert_eq!(
+            store.read_segment_tail(&compacted.relative_path)?,
+            super::SegmentTail {
+                sequence: 6,
+                step: 5
+            }
+        );
         assert_eq!(history.sequence, vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(page.sequence, vec![4, 5]);
         assert_eq!(page.next_after, Some(5));
@@ -1188,6 +1260,64 @@ mod tests {
                 Some(5.0),
                 Some(6.0)
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_the_tail_from_the_final_parquet_row_group() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let store = MetricStore::new(directory.path());
+        let project_id = ProjectId::new();
+        let run_id = RunId::new();
+        let mut written = Vec::new();
+        for batch_sequence in 0..9_u64 {
+            let first_sequence = batch_sequence * 1_024 + 1;
+            let request = IngestBatchRequest {
+                batch_sequence,
+                points: (0..1_024)
+                    .map(|offset| {
+                        let sequence = first_sequence + offset;
+                        MetricPoint {
+                            sequence,
+                            step: sequence * 2,
+                            timestamp_ms: sequence as i64,
+                            metrics: BTreeMap::from([("loss".to_owned(), sequence as f64)]),
+                        }
+                    })
+                    .collect(),
+            };
+            written.push(store.write_batch(
+                project_id,
+                run_id,
+                &format!("{batch_sequence:064x}"),
+                &request,
+            )?);
+        }
+        let sources = written
+            .iter()
+            .map(|segment| CompactionSource {
+                relative_path: segment.relative_path.clone(),
+                first_sequence: segment.first_sequence,
+                last_sequence: segment.last_sequence,
+                row_count: segment.row_count,
+            })
+            .collect::<Vec<_>>();
+        let compacted = store.compact_segments(
+            project_id,
+            run_id,
+            &written[0].signature,
+            &sources,
+            &AtomicBool::new(false),
+        )?;
+
+        assert_eq!(compacted.row_count, 9_216);
+        assert_eq!(
+            store.read_segment_tail(&compacted.relative_path)?,
+            super::SegmentTail {
+                sequence: 9_216,
+                step: 18_432,
+            }
         );
         Ok(())
     }

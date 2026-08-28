@@ -25,7 +25,7 @@ not a reduction in the final parity goal.
 - [x] Workload-shaped storage benchmark harness.
 - [x] Config mutation and non-numeric summary semantics.
 - [x] Background compaction.
-- [ ] Full W&B lifecycle contract suite.
+- [x] Full W&B lifecycle contract suite for the supported scalar surface.
 
 ## Milestone 2: dashboard and monitoring
 
