@@ -109,6 +109,31 @@ export type TraceSpan = {
   created_at: string;
 };
 
+export type ReportPanel = {
+  id: string;
+  title: string;
+  kind: "metric" | "markdown";
+  run_id: string | null;
+  metric_keys: string[];
+  markdown: string | null;
+  width: number;
+  height: number;
+};
+
+export type Report = {
+  id: string;
+  project_id: string;
+  project: string;
+  name: string;
+  description: string | null;
+  layout: {
+    columns: number;
+    panels: ReportPanel[];
+  };
+  created_at: string;
+  updated_at: string;
+};
+
 export function getHealth(signal?: AbortSignal): Promise<Health> {
   return getJson<Health>("/api/v1/health", signal);
 }
@@ -124,6 +149,14 @@ export async function getRuns(project: string, signal?: AbortSignal): Promise<Ru
     signal,
   );
   return result.runs;
+}
+
+export async function getReports(project: string, signal?: AbortSignal): Promise<Report[]> {
+  const result = await getJson<{ reports: Report[] }>(
+    `/api/v1/projects/${encodeURIComponent(project)}/reports?limit=100`,
+    signal,
+  );
+  return result.reports;
 }
 
 export function getRun(runId: string, signal?: AbortSignal): Promise<Run> {

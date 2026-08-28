@@ -105,3 +105,69 @@ def test_public_api_rejects_inert_filter_and_order_options(monkeypatch) -> None:
             api.runs(order="name")
     finally:
         api.close()
+
+
+def test_public_api_manages_persisted_reports(monkeypatch) -> None:
+    requests: list[httpx.Request] = []
+    layout = {
+        "columns": 2,
+        "panels": [
+            {
+                "id": "loss",
+                "title": "Loss",
+                "kind": "metric",
+                "run_id": "run-1",
+                "metric_keys": ["train/loss"],
+                "markdown": None,
+                "width": 1,
+                "height": 360,
+            }
+        ],
+    }
+
+    def report_record(name: str) -> dict:
+        return {
+            "id": "report-1",
+            "project": "robotics",
+            "name": name,
+            "description": None,
+            "layout": layout,
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(
+                201, json={"report": report_record("Overview"), "duplicate": False}
+            )
+        if request.method == "GET" and request.url.path.endswith("/reports"):
+            return httpx.Response(200, json={"reports": [report_record("Overview")]})
+        if request.method == "PUT":
+            return httpx.Response(200, json=report_record("Updated"))
+        if request.method == "DELETE":
+            return httpx.Response(200, json=report_record("Updated"))
+        return httpx.Response(200, json=report_record("Overview"))
+
+    original_client = httpx.Client
+
+    def client_with_mock_transport(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client_with_mock_transport)
+
+    with Api(server_url="http://runloom.test") as api:
+        created = api.create_report("robotics", name="Overview", layout=layout, id="report-1")
+        listed = api.reports("robotics", per_page=20)
+        loaded = api.report("report-1")
+        updated = api.update_report("report-1", name="Updated", layout=layout)
+        deleted = api.delete_report("report-1")
+
+    assert created["id"] == "report-1"
+    assert listed[0]["name"] == "Overview"
+    assert loaded["project"] == "robotics"
+    assert updated["name"] == "Updated"
+    assert deleted["id"] == "report-1"
+    assert json.loads(requests[0].content)["id"] == "report-1"
+    assert dict(requests[1].url.params) == {"limit": "20"}
+    assert [request.method for request in requests] == ["POST", "GET", "GET", "PUT", "DELETE"]

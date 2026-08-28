@@ -7,12 +7,13 @@ use std::str::FromStr;
 use runloom_protocol::{
     AlertId, AlertLevel, AlertRecord, ArtifactEntry, ArtifactId, ArtifactRecord, ArtifactRelation,
     BlobRef, CompleteSweepTrialRequest, CreateAlertRequest, CreateArtifactRequest,
-    CreateRichValueRequest, CreateRunRequest, CreateSweepRequest, CreateTraceSpanRequest,
-    EarlyTerminateConfig, MAX_CONFIG_BYTES, MAX_SUMMARY_BYTES, MetricGoal, ProjectId,
-    ProjectSummary, ResumePolicy, RichValueId, RichValueKind, RichValueRecord, RunArtifactRecord,
-    RunId, RunQueryRequest, RunRecord, RunState, SweepId, SweepMethod, SweepMetric, SweepParameter,
-    SweepRecord, SweepState, SweepTrialId, SweepTrialRecord, SweepTrialState, TraceKind,
-    TraceSpanId, TraceSpanRecord, TraceStatus,
+    CreateReportRequest, CreateRichValueRequest, CreateRunRequest, CreateSweepRequest,
+    CreateTraceSpanRequest, EarlyTerminateConfig, MAX_CONFIG_BYTES, MAX_SUMMARY_BYTES, MetricGoal,
+    ProjectId, ProjectSummary, ReportId, ReportLayout, ReportRecord, ResumePolicy, RichValueId,
+    RichValueKind, RichValueRecord, RunArtifactRecord, RunId, RunQueryRequest, RunRecord, RunState,
+    SweepId, SweepMethod, SweepMetric, SweepParameter, SweepRecord, SweepState, SweepTrialId,
+    SweepTrialRecord, SweepTrialState, TraceKind, TraceSpanId, TraceSpanRecord, TraceStatus,
+    UpdateReportRequest,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -223,6 +224,19 @@ CREATE TABLE IF NOT EXISTS sweep_trials (
 
 CREATE INDEX IF NOT EXISTS idx_sweep_trials_sweep_id
     ON sweep_trials(sweep_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS reports (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    description TEXT,
+    layout_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reports_project_id
+    ON reports(project_id, id DESC);
 "#;
 
 #[derive(Debug, Error)]
@@ -779,6 +793,108 @@ impl Catalog {
                 .await?;
         }
         Ok(stop)
+    }
+
+    pub async fn create_report(
+        &self,
+        project_name: &str,
+        request: &CreateReportRequest,
+    ) -> Result<(ReportRecord, bool), CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        let project_id = ensure_project(&mut transaction, project_name).await?;
+        let report_id = request.id.unwrap_or_default();
+        if let Some(existing) = load_report(&mut transaction, report_id).await? {
+            let matches = existing.project_id == project_id
+                && existing.name == request.name
+                && existing.description == request.description
+                && existing.layout == request.layout;
+            if !matches {
+                return Err(CatalogError::Conflict(
+                    "report ID was reused with different contents".to_owned(),
+                ));
+            }
+            transaction.commit().await?;
+            return Ok((existing, true));
+        }
+        validate_report_runs(&mut transaction, project_id, &request.layout).await?;
+        let layout_json = serde_json::to_string(&request.layout)
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        query(
+            "INSERT INTO reports \
+             (id, project_id, name, description, layout_json, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, current_timestamp, current_timestamp)",
+        )
+        .bind(report_id.to_string())
+        .bind(project_id.to_string())
+        .bind(&request.name)
+        .bind(&request.description)
+        .bind(layout_json)
+        .execute(&mut *transaction)
+        .await?;
+        let report = load_required_report(&mut transaction, report_id).await?;
+        transaction.commit().await?;
+        Ok((report, false))
+    }
+
+    pub async fn get_report(&self, report_id: ReportId) -> Result<ReportRecord, CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        let report = load_required_report(&mut transaction, report_id).await?;
+        transaction.commit().await?;
+        Ok(report)
+    }
+
+    pub async fn list_reports(
+        &self,
+        project_name: &str,
+        limit: usize,
+    ) -> Result<Vec<ReportRecord>, CatalogError> {
+        let rows = query(
+            "SELECT r.id, r.project_id, p.name AS project, r.name, r.description, r.layout_json, \
+                    r.created_at, r.updated_at FROM reports r \
+             JOIN projects p ON p.id = r.project_id WHERE p.name = ? \
+             ORDER BY r.id DESC LIMIT ?",
+        )
+        .bind(project_name)
+        .bind(to_i64(limit as u64, "report list limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(report_from_row).collect()
+    }
+
+    pub async fn update_report(
+        &self,
+        report_id: ReportId,
+        request: &UpdateReportRequest,
+    ) -> Result<ReportRecord, CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        let existing = load_required_report(&mut transaction, report_id).await?;
+        validate_report_runs(&mut transaction, existing.project_id, &request.layout).await?;
+        let layout_json = serde_json::to_string(&request.layout)
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        query(
+            "UPDATE reports SET name = ?, description = ?, layout_json = ?, \
+                    updated_at = current_timestamp WHERE id = ?",
+        )
+        .bind(&request.name)
+        .bind(&request.description)
+        .bind(layout_json)
+        .bind(report_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        let report = load_required_report(&mut transaction, report_id).await?;
+        transaction.commit().await?;
+        Ok(report)
+    }
+
+    pub async fn delete_report(&self, report_id: ReportId) -> Result<ReportRecord, CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        let report = load_required_report(&mut transaction, report_id).await?;
+        query("DELETE FROM reports WHERE id = ?")
+            .bind(report_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(report)
     }
 
     pub async fn metric_keys(&self, run_id: RunId) -> Result<Vec<String>, CatalogError> {
@@ -2327,6 +2443,73 @@ async fn load_sweep(
     .fetch_optional(&mut **transaction)
     .await?;
     row.map(sweep_from_row).transpose()
+}
+
+async fn load_report(
+    transaction: &mut Transaction<'_, Sqlite>,
+    report_id: ReportId,
+) -> Result<Option<ReportRecord>, CatalogError> {
+    let row = query(
+        "SELECT r.id, r.project_id, p.name AS project, r.name, r.description, r.layout_json, \
+                r.created_at, r.updated_at FROM reports r \
+         JOIN projects p ON p.id = r.project_id WHERE r.id = ?",
+    )
+    .bind(report_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.map(report_from_row).transpose()
+}
+
+async fn load_required_report(
+    transaction: &mut Transaction<'_, Sqlite>,
+    report_id: ReportId,
+) -> Result<ReportRecord, CatalogError> {
+    load_report(transaction, report_id)
+        .await?
+        .ok_or_else(|| CatalogError::NotFound {
+            resource: format!("report {report_id}"),
+        })
+}
+
+async fn validate_report_runs(
+    transaction: &mut Transaction<'_, Sqlite>,
+    project_id: ProjectId,
+    layout: &ReportLayout,
+) -> Result<(), CatalogError> {
+    for run_id in layout
+        .panels
+        .iter()
+        .filter_map(|panel| panel.run_id)
+        .collect::<std::collections::HashSet<_>>()
+    {
+        let matches: bool =
+            query("SELECT EXISTS(SELECT 1 FROM runs WHERE id = ? AND project_id = ?)")
+                .bind(run_id.to_string())
+                .bind(project_id.to_string())
+                .fetch_one(&mut **transaction)
+                .await?
+                .get(0);
+        if !matches {
+            return Err(CatalogError::Conflict(format!(
+                "report run {run_id} does not belong to its project"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn report_from_row(row: SqliteRow) -> Result<ReportRecord, CatalogError> {
+    Ok(ReportRecord {
+        id: parse_id(row.get::<String, _>("id"), "report ID")?,
+        project_id: parse_id(row.get::<String, _>("project_id"), "project ID")?,
+        project: row.get("project"),
+        name: row.get("name"),
+        description: row.get("description"),
+        layout: serde_json::from_str(&row.get::<String, _>("layout_json"))
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
 }
 
 async fn load_required_sweep(

@@ -4,6 +4,7 @@
   import type { History } from "./api";
 
   export let metric: string;
+  export let title: string | undefined = undefined;
   export let history: History | undefined;
   export let loading = false;
   export let onvisible: (metric: string) => void;
@@ -125,11 +126,11 @@
   }
 </script>
 
-<article bind:this={card} class="metric-chart-card" aria-label={`${metric} metric panel`}>
+<article bind:this={card} class="metric-chart-card" aria-label={`${title ?? metric} metric panel`}>
   <div class="card-heading">
     <div>
       <small>Metric history</small>
-      <strong>{metric}</strong>
+      <strong>{title ?? metric}</strong>
     </div>
     {#if loading}<span class="loading-label">updating</span>{/if}
   </div>

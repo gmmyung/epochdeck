@@ -6,6 +6,7 @@ import {
   getAlerts,
   getHealth,
   getHistory,
+  getReports,
   getRichValues,
   getRunArtifacts,
   getRun,
@@ -81,6 +82,16 @@ describe("getHealth", () => {
     expect(fetchMock.mock.calls[2][0]).toBe(
       "/api/v1/runs/run-id/history?keys=loss&max_points=1200",
     );
+  });
+
+  it("loads a bounded report collection for an encoded project", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ reports: [] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getReports("robot learning")).resolves.toEqual([]);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/projects/robot%20learning/reports?limit=100");
   });
 
   it("loads one run and encodes a bounded delta cursor", async () => {

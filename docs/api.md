@@ -137,6 +137,25 @@ the median rule. Ingesting the target metric records a bounded observation and
 returns `stop_requested` in the normal batch acknowledgement when the run is
 worse than the eligible peer median.
 
+## Reports
+
+- `POST /projects/{project}/reports` creates an idempotent persisted report.
+- `GET /projects/{project}/reports?limit=100` lists bounded report definitions.
+- `GET /reports/{report_id}` returns one definition.
+- `PUT /reports/{report_id}` replaces its current definition.
+- `DELETE /reports/{report_id}` removes the definition, not its referenced runs.
+
+A report has one to four columns and at most 32 panels. Each panel has a unique
+safe identifier, title, width, and height. Metric panels reference exactly one
+run in the same project and one to eight metric keys. Markdown panels contain a
+bounded document and cannot reference run metrics. The complete serialized
+layout is capped at 256 KiB.
+
+Reports store no metric copies or sampled results. The dashboard lazily requests
+each visible metric from its referenced run with a fixed point budget and at
+most four concurrent chart queries. Report creation validates all referenced
+runs before committing the layout transaction.
+
 ## Discovery
 
 - `GET /projects?limit=100` returns bounded project summaries.

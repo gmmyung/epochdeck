@@ -114,6 +114,33 @@ class RunloomClient:
             params={"limit": limit},
         )
 
+    def create_report(self, project: str, report: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/projects/{quote(project, safe='')}/reports",
+            json=report,
+        )
+
+    def reports(self, project: str, *, limit: int = 100) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/v1/projects/{quote(project, safe='')}/reports",
+            params={"limit": limit},
+        )
+
+    def get_report(self, report_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/reports/{quote(report_id, safe='')}")
+
+    def update_report(self, report_id: str, report: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "PUT",
+            f"/api/v1/reports/{quote(report_id, safe='')}",
+            json=report,
+        )
+
+    def delete_report(self, report_id: str) -> dict[str, Any]:
+        return self._request("DELETE", f"/api/v1/reports/{quote(report_id, safe='')}")
+
     def ingest_batch(self, run_id: str, batch: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", f"/api/v1/runs/{run_id}/batches", json=batch)
 

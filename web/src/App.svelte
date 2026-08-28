@@ -9,6 +9,7 @@
     getHistory,
     getMetricKeys,
     getProjects,
+    getReports,
     getRun,
     getRuns,
     getRichValues,
@@ -19,6 +20,8 @@
     type Health,
     type History,
     type Project,
+    type Report,
+    type ReportPanel,
     type RichValue,
     type Run,
     type RunArtifact,
@@ -32,6 +35,7 @@
   } from "./lib/history-cache";
   import MetricChart from "./lib/MetricChart.svelte";
   import HistogramChart from "./lib/HistogramChart.svelte";
+  import MarkdownPanel from "./lib/MarkdownPanel.svelte";
 
   const MAX_CONCURRENT_CHART_REQUESTS = 4;
   const LIVE_REFRESH_MS = 2_000;
@@ -40,8 +44,10 @@
   let health: Health | null = null;
   let projects: Project[] = [];
   let runs: Run[] = [];
+  let reports: Report[] = [];
   let selectedProject = "";
   let selectedRun: Run | null = null;
+  let selectedReport: Report | null = null;
   let metricKeys: string[] = [];
   let alerts: Alert[] = [];
   let richValues: RichValue[] = [];
@@ -55,6 +61,14 @@
   let visibleMetrics = new Set<string>();
   let pendingMetrics: string[] = [];
   let activeChartRequests = 0;
+  let reportHistories: Record<string, History> = {};
+  let loadingReportMetrics = new Set<string>();
+  let pendingReportMetrics: Array<{
+    identity: string;
+    runId: string;
+    metric: string;
+  }> = [];
+  let activeReportRequests = 0;
   let refreshingRun = false;
   let error: string | null = null;
   let loading = true;
@@ -88,10 +102,16 @@
     projectController = controller;
     selectedProject = name;
     resetRunSelection();
+    runs = [];
+    reports = [];
     error = null;
     try {
-      runs = await getRuns(name, controller.signal);
-      if (runs[0]) await chooseRun(runs[0]);
+      [runs, reports] = await Promise.all([
+        getRuns(name, controller.signal),
+        getReports(name, controller.signal),
+      ]);
+      if (reports[0]) chooseReport(reports[0]);
+      else if (runs[0]) await chooseRun(runs[0]);
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
     }
@@ -101,6 +121,8 @@
     runController?.abort();
     const controller = new AbortController();
     runController = controller;
+    selectedReport = null;
+    resetReportState();
     resetChartState();
     selectedRun = run;
     error = null;
@@ -120,6 +142,7 @@
   function resetRunSelection(): void {
     runController?.abort();
     selectedRun = null;
+    selectedReport = null;
     metricKeys = [];
     alerts = [];
     richValues = [];
@@ -127,6 +150,7 @@
     traces = [];
     traceSearch = "";
     resetChartState();
+    resetReportState();
   }
 
   function resetChartState(): void {
@@ -135,6 +159,72 @@
     loadingMetrics = new Set();
     visibleMetrics = new Set();
     pendingMetrics = [];
+  }
+
+  function resetReportState(): void {
+    reportHistories = {};
+    loadingReportMetrics = new Set();
+    pendingReportMetrics = [];
+  }
+
+  function chooseReport(report: Report): void {
+    runController?.abort();
+    runController = new AbortController();
+    selectedRun = null;
+    selectedReport = report;
+    metricKeys = [];
+    alerts = [];
+    richValues = [];
+    artifacts = [];
+    traces = [];
+    traceSearch = "";
+    resetChartState();
+    resetReportState();
+    error = null;
+  }
+
+  function reportChartVisible(panel: ReportPanel, metric: string): void {
+    const runId = panel.run_id;
+    if (!runId) return;
+    const identity = `${panel.id}:${runId}:${metric}`;
+    if (reportHistories[identity] || loadingReportMetrics.has(identity)) return;
+    if (pendingReportMetrics.some((candidate) => candidate.identity === identity)) return;
+    pendingReportMetrics = [...pendingReportMetrics, { identity, runId, metric }];
+    drainReportMetricQueue();
+  }
+
+  function drainReportMetricQueue(): void {
+    while (
+      activeReportRequests < MAX_CONCURRENT_CHART_REQUESTS &&
+      pendingReportMetrics.length > 0
+    ) {
+      const request = pendingReportMetrics[0];
+      pendingReportMetrics = pendingReportMetrics.slice(1);
+      const report = selectedReport;
+      const controller = runController;
+      if (!report || !controller) continue;
+      activeReportRequests += 1;
+      loadingReportMetrics = new Set([...loadingReportMetrics, request.identity]);
+      void getSampledHistory(request.runId, [request.metric], CHART_POINT_BUDGET, controller.signal)
+        .then((history) => {
+          if (selectedReport?.id !== report.id) return;
+          reportHistories = { ...reportHistories, [request.identity]: history };
+        })
+        .catch((reason) => {
+          if (!controller.signal.aborted) showError(reason);
+        })
+        .finally(() => {
+          activeReportRequests -= 1;
+          const nextLoading = new Set(loadingReportMetrics);
+          nextLoading.delete(request.identity);
+          loadingReportMetrics = nextLoading;
+          drainReportMetricQueue();
+        });
+    }
+  }
+
+  function reportMetricIdentity(panel: ReportPanel, metric: string): string {
+    return `${panel.id}:${panel.run_id ?? ""}:${metric}`;
   }
 
   function chartVisible(metric: string): void {
@@ -366,7 +456,21 @@
             {/each}
           </select>
 
-          <div class="run-list" aria-label="Runs">
+          {#if reports.length > 0}<p class="nav-label">Reports</p>{/if}
+          <div class="run-list" aria-label="Reports" class:hidden={reports.length === 0}>
+            {#each reports as report (report.id)}
+              <button
+                class:active={selectedReport?.id === report.id}
+                onclick={() => chooseReport(report)}
+              >
+                <span>{report.name}</span>
+                <small>{report.layout.panels.length} panels</small>
+              </button>
+            {/each}
+          </div>
+
+          {#if runs.length > 0}<p class="nav-label">Runs</p>{/if}
+          <div class="run-list" aria-label="Runs" class:hidden={runs.length === 0}>
             {#each runs as run (run.id)}
               <button class:active={selectedRun?.id === run.id} onclick={() => chooseRun(run)}>
                 <span>{run.name}</span>
@@ -377,7 +481,57 @@
         </aside>
 
         <section class="run-view">
-          {#if selectedRun}
+          {#if selectedReport}
+            <div class="run-heading">
+              <div>
+                <p class="eyebrow">{selectedReport.project} / report</p>
+                <h1>{selectedReport.name}</h1>
+                {#if selectedReport.description}
+                  <p class="report-description">{selectedReport.description}</p>
+                {/if}
+              </div>
+              <span class="run-state">{selectedReport.layout.panels.length} panels</span>
+            </div>
+
+            <div class="report-grid" style={`--report-columns: ${selectedReport.layout.columns}`}>
+              {#each selectedReport.layout.panels as panel (panel.id)}
+                {#if panel.kind === "markdown"}
+                  <article
+                    class="report-markdown-panel"
+                    style={`grid-column: span ${Math.min(panel.width, selectedReport.layout.columns)}; min-height: ${panel.height}px`}
+                  >
+                    <div class="card-heading">
+                      <div><small>Markdown</small><strong>{panel.title}</strong></div>
+                    </div>
+                    <MarkdownPanel source={panel.markdown ?? ""} />
+                  </article>
+                {:else}
+                  <section
+                    class="report-metric-panel"
+                    style={`grid-column: span ${Math.min(panel.width, selectedReport.layout.columns)}; min-height: ${panel.height}px`}
+                    aria-label={`${panel.title} report panel`}
+                  >
+                    <div class="report-panel-heading">
+                      <strong>{panel.title}</strong>
+                      <small>run {panel.run_id?.slice(0, 8)}</small>
+                    </div>
+                    <div class="report-metric-grid">
+                      {#each panel.metric_keys as metric (metric)}
+                        {@const identity = reportMetricIdentity(panel, metric)}
+                        <MetricChart
+                          {metric}
+                          title={panel.metric_keys.length === 1 ? metric : metric}
+                          history={reportHistories[identity]}
+                          loading={loadingReportMetrics.has(identity)}
+                          onvisible={() => reportChartVisible(panel, metric)}
+                        />
+                      {/each}
+                    </div>
+                  </section>
+                {/if}
+              {/each}
+            </div>
+          {:else if selectedRun}
             <div class="run-heading">
               <div>
                 <p class="eyebrow">{selectedRun.project} / {selectedRun.id.slice(0, 8)}</p>

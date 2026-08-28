@@ -30,7 +30,7 @@ usable and tested, not that the entire feature group is complete.
 | Python API | synchronous public API and background delivery | Partial |
 | Remote server | authenticated ingestion and read APIs | Partial |
 | CLI | serve, list, get, query, import, export | Partial |
-| Dashboard | projects, runs, metrics, media, artifacts, traces | Partial |
+| Dashboard | projects, runs, metrics, media, artifacts, traces, reports | Partial |
 | Import/export | lossless local export and resumable import | Planned |
 
 Features tied specifically to third-party hosting platforms are deliberately
@@ -48,7 +48,7 @@ deployment model.
 | Tables | typed columns, incremental data, linked rich values | Partial |
 | Artifacts | collections, versions, aliases, lineage, downloads | Compatible |
 | Sweeps | definitions, agents, scheduling, early termination | Partial |
-| Reports | persisted dashboard/report definitions | Planned |
+| Reports | persisted dashboard/report definitions | Partial |
 | Groups and jobs | group, job type, tags, notes, ownership metadata | Planned |
 | Importers | W&B API and export formats with resumable checkpoints | Planned |
 | Compatibility errors | explicit diagnostics for unsupported behavior | Partial |
@@ -127,3 +127,12 @@ terminal result idempotently, and inherit the scheduled config through ordinary
 the batch acknowledgement sets `run.should_stop`, and the next `log` raises
 `SweepEarlyStop`. Continuous distributions, Hyperband, and process-level remote
 agents remain outside the current partial W&B surface and fail explicitly.
+
+Reports are durable project-scoped grid definitions with typed metric and
+Markdown panels. Report metric references are validated against project runs,
+and the dashboard renders their histories with lazy bounded sampling and a
+four-request concurrency cap. Definitions can be created, listed, replaced, and
+deleted through the HTTP and public Python APIs. The Markdown renderer supports
+safe headings, paragraphs, lists, and fenced code. Arbitrary W&B report blocks,
+inline rich text, collaborative editing, and hosted sharing semantics remain
+outside the current partial surface.

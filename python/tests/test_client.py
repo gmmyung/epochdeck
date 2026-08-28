@@ -164,3 +164,29 @@ def test_public_run_query_uses_a_structured_filter_body() -> None:
 
     assert requests[0].url.path == "/api/v1/query/runs"
     assert json.loads(requests[0].read()) == query
+
+
+def test_report_client_uses_project_collection_and_record_routes() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(201, json={"report": {}, "duplicate": False})
+        if request.method == "GET" and request.url.path.endswith("/reports"):
+            return httpx.Response(200, json={"reports": []})
+        return httpx.Response(200, json={"id": "report/id"})
+
+    report = {"id": None, "name": "Overview", "description": None, "layout": {}}
+    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+        client.create_report("demo/project", report)
+        client.reports("demo/project", limit=25)
+        client.update_report("report/id", {"name": "Updated", "layout": {}})
+        client.delete_report("report/id")
+
+    assert requests[0].url.path == "/api/v1/projects/demo/project/reports"
+    assert json.loads(requests[0].read()) == report
+    assert dict(requests[1].url.params) == {"limit": "25"}
+    assert requests[2].method == "PUT"
+    assert requests[2].url.path == "/api/v1/reports/report/id"
+    assert requests[3].method == "DELETE"

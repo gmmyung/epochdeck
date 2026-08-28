@@ -24,18 +24,19 @@ use runloom_protocol::{
     ArtifactListResponse, ArtifactRecord, ArtifactRelation, BlobRef, BlobUploadResponse,
     ClaimSweepTrialRequest, ClaimSweepTrialResponse, CompleteSweepTrialRequest,
     ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse, CreateArtifactRequest,
-    CreateArtifactResponse, CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest,
-    CreateRunResponse, CreateSweepRequest, CreateSweepResponse, CreateTraceSpanRequest,
-    CreateTraceSpanResponse, FinishRunRequest, FinishRunResponse, HealthResponse, HistoryResponse,
-    IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES,
-    MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS, MAX_CONFIG_BYTES,
-    MAX_HISTORY_KEYS, MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES,
-    MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES, MAX_TRACE_METADATA_BYTES, MetricKeyListResponse,
-    ProjectListResponse, ResumePolicy, RichValueId, RichValueKind, RichValueListResponse,
-    RunArtifactListResponse, RunId, RunListResponse, RunQueryRequest, RunQueryResponse, RunRecord,
-    RunState, RunUpdateResponse, SummaryUpdateRequest, SweepId, SweepListResponse, SweepTrialId,
-    SweepTrialListResponse, SweepTrialRecord, SweepTrialState, TraceSpanId, TraceSpanListResponse,
-    UseArtifactRequest,
+    CreateArtifactResponse, CreateReportRequest, CreateReportResponse, CreateRichValueRequest,
+    CreateRichValueResponse, CreateRunRequest, CreateRunResponse, CreateSweepRequest,
+    CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse, FinishRunRequest,
+    FinishRunResponse, HealthResponse, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
+    MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES, MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES,
+    MAX_BATCH_POINTS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS, MAX_HISTORY_POINTS,
+    MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES,
+    MAX_TRACE_METADATA_BYTES, MetricKeyListResponse, ProjectListResponse, ReportId, ReportLayout,
+    ReportListResponse, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId, RichValueKind,
+    RichValueListResponse, RunArtifactListResponse, RunId, RunListResponse, RunQueryRequest,
+    RunQueryResponse, RunRecord, RunState, RunUpdateResponse, SummaryUpdateRequest, SweepId,
+    SweepListResponse, SweepTrialId, SweepTrialListResponse, SweepTrialRecord, SweepTrialState,
+    TraceSpanId, TraceSpanListResponse, UpdateReportRequest, UseArtifactRequest,
 };
 use runloom_storage::{
     BlobStore, MetricStore, MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
@@ -70,6 +71,9 @@ const MAX_SWEEP_PARAMETERS: usize = 64;
 const MAX_SWEEP_VALUES: usize = 256;
 const MAX_SWEEP_RUNS: u64 = 100_000;
 const MAX_AGENT_ID_BYTES: usize = 128;
+const MAX_REPORT_PANELS: usize = 32;
+const MAX_REPORT_METRICS: usize = 8;
+const MAX_REPORT_MARKDOWN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 struct AppState {
@@ -115,6 +119,14 @@ pub fn app_with_runtime_and_blobs(
         .route(
             "/api/v1/projects/{project}/sweeps",
             post(create_sweep).get(list_sweeps),
+        )
+        .route(
+            "/api/v1/projects/{project}/reports",
+            post(create_report).get(list_reports),
+        )
+        .route(
+            "/api/v1/reports/{report_id}",
+            get(get_report).put(update_report).delete(delete_report),
         )
         .route("/api/v1/sweeps/{sweep_id}", get(get_sweep))
         .route("/api/v1/sweeps/{sweep_id}/claim", post(claim_sweep_trial))
@@ -306,6 +318,67 @@ async fn complete_sweep_trial(
             .complete_sweep_trial(trial_id, &request)
             .await?,
     ))
+}
+
+async fn create_report(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    Json(request): Json<CreateReportRequest>,
+) -> Result<(StatusCode, Json<CreateReportResponse>), HttpError> {
+    validate_project_name(&project)?;
+    validate_report(
+        &request.name,
+        request.description.as_deref(),
+        &request.layout,
+    )?;
+    let (report, duplicate) = state.catalog.create_report(&project, &request).await?;
+    let status = if duplicate {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(CreateReportResponse { report, duplicate })))
+}
+
+async fn list_reports(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<ReportListResponse>, HttpError> {
+    validate_project_name(&project)?;
+    validate_list_limit(query.limit)?;
+    Ok(Json(ReportListResponse {
+        reports: state.catalog.list_reports(&project, query.limit).await?,
+    }))
+}
+
+async fn get_report(
+    State(state): State<AppState>,
+    Path(report_id): Path<ReportId>,
+) -> Result<Json<ReportRecord>, HttpError> {
+    Ok(Json(state.catalog.get_report(report_id).await?))
+}
+
+async fn update_report(
+    State(state): State<AppState>,
+    Path(report_id): Path<ReportId>,
+    Json(request): Json<UpdateReportRequest>,
+) -> Result<Json<ReportRecord>, HttpError> {
+    validate_report(
+        &request.name,
+        request.description.as_deref(),
+        &request.layout,
+    )?;
+    Ok(Json(
+        state.catalog.update_report(report_id, &request).await?,
+    ))
+}
+
+async fn delete_report(
+    State(state): State<AppState>,
+    Path(report_id): Path<ReportId>,
+) -> Result<Json<ReportRecord>, HttpError> {
+    Ok(Json(state.catalog.delete_report(report_id).await?))
 }
 
 async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
@@ -1590,9 +1663,11 @@ fn validate_sweep(request: &CreateSweepRequest) -> Result<(), HttpError> {
             "sweep max_runs must be between 1 and {MAX_SWEEP_RUNS}"
         )));
     }
-    if request.early_terminate.as_ref().is_some_and(|early| {
-        early.min_trials == 0 || early.min_trials > 100 || early.min_step > u64::MAX / 2
-    }) {
+    if request
+        .early_terminate
+        .as_ref()
+        .is_some_and(|early| early.min_trials == 0 || early.min_trials > 100)
+    {
         return Err(HttpError::invalid(
             "early termination requires min_trials between 1 and 100",
         ));
@@ -1614,6 +1689,91 @@ fn validate_agent_id(agent_id: &str) -> Result<(), HttpError> {
     {
         return Err(HttpError::invalid(format!(
             "agent ID must contain 1 to {MAX_AGENT_ID_BYTES} non-control bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_report(
+    name: &str,
+    description: Option<&str>,
+    layout: &ReportLayout,
+) -> Result<(), HttpError> {
+    if name.is_empty() || name.len() > MAX_RUN_NAME_BYTES || name.chars().any(char::is_control) {
+        return Err(HttpError::invalid(format!(
+            "report name must contain 1 to {MAX_RUN_NAME_BYTES} non-control bytes"
+        )));
+    }
+    if description.is_some_and(|value| value.len() > MAX_REPORT_MARKDOWN_BYTES) {
+        return Err(HttpError::invalid(format!(
+            "report description cannot exceed {MAX_REPORT_MARKDOWN_BYTES} bytes"
+        )));
+    }
+    if !(1..=4).contains(&layout.columns)
+        || layout.panels.is_empty()
+        || layout.panels.len() > MAX_REPORT_PANELS
+    {
+        return Err(HttpError::invalid(format!(
+            "report layouts require 1 to {MAX_REPORT_PANELS} panels and 1 to 4 columns"
+        )));
+    }
+    let mut panel_ids = BTreeSet::new();
+    for panel in &layout.panels {
+        if panel.id.is_empty()
+            || panel.id.len() > 128
+            || panel.id.chars().any(char::is_control)
+            || !panel_ids.insert(&panel.id)
+            || panel.title.is_empty()
+            || panel.title.len() > MAX_RUN_NAME_BYTES
+            || panel.title.chars().any(char::is_control)
+            || panel.width == 0
+            || panel.width > layout.columns
+            || !(180..=800).contains(&panel.height)
+        {
+            return Err(HttpError::invalid(
+                "report panels require unique safe IDs, titles, valid spans, and 180-800px heights",
+            ));
+        }
+        match panel.kind {
+            ReportPanelKind::Metric => {
+                if panel.run_id.is_none()
+                    || panel.metric_keys.is_empty()
+                    || panel.metric_keys.len() > MAX_REPORT_METRICS
+                    || panel.markdown.is_some()
+                {
+                    return Err(HttpError::invalid(format!(
+                        "metric panels require a run and 1 to {MAX_REPORT_METRICS} metric keys"
+                    )));
+                }
+                for key in &panel.metric_keys {
+                    if key.is_empty()
+                        || key.len() > MAX_METRIC_KEY_BYTES
+                        || key.chars().any(char::is_control)
+                    {
+                        return Err(HttpError::invalid("report metric key is invalid"));
+                    }
+                }
+            }
+            ReportPanelKind::Markdown => {
+                if panel.run_id.is_some()
+                    || !panel.metric_keys.is_empty()
+                    || panel
+                        .markdown
+                        .as_ref()
+                        .is_none_or(|value| value.len() > MAX_REPORT_MARKDOWN_BYTES)
+                {
+                    return Err(HttpError::invalid(
+                        "markdown panels require only bounded markdown text",
+                    ));
+                }
+            }
+        }
+    }
+    let encoded = serde_json::to_vec(layout)
+        .map_err(|error| HttpError::invalid(format!("report is not serializable: {error}")))?;
+    if encoded.len() > MAX_CONFIG_BYTES {
+        return Err(HttpError::invalid(format!(
+            "serialized report layout exceeds {MAX_CONFIG_BYTES} bytes"
         )));
     }
     Ok(())
@@ -1722,16 +1882,18 @@ mod tests {
         AlertId, AlertLevel, AlertListResponse, ArtifactEntry, ArtifactListResponse, BlobRef,
         BlobUploadResponse, ClaimSweepTrialRequest, ClaimSweepTrialResponse,
         CompleteSweepTrialRequest, ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse,
-        CreateArtifactRequest, CreateArtifactResponse, CreateRichValueRequest,
-        CreateRichValueResponse, CreateRunRequest, CreateRunResponse, CreateSweepRequest,
-        CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse, EarlyTerminateConfig,
-        FinishRunRequest, FinishRunResponse, HealthResponse, HealthStatus, HistoryResponse,
-        IngestBatchRequest, IngestBatchResponse, MetricGoal, MetricKeyListResponse, MetricPoint,
-        ProjectListResponse, ResumePolicy, RichValueId, RichValueKind, RichValueListResponse,
-        RunArtifactListResponse, RunListResponse, RunQueryRequest, RunQueryResponse, RunState,
-        RunUpdateResponse, SummaryUpdateRequest, SweepMethod, SweepMetric, SweepParameter,
-        SweepTrialListResponse, SweepTrialState, TraceKind, TraceSpanId, TraceSpanListResponse,
-        TraceSpanRecord, TraceStatus, UseArtifactRequest,
+        CreateArtifactRequest, CreateArtifactResponse, CreateReportRequest, CreateReportResponse,
+        CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest, CreateRunResponse,
+        CreateSweepRequest, CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse,
+        EarlyTerminateConfig, FinishRunRequest, FinishRunResponse, HealthResponse, HealthStatus,
+        HistoryResponse, IngestBatchRequest, IngestBatchResponse, MetricGoal,
+        MetricKeyListResponse, MetricPoint, ProjectListResponse, ReportLayout, ReportListResponse,
+        ReportPanel, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId, RichValueKind,
+        RichValueListResponse, RunArtifactListResponse, RunListResponse, RunQueryRequest,
+        RunQueryResponse, RunState, RunUpdateResponse, SummaryUpdateRequest, SweepMethod,
+        SweepMetric, SweepParameter, SweepTrialListResponse, SweepTrialState, TraceKind,
+        TraceSpanId, TraceSpanListResponse, TraceSpanRecord, TraceStatus, UpdateReportRequest,
+        UseArtifactRequest,
     };
     use runloom_storage::MetricStore;
     use sha2::{Digest, Sha256};
@@ -2016,6 +2178,127 @@ mod tests {
         )
         .await?;
         assert_eq!(trials.trials.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_persist_bounded_dashboard_layouts() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let run: CreateRunResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/report-demo/runs",
+                    &CreateRunRequest {
+                        id: None,
+                        name: Some("baseline".to_owned()),
+                        config: BTreeMap::new(),
+                        resume: ResumePolicy::Never,
+                        sweep_trial_id: None,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        let layout = ReportLayout {
+            columns: 2,
+            panels: vec![
+                ReportPanel {
+                    id: "overview".to_owned(),
+                    title: "Overview".to_owned(),
+                    kind: ReportPanelKind::Markdown,
+                    run_id: None,
+                    metric_keys: Vec::new(),
+                    markdown: Some("# Baseline\nStable rollout".to_owned()),
+                    width: 2,
+                    height: 180,
+                },
+                ReportPanel {
+                    id: "loss".to_owned(),
+                    title: "Training loss".to_owned(),
+                    kind: ReportPanelKind::Metric,
+                    run_id: Some(run.run.id),
+                    metric_keys: vec!["loss".to_owned()],
+                    markdown: None,
+                    width: 1,
+                    height: 320,
+                },
+            ],
+        };
+        let request = CreateReportRequest {
+            id: None,
+            name: "Training report".to_owned(),
+            description: Some("Baseline dashboard".to_owned()),
+            layout: layout.clone(),
+        };
+        let created: CreateReportResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/report-demo/reports",
+                    &request,
+                )?)
+                .await?,
+        )
+        .await?;
+        assert!(!created.duplicate);
+        let replay: CreateReportResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/report-demo/reports",
+                    &CreateReportRequest {
+                        id: Some(created.report.id),
+                        ..request
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert!(replay.duplicate);
+        let reports: ReportListResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/projects/report-demo/reports?limit=10")
+                        .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(reports.reports.len(), 1);
+        let updated: ReportRecord = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "PUT",
+                    &format!("/api/v1/reports/{}", created.report.id),
+                    &UpdateReportRequest {
+                        name: "Updated report".to_owned(),
+                        description: None,
+                        layout,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(updated.name, "Updated report");
+        let deleted: ReportRecord = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::delete(format!("/api/v1/reports/{}", created.report.id))
+                        .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(deleted.id, created.report.id);
         Ok(())
     }
 

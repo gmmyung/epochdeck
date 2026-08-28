@@ -63,6 +63,55 @@ class Api:
         query["limit"] = per_page
         return RunCollection(self.client, query)
 
+    def reports(self, project: str, *, per_page: int = 100) -> list[dict[str, Any]]:
+        _validate_page_size(per_page)
+        return deepcopy(self.client.reports(project, limit=per_page)["reports"])
+
+    def report(self, report_id: str) -> dict[str, Any]:
+        return deepcopy(self.client.get_report(report_id))
+
+    def create_report(
+        self,
+        project: str,
+        *,
+        name: str,
+        layout: Mapping[str, Any],
+        description: str | None = None,
+        id: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.client.create_report(
+            project,
+            {
+                "id": id,
+                "name": name,
+                "description": description,
+                "layout": deepcopy(dict(layout)),
+            },
+        )
+        return deepcopy(response["report"])
+
+    def update_report(
+        self,
+        report_id: str,
+        *,
+        name: str,
+        layout: Mapping[str, Any],
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        return deepcopy(
+            self.client.update_report(
+                report_id,
+                {
+                    "name": name,
+                    "description": description,
+                    "layout": deepcopy(dict(layout)),
+                },
+            )
+        )
+
+    def delete_report(self, report_id: str) -> dict[str, Any]:
+        return deepcopy(self.client.delete_report(report_id))
+
 
 class RunCollection:
     def __init__(self, client: RunloomClient, query: dict[str, Any]) -> None:

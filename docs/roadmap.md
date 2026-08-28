@@ -46,7 +46,7 @@ not a reduction in the final parity goal.
 
 - [x] Public query API and filtering.
 - [x] Sweeps, agents, scheduling, and early termination.
-- Persisted reports and dashboard layouts.
+- [x] Persisted reports and dashboard layouts.
 - Resumable W&B importer and lossless Runloom export.
 
 ## Milestone 5: production operations

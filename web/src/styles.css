@@ -206,6 +206,23 @@ select:hover {
   background: var(--line);
 }
 
+.run-list.hidden {
+  display: none;
+}
+
+.nav-label {
+  margin: 14px 0 6px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.nav-label + .run-list {
+  margin-top: 0;
+}
+
 .run-list button {
   min-width: 0;
   display: grid;
@@ -275,6 +292,60 @@ select:hover {
   font-weight: 650;
   letter-spacing: -0.015em;
   line-height: 1.2;
+}
+
+.report-description {
+  max-width: 720px;
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.report-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--report-columns), minmax(0, 1fr));
+  gap: 12px;
+}
+
+.report-markdown-panel,
+.report-metric-panel {
+  min-width: 0;
+}
+
+.report-metric-panel {
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.report-panel-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.report-panel-heading strong {
+  font-size: 13px;
+}
+
+.report-panel-heading small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.report-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+  gap: 10px;
+}
+
+.report-metric-grid .metric-chart-card {
+  min-height: 320px;
 }
 
 .run-state {
@@ -833,6 +904,14 @@ dd {
   .rich-grid,
   .metric-grid {
     grid-template-columns: 1fr;
+  }
+
+  .report-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .report-grid > * {
+    grid-column: 1 / -1 !important;
   }
 
   .run-heading h1,

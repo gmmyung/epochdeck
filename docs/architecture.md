@@ -122,9 +122,20 @@ memory. A short transaction serializes claims. Metric batch acknowledgements
 carry median-rule stop decisions back through the existing durable delivery
 worker; no polling thread or scheduler queue enters training code.
 
+### Reports
+
+Reports are small project-scoped SQLite documents containing a bounded grid of
+typed metric and Markdown panels. Metric panels hold run IDs and requested
+column names, not materialized history. The catalog transaction validates that
+every referenced run belongs to the report project.
+
+The dashboard renders the grid directly from that definition. Metric histories
+remain lazy, sampled, cancellable, and capped at four concurrent requests, so a
+large report cannot turn into an unbounded fan-out or duplicate source data.
+
 ### Dashboard
 
-The Svelte dashboard initially loads project, run, and metric metadata. It
+The Svelte dashboard initially loads project, run, report, and metric metadata. It
 requests values only for visible charts and selected metrics. Off-screen charts
 are virtualized, Arrow decoding happens in a Web Worker, numeric series stay in
 typed arrays, and charts render with Canvas.

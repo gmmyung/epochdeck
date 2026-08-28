@@ -66,6 +66,7 @@ uuid_identifier!(ArtifactId);
 uuid_identifier!(TraceSpanId);
 uuid_identifier!(SweepId);
 uuid_identifier!(SweepTrialId);
+uuid_identifier!(ReportId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -212,6 +213,34 @@ pub enum SweepTrialState {
     Completed,
     Failed,
     Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportPanelKind {
+    Metric,
+    Markdown,
+}
+
+impl fmt::Display for ReportPanelKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Metric => formatter.write_str("metric"),
+            Self::Markdown => formatter.write_str("markdown"),
+        }
+    }
+}
+
+impl FromStr for ReportPanelKind {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "metric" => Ok(Self::Metric),
+            "markdown" => Ok(Self::Markdown),
+            _ => Err("unknown report panel kind"),
+        }
+    }
 }
 
 impl fmt::Display for SweepTrialState {
@@ -664,6 +693,68 @@ pub struct SweepListResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SweepTrialListResponse {
     pub trials: Vec<SweepTrialRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportPanel {
+    pub id: String,
+    pub title: String,
+    pub kind: ReportPanelKind,
+    #[serde(default)]
+    pub run_id: Option<RunId>,
+    #[serde(default)]
+    pub metric_keys: Vec<String>,
+    #[serde(default)]
+    pub markdown: Option<String>,
+    pub width: u8,
+    pub height: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportLayout {
+    pub columns: u8,
+    pub panels: Vec<ReportPanel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateReportRequest {
+    #[serde(default)]
+    pub id: Option<ReportId>,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub layout: ReportLayout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateReportRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub layout: ReportLayout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportRecord {
+    pub id: ReportId,
+    pub project_id: ProjectId,
+    pub project: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub layout: ReportLayout,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateReportResponse {
+    pub report: ReportRecord,
+    pub duplicate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportListResponse {
+    pub reports: Vec<ReportRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
