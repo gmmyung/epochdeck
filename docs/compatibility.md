@@ -29,9 +29,9 @@ usable and tested, not that the entire feature group is complete.
 | Traces | structured spans, messages, search metadata | Compatible |
 | Python API | synchronous public API and background delivery | Partial |
 | Remote server | authenticated ingestion and read APIs | Partial |
-| CLI | serve, list, get, query, import, export | Partial |
+| CLI | list, get, query, sync, W&B import, Runloom export | Partial |
 | Dashboard | projects, runs, metrics, media, artifacts, traces, reports | Partial |
-| Import/export | lossless local export and resumable import | Planned |
+| Import/export | lossless local export and resumable import | Partial |
 
 Features tied specifically to third-party hosting platforms are deliberately
 excluded. Runloom provides its own server, storage roots, authentication, and
@@ -50,7 +50,7 @@ deployment model.
 | Sweeps | definitions, agents, scheduling, early termination | Partial |
 | Reports | persisted dashboard/report definitions | Partial |
 | Groups and jobs | group, job type, tags, notes, ownership metadata | Planned |
-| Importers | W&B API and export formats with resumable checkpoints | Planned |
+| Importers | W&B API and export formats with resumable checkpoints | Partial |
 | Compatibility errors | explicit diagnostics for unsupported behavior | Partial |
 
 ## Test strategy
@@ -136,3 +136,17 @@ deleted through the HTTP and public Python APIs. The Markdown renderer supports
 safe headings, paragraphs, lists, and fenced code. Arbitrary W&B report blocks,
 inline rich text, collaborative editing, and hosted sharing semantics remain
 outside the current partial surface.
+
+The W&B importer scans runs lazily with one to sixteen bounded workers. Stable
+target IDs, deterministic metric batches, and an fsynced atomic checkpoint make
+lost-response replay and whole-process restart safe. Scalar histories, config,
+summary, source metadata, and W&B run files are retained; run files become
+versioned CAS-backed artifacts. Unsupported history values are counted in each
+imported summary. W&B registry artifact lineage and conversion of media-history
+references into native Runloom rich rows remain outside this partial importer.
+
+Runloom project exports are lossless for the current supported Runloom surface.
+They cursor-scan full-resolution metric columns and every paginated metadata
+collection, retain artifact links and control-plane definitions, stream each
+referenced CAS digest once, and verify content before an atomic directory
+install. Orphaned, unreferenced blob uploads are deliberately excluded.

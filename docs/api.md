@@ -82,7 +82,8 @@ Exact manifest retries are idempotent.
 - `POST /runs/{run_id}/artifacts` creates the next immutable version and an
   output lineage edge.
 - `POST /runs/{run_id}/artifacts/use` records an input lineage edge.
-- `GET /runs/{run_id}/artifacts` lists the run's bounded input/output links.
+- `GET /runs/{run_id}/artifacts?limit=100&before=<artifact_id>` lists the run's
+  bounded input/output links.
 - `GET /projects/{project}/artifacts?limit=100&before=<artifact_id>` lists
   project versions newest first.
 - `GET /projects/{project}/artifacts/{name}/aliases/{alias}` resolves a movable
@@ -97,6 +98,10 @@ contains up to 4,096 unique relative POSIX paths and a total 2 MiB manifest
 budget; these are metadata bounds, not file-size or retention quotas. The server
 verifies every referenced SHA-256 object before allocating the version in one
 SQLite transaction. Stable request IDs make a lost create response replay-safe.
+
+Project artifact and run-link responses include `next_before` cursors. The
+artifact ID order is stable and allows complete lineage scans without loading a
+run's link set into one response.
 
 ## Traces
 
@@ -132,6 +137,10 @@ random configurations by deterministic hashing, so the server never
 materializes the search space. Claims have a 60-second pre-run lease; binding a
 run makes the claim exclusive. Exact terminal retries are idempotent.
 
+Sweep and trial list responses include `next_before` when a full page may have a
+continuation. Pass it back as `before` to scan definitions without a fixed total
+limit.
+
 An optional early-termination document contains `min_step` and `min_trials` for
 the median rule. Ingesting the target metric records a bounded observation and
 returns `stop_requested` in the normal batch acknowledgement when the run is
@@ -155,6 +164,8 @@ Reports store no metric copies or sampled results. The dashboard lazily requests
 each visible metric from its referenced run with a fixed point budget and at
 most four concurrent chart queries. Report creation validates all referenced
 runs before committing the layout transaction.
+
+Report list responses use the same `next_before` cursor convention.
 
 ## Discovery
 

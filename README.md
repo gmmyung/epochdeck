@@ -239,6 +239,35 @@ Reports persist only bounded layout definitions. Their metric panels issue the
 same lazy, sampled, column-projected queries as ordinary run charts, so opening
 a report does not duplicate or scan complete histories.
 
+Import a W&B project with four run workers and a durable checkpoint:
+
+```bash
+uv run --project python --with wandb runloom import-wandb gyungmin bello-mujoco \
+  --server-url http://127.0.0.1:8787 \
+  --checkpoint bello-mujoco.import.json \
+  --workers 4
+```
+
+The importer derives stable Runloom IDs from W&B run paths and sends scalar
+history in deterministic batches. A response lost after commit is replayed
+exactly; completed runs are skipped on the next invocation. W&B run files,
+including media and checkpoints, are streamed into CAS and retained as
+versioned artifacts. Unsupported non-scalar history cells are counted in the
+imported summary rather than silently presented as scalar metrics. W&B registry
+artifact lineage and native reconstruction of W&B media-history references are
+not part of this first importer surface.
+
+Create a complete portable project bundle:
+
+```bash
+uv run --project python runloom export bello-mujoco ./bello-mujoco.runloom-export
+```
+
+The exporter scans raw metrics in cursor pages, downloads CAS content once,
+includes alerts, rich values, traces, artifact links, reports, sweeps, and
+trials, and atomically publishes the directory only after every digest verifies.
+See [Export format](docs/export-format.md).
+
 ## Repository layout
 
 ```text

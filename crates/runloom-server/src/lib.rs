@@ -200,6 +200,27 @@ struct ListQuery {
     limit: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct SweepListQuery {
+    before: Option<SweepId>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SweepTrialListQuery {
+    before: Option<SweepTrialId>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportListQuery {
+    before: Option<ReportId>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
 async fn list_projects(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
@@ -260,12 +281,22 @@ async fn get_sweep(
 async fn list_sweeps(
     State(state): State<AppState>,
     Path(project): Path<String>,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<SweepListQuery>,
 ) -> Result<Json<SweepListResponse>, HttpError> {
     validate_project_name(&project)?;
     validate_list_limit(query.limit)?;
+    let sweeps = state
+        .catalog
+        .list_sweeps(&project, query.before, query.limit)
+        .await?;
+    let next_before = if sweeps.len() == query.limit {
+        sweeps.last().map(|sweep| sweep.id)
+    } else {
+        None
+    };
     Ok(Json(SweepListResponse {
-        sweeps: state.catalog.list_sweeps(&project, query.limit).await?,
+        sweeps,
+        next_before,
     }))
 }
 
@@ -285,14 +316,21 @@ async fn claim_sweep_trial(
 async fn list_sweep_trials(
     State(state): State<AppState>,
     Path(sweep_id): Path<SweepId>,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<SweepTrialListQuery>,
 ) -> Result<Json<SweepTrialListResponse>, HttpError> {
     validate_list_limit(query.limit)?;
+    let trials = state
+        .catalog
+        .list_sweep_trials(sweep_id, query.before, query.limit)
+        .await?;
+    let next_before = if trials.len() == query.limit {
+        trials.last().map(|trial| trial.id)
+    } else {
+        None
+    };
     Ok(Json(SweepTrialListResponse {
-        trials: state
-            .catalog
-            .list_sweep_trials(sweep_id, query.limit)
-            .await?,
+        trials,
+        next_before,
     }))
 }
 
@@ -343,12 +381,22 @@ async fn create_report(
 async fn list_reports(
     State(state): State<AppState>,
     Path(project): Path<String>,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<ReportListQuery>,
 ) -> Result<Json<ReportListResponse>, HttpError> {
     validate_project_name(&project)?;
     validate_list_limit(query.limit)?;
+    let reports = state
+        .catalog
+        .list_reports(&project, query.before, query.limit)
+        .await?;
+    let next_before = if reports.len() == query.limit {
+        reports.last().map(|report| report.id)
+    } else {
+        None
+    };
     Ok(Json(ReportListResponse {
-        reports: state.catalog.list_reports(&project, query.limit).await?,
+        reports,
+        next_before,
     }))
 }
 
@@ -813,12 +861,21 @@ async fn list_project_artifacts(
 async fn list_run_artifacts(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
+    Query(query): Query<ArtifactListQuery>,
 ) -> Result<Json<RunArtifactListResponse>, HttpError> {
+    validate_list_limit(query.limit)?;
+    let artifacts = state
+        .catalog
+        .list_run_artifacts(run_id, query.before, query.limit)
+        .await?;
+    let next_before = if artifacts.len() == query.limit {
+        artifacts.last().map(|linked| linked.artifact.id)
+    } else {
+        None
+    };
     Ok(Json(RunArtifactListResponse {
-        artifacts: state
-            .catalog
-            .list_run_artifacts(run_id, MAX_LIST_ITEMS)
-            .await?,
+        artifacts,
+        next_before,
     }))
 }
 
@@ -2169,7 +2226,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::get(format!(
-                        "/api/v1/sweeps/{}/trials?limit=10",
+                        "/api/v1/sweeps/{}/trials?limit=1",
                         created.sweep.id
                     ))
                     .body(Body::empty())?,
@@ -2177,7 +2234,23 @@ mod tests {
                 .await?,
         )
         .await?;
-        assert_eq!(trials.trials.len(), 2);
+        assert_eq!(trials.trials.len(), 1);
+        let trial_cursor = trials.next_before.expect("full trial page has a cursor");
+        let next_trials: SweepTrialListResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/sweeps/{}/trials?limit=1&before={trial_cursor}",
+                        created.sweep.id
+                    ))
+                    .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(next_trials.trials.len(), 1);
+        assert_ne!(trials.trials[0].id, next_trials.trials[0].id);
         Ok(())
     }
 
@@ -2265,13 +2338,27 @@ mod tests {
             router
                 .clone()
                 .oneshot(
-                    Request::get("/api/v1/projects/report-demo/reports?limit=10")
+                    Request::get("/api/v1/projects/report-demo/reports?limit=1")
                         .body(Body::empty())?,
                 )
                 .await?,
         )
         .await?;
         assert_eq!(reports.reports.len(), 1);
+        let report_cursor = reports.next_before.expect("full report page has a cursor");
+        let next_reports: ReportListResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/projects/report-demo/reports?limit=1&before={report_cursor}"
+                    ))
+                    .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert!(next_reports.reports.is_empty());
         let updated: ReportRecord = response_json(
             router
                 .clone()

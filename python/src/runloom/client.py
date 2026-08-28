@@ -84,6 +84,19 @@ class RunloomClient:
             json=sweep,
         )
 
+    def sweeps(
+        self,
+        project: str,
+        *,
+        before: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/v1/projects/{quote(project, safe='')}/sweeps",
+            params=_cursor_params(before, limit),
+        )
+
     def get_sweep(self, sweep_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/sweeps/{quote(sweep_id, safe='')}")
 
@@ -107,11 +120,17 @@ class RunloomClient:
             json={"state": state, "metric": metric},
         )
 
-    def sweep_trials(self, sweep_id: str, *, limit: int = 100) -> dict[str, Any]:
+    def sweep_trials(
+        self,
+        sweep_id: str,
+        *,
+        before: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
         return self._request(
             "GET",
             f"/api/v1/sweeps/{quote(sweep_id, safe='')}/trials",
-            params={"limit": limit},
+            params=_cursor_params(before, limit),
         )
 
     def create_report(self, project: str, report: dict[str, Any]) -> dict[str, Any]:
@@ -121,11 +140,17 @@ class RunloomClient:
             json=report,
         )
 
-    def reports(self, project: str, *, limit: int = 100) -> dict[str, Any]:
+    def reports(
+        self,
+        project: str,
+        *,
+        before: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
         return self._request(
             "GET",
             f"/api/v1/projects/{quote(project, safe='')}/reports",
-            params={"limit": limit},
+            params=_cursor_params(before, limit),
         )
 
     def get_report(self, report_id: str) -> dict[str, Any]:
@@ -146,6 +171,9 @@ class RunloomClient:
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/runs/{run_id}")
+
+    def metric_keys(self, run_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/runs/{quote(run_id, safe='')}/metrics")
 
     def projects(self, *, limit: int = 100) -> dict[str, Any]:
         return self._request("GET", "/api/v1/projects", params={"limit": limit})
@@ -216,6 +244,19 @@ class RunloomClient:
                 content=stream,
             )
 
+    def download_blob(self, digest: str, destination: Path) -> int:
+        size = 0
+        with self._client.stream(
+            "GET",
+            f"/api/v1/blobs/{quote(digest, safe='')}",
+        ) as response:
+            self._raise_for_status(response)
+            with destination.open("wb") as stream:
+                for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                    stream.write(chunk)
+                    size += len(chunk)
+        return size
+
     def create_rich_value(self, run_id: str, value: dict[str, Any]) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -260,10 +301,36 @@ class RunloomClient:
             f"{quote(name, safe='')}/aliases/{quote(alias, safe='')}",
         )
 
-    def run_artifacts(self, run_id: str) -> dict[str, Any]:
+    def project_artifacts(
+        self,
+        project: str,
+        *,
+        before: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/v1/projects/{quote(project, safe='')}/artifacts",
+            params=_cursor_params(before, limit),
+        )
+
+    def artifact_lineage(self, artifact_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/v1/artifacts/{quote(artifact_id, safe='')}/lineage",
+        )
+
+    def run_artifacts(
+        self,
+        run_id: str,
+        *,
+        before: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
         return self._request(
             "GET",
             f"/api/v1/runs/{quote(run_id, safe='')}/artifacts",
+            params=_cursor_params(before, limit),
         )
 
     def create_trace_span(self, run_id: str, span: dict[str, Any]) -> dict[str, Any]:
@@ -314,7 +381,16 @@ class RunloomClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         response = self._client.request(method, path, **kwargs)
+        self._raise_for_status(response)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RunloomApiError(response.status_code, "invalid_response", "expected JSON object")
+        return payload
+
+    @staticmethod
+    def _raise_for_status(response: httpx.Response) -> None:
         if response.is_error:
+            response.read()
             try:
                 payload = response.json()
             except ValueError:
@@ -324,7 +400,10 @@ class RunloomClient:
                 str(payload.get("code", "http_error")),
                 str(payload.get("message", response.reason_phrase)),
             )
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise RunloomApiError(response.status_code, "invalid_response", "expected JSON object")
-        return payload
+
+
+def _cursor_params(before: str | None, limit: int) -> dict[str, str | int]:
+    params: dict[str, str | int] = {"limit": limit}
+    if before is not None:
+        params["before"] = before
+    return params

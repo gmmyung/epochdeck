@@ -565,16 +565,20 @@ impl Catalog {
     pub async fn list_sweeps(
         &self,
         project_name: &str,
+        before: Option<SweepId>,
         limit: usize,
     ) -> Result<Vec<SweepRecord>, CatalogError> {
+        let before = before.map(|value| value.to_string());
         let rows = query(
             "SELECT s.id, s.project_id, p.name AS project, s.name, s.method, s.metric_name, \
                     s.metric_goal, s.parameters_json, s.max_runs, s.next_index, \
                     s.early_terminate_json, s.state, s.created_at \
              FROM sweeps s JOIN projects p ON p.id = s.project_id \
-             WHERE p.name = ? ORDER BY s.id DESC LIMIT ?",
+             WHERE p.name = ? AND (? IS NULL OR s.id < ?) ORDER BY s.id DESC LIMIT ?",
         )
         .bind(project_name)
+        .bind(&before)
+        .bind(&before)
         .bind(to_i64(limit as u64, "sweep list limit")?)
         .fetch_all(&self.pool)
         .await?;
@@ -702,16 +706,20 @@ impl Catalog {
     pub async fn list_sweep_trials(
         &self,
         sweep_id: SweepId,
+        before: Option<SweepTrialId>,
         limit: usize,
     ) -> Result<Vec<SweepTrialRecord>, CatalogError> {
         self.get_sweep(sweep_id).await?;
+        let before = before.map(|value| value.to_string());
         let rows = query(
             "SELECT id, sweep_id, run_id, agent_id, trial_index, config_json, state, \
                     stop_requested, last_step, last_metric, lease_expires_at, created_at, \
                     updated_at, finished_at FROM sweep_trials WHERE sweep_id = ? \
-             ORDER BY id DESC LIMIT ?",
+                    AND (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?",
         )
         .bind(sweep_id.to_string())
+        .bind(&before)
+        .bind(&before)
         .bind(to_i64(limit as u64, "sweep trial list limit")?)
         .fetch_all(&self.pool)
         .await?;
@@ -846,15 +854,19 @@ impl Catalog {
     pub async fn list_reports(
         &self,
         project_name: &str,
+        before: Option<ReportId>,
         limit: usize,
     ) -> Result<Vec<ReportRecord>, CatalogError> {
+        let before = before.map(|value| value.to_string());
         let rows = query(
             "SELECT r.id, r.project_id, p.name AS project, r.name, r.description, r.layout_json, \
                     r.created_at, r.updated_at FROM reports r \
              JOIN projects p ON p.id = r.project_id WHERE p.name = ? \
-             ORDER BY r.id DESC LIMIT ?",
+             AND (? IS NULL OR r.id < ?) ORDER BY r.id DESC LIMIT ?",
         )
         .bind(project_name)
+        .bind(&before)
+        .bind(&before)
         .bind(to_i64(limit as u64, "report list limit")?)
         .fetch_all(&self.pool)
         .await?;
@@ -1264,9 +1276,11 @@ impl Catalog {
     pub async fn list_run_artifacts(
         &self,
         run_id: RunId,
+        before: Option<ArtifactId>,
         limit: usize,
     ) -> Result<Vec<RunArtifactRecord>, CatalogError> {
         self.get_run(run_id).await?;
+        let before = before.map(|value| value.to_string());
         let rows = query(
             "SELECT v.id, v.project_id, p.name AS project, v.name, v.artifact_type, v.version, \
                     v.description, v.metadata_json, v.entries_json, v.request_json, \
@@ -1274,9 +1288,11 @@ impl Catalog {
              FROM artifact_lineage l \
              JOIN artifact_versions v ON v.id = l.artifact_id \
              JOIN projects p ON p.id = v.project_id \
-             WHERE l.run_id = ? ORDER BY l.created_at DESC, v.id DESC LIMIT ?",
+             WHERE l.run_id = ? AND (? IS NULL OR v.id < ?) ORDER BY v.id DESC LIMIT ?",
         )
         .bind(run_id.to_string())
+        .bind(&before)
+        .bind(&before)
         .bind(to_i64(limit as u64, "run artifact list limit")?)
         .fetch_all(&self.pool)
         .await?;

@@ -688,11 +688,13 @@ pub struct CompleteSweepTrialRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SweepListResponse {
     pub sweeps: Vec<SweepRecord>,
+    pub next_before: Option<SweepId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SweepTrialListResponse {
     pub trials: Vec<SweepTrialRecord>,
+    pub next_before: Option<SweepTrialId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -755,6 +757,7 @@ pub struct CreateReportResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportListResponse {
     pub reports: Vec<ReportRecord>,
+    pub next_before: Option<ReportId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -924,6 +927,7 @@ pub struct RunArtifactRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunArtifactListResponse {
     pub artifacts: Vec<RunArtifactRecord>,
+    pub next_before: Option<ArtifactId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

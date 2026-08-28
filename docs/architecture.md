@@ -113,6 +113,20 @@ behavioral shape and does not carry data or SDK compatibility scaffolding;
 unsupported semantics produce clear errors rather than inert arguments. The
 HTTP namespace remains explicitly versioned under `/api/v1`.
 
+### Import and export
+
+The optional W&B importer is a Python boundary adapter. It scans source runs
+lazily, admits a bounded number of run workers, and sends deterministic metric
+batches. An fsynced checkpoint advances only after acknowledgement, allowing an
+ambiguous accepted request to replay under the server's existing idempotency
+contract. Source run files are chunked into ordinary CAS-backed artifacts.
+
+Portable Runloom export traverses only public bounded APIs. It writes raw
+full-resolution history pages, metadata JSON Lines, lineage links, and verified
+referenced CAS bytes to a temporary directory, then atomically publishes a
+format-versioned bundle. The exporter never requests dashboard samples or
+buffers complete histories and files.
+
 ### Sweep scheduler
 
 Sweep definitions, monotonic scheduler indexes, leased trials, and run bindings

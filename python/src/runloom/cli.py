@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+from importlib import import_module
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from runloom.client import RunloomClient
+from runloom.exporter import export_project
 from runloom.public_api import Api
 from runloom.run import sync_spool
+from runloom.wandb_importer import import_wandb_runs
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 
@@ -152,6 +155,93 @@ def history_command(
     with RunloomClient(server_url) as client:
         result = client.history(run_id, keys=key, after=after, limit=limit)
     typer.echo(json.dumps(result, sort_keys=True))
+
+
+@app.command("export")
+def export_command(
+    project: Annotated[str, typer.Argument(help="Project name to export.")],
+    destination: Annotated[
+        Path,
+        typer.Argument(help="New directory to create as a portable export bundle."),
+    ],
+    server_url: str = typer.Option(
+        "http://127.0.0.1:8787",
+        envvar="RUNLOOM_SERVER_URL",
+        help="Runloom server base URL.",
+    ),
+    timeout: float = typer.Option(300.0, min=0.1, help="Per-request timeout in seconds."),
+) -> None:
+    """Stream a lossless project export without loading complete histories."""
+    with RunloomClient(server_url, timeout=timeout) as client:
+        manifest = export_project(client, project, destination)
+    typer.echo(json.dumps(manifest, sort_keys=True))
+
+
+@app.command("import-wandb")
+def import_wandb_command(
+    entity: Annotated[str, typer.Argument(help="W&B entity or team name.")],
+    project: Annotated[str, typer.Argument(help="W&B project name.")],
+    target_project: str | None = typer.Option(
+        None,
+        help="Runloom project name; defaults to the W&B project name.",
+    ),
+    checkpoint: Annotated[
+        Path,
+        typer.Option(help="Durable JSON checkpoint used to resume interrupted imports."),
+    ] = "runloom-wandb-checkpoint.json",
+    workers: int = typer.Option(4, min=1, max=16, help="Runs imported concurrently."),
+    max_runs: int | None = typer.Option(
+        None,
+        min=1,
+        max=100_000,
+        help="Stop after this many source runs.",
+    ),
+    include_files: bool = typer.Option(
+        True,
+        "--files/--no-files",
+        help="Preserve W&B run files as versioned Runloom artifacts.",
+    ),
+    server_url: str = typer.Option(
+        "http://127.0.0.1:8787",
+        envvar="RUNLOOM_SERVER_URL",
+        help="Runloom server base URL.",
+    ),
+    timeout: float = typer.Option(300.0, min=0.1, help="Per-request timeout in seconds."),
+) -> None:
+    """Import W&B runs with bounded parallel workers and exact batch replay."""
+    try:
+        wandb = import_module("wandb")
+    except ModuleNotFoundError as error:
+        raise typer.BadParameter(
+            "the W&B importer requires the optional 'wandb' package in this environment"
+        ) from error
+    source_api = wandb.Api()
+    with RunloomClient(server_url, timeout=timeout) as client:
+        result = import_wandb_runs(
+            source_api,
+            client,
+            entity=entity,
+            project=project,
+            target_project=target_project or project,
+            checkpoint_path=checkpoint,
+            workers=workers,
+            max_runs=max_runs,
+            include_files=include_files,
+        )
+    typer.echo(
+        json.dumps(
+            {
+                "selected": result.selected,
+                "completed": result.completed,
+                "skipped": result.skipped,
+                "failed": result.failed,
+                "failures": result.failures,
+            },
+            sort_keys=True,
+        )
+    )
+    if result.failed:
+        raise typer.Exit(code=1)
 
 
 def _parse_json_filters(values: list[str], name: str) -> dict[str, object]:
