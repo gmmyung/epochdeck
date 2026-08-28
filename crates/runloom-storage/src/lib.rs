@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
@@ -136,6 +136,218 @@ pub struct SegmentSource {
     pub relative_path: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Extremum {
+    sequence: u64,
+    value: f64,
+}
+
+#[derive(Debug, Clone)]
+struct MetricRange {
+    minimum: Option<Extremum>,
+    maximum: Option<Extremum>,
+}
+
+#[derive(Debug, Clone)]
+struct SampleRow {
+    step: u64,
+    timestamp_ms: i64,
+    metrics: Vec<Option<f64>>,
+}
+
+#[derive(Debug, Clone)]
+struct SampleBucket {
+    ranges: Vec<MetricRange>,
+    references: BTreeMap<u64, usize>,
+    rows: BTreeMap<u64, SampleRow>,
+}
+
+impl SampleBucket {
+    fn new(metric_count: usize) -> Self {
+        Self {
+            ranges: vec![
+                MetricRange {
+                    minimum: None,
+                    maximum: None,
+                };
+                metric_count
+            ],
+            references: BTreeMap::new(),
+            rows: BTreeMap::new(),
+        }
+    }
+
+    fn observe(&mut self, sequence: u64, step: u64, timestamp_ms: i64, values: &[Option<f64>]) {
+        let changed = self.ranges.iter().zip(values).any(|(range, value)| {
+            value.is_some_and(|value| {
+                range
+                    .minimum
+                    .is_none_or(|candidate| value < candidate.value)
+                    || range
+                        .maximum
+                        .is_none_or(|candidate| value >= candidate.value)
+            })
+        });
+        if !changed {
+            return;
+        }
+        self.rows.insert(
+            sequence,
+            SampleRow {
+                step,
+                timestamp_ms,
+                metrics: values.to_vec(),
+            },
+        );
+
+        for (metric_index, value) in values.iter().copied().enumerate() {
+            let Some(value) = value else {
+                continue;
+            };
+            let candidate = Extremum { sequence, value };
+            let (replace_minimum, replace_maximum, old_minimum, old_maximum) = {
+                let range = &self.ranges[metric_index];
+                (
+                    range.minimum.is_none_or(|current| value < current.value),
+                    range.maximum.is_none_or(|current| value >= current.value),
+                    range.minimum.map(|current| current.sequence),
+                    range.maximum.map(|current| current.sequence),
+                )
+            };
+            if replace_minimum {
+                self.ranges[metric_index].minimum = Some(candidate);
+                self.replace_reference(old_minimum, sequence);
+            }
+            if replace_maximum {
+                self.ranges[metric_index].maximum = Some(candidate);
+                self.replace_reference(old_maximum, sequence);
+            }
+        }
+    }
+
+    fn replace_reference(&mut self, previous: Option<u64>, current: u64) {
+        if previous == Some(current) {
+            return;
+        }
+        if let Some(previous) = previous {
+            let remove = self.references.get_mut(&previous).is_some_and(|count| {
+                *count -= 1;
+                *count == 0
+            });
+            if remove {
+                self.references.remove(&previous);
+                self.rows.remove(&previous);
+            }
+        }
+        *self.references.entry(current).or_default() += 1;
+    }
+}
+
+#[derive(Debug)]
+pub struct MinMaxHistorySampler {
+    run_id: RunId,
+    keys: Vec<String>,
+    first_sequence: u64,
+    last_sequence: u64,
+    source_points: u64,
+    buckets: Vec<SampleBucket>,
+}
+
+impl MinMaxHistorySampler {
+    pub fn new(
+        run_id: RunId,
+        keys: &[String],
+        first_sequence: u64,
+        last_sequence: u64,
+        max_points: usize,
+    ) -> Result<Self, StorageError> {
+        if keys.is_empty() || first_sequence > last_sequence {
+            return Err(StorageError::InvalidSegment(
+                "sampled history requires keys and a valid sequence extent".to_owned(),
+            ));
+        }
+        let candidates_per_bucket = keys.len().checked_mul(2).ok_or_else(|| {
+            StorageError::InvalidSegment("sampled history key count overflow".to_owned())
+        })?;
+        if max_points < candidates_per_bucket {
+            return Err(StorageError::InvalidSegment(format!(
+                "sampled history needs at least {candidates_per_bucket} output points"
+            )));
+        }
+        let bucket_count = max_points / candidates_per_bucket;
+        Ok(Self {
+            run_id,
+            keys: keys.to_vec(),
+            first_sequence,
+            last_sequence,
+            source_points: 0,
+            buckets: (0..bucket_count)
+                .map(|_| SampleBucket::new(keys.len()))
+                .collect(),
+        })
+    }
+
+    pub fn read_segments(
+        &mut self,
+        store: &MetricStore,
+        segments: &[SegmentSource],
+    ) -> Result<(), StorageError> {
+        for segment in segments {
+            let path = store.resolve_segment(&segment.relative_path)?;
+            read_segment_sampled(&path, self)?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn finish(self) -> HistoryResponse {
+        let point_count = self.buckets.iter().map(|bucket| bucket.rows.len()).sum();
+        let mut sequence = Vec::with_capacity(point_count);
+        let mut step = Vec::with_capacity(point_count);
+        let mut timestamp_ms = Vec::with_capacity(point_count);
+        let mut metric_columns = (0..self.keys.len())
+            .map(|_| Vec::with_capacity(point_count))
+            .collect::<Vec<_>>();
+        for bucket in self.buckets {
+            for (row_sequence, row) in bucket.rows {
+                sequence.push(row_sequence);
+                step.push(row.step);
+                timestamp_ms.push(row.timestamp_ms);
+                for (column, value) in metric_columns.iter_mut().zip(row.metrics) {
+                    column.push(value);
+                }
+            }
+        }
+        HistoryResponse {
+            run_id: self.run_id,
+            sequence,
+            step,
+            timestamp_ms,
+            metrics: self.keys.into_iter().zip(metric_columns).collect(),
+            next_after: None,
+            sampled: true,
+            source_points: Some(self.source_points),
+        }
+    }
+
+    fn observe(&mut self, sequence: u64, step: u64, timestamp_ms: i64, values: &[Option<f64>]) {
+        if sequence < self.first_sequence || sequence > self.last_sequence {
+            return;
+        }
+        if !values.iter().any(Option::is_some) {
+            return;
+        }
+        self.source_points = self.source_points.saturating_add(1);
+        let span = u128::from(self.last_sequence - self.first_sequence) + 1;
+        let offset = u128::from(sequence - self.first_sequence);
+        let bucket_count = self.buckets.len() as u128;
+        let bucket_index = usize::try_from((offset * bucket_count) / span)
+            .unwrap_or(self.buckets.len() - 1)
+            .min(self.buckets.len() - 1);
+        self.buckets[bucket_index].observe(sequence, step, timestamp_ms, values);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MetricStore {
     root: PathBuf,
@@ -249,6 +461,8 @@ impl MetricStore {
                 .map(|key| (key, Vec::with_capacity(limit)))
                 .collect(),
             next_after: None,
+            sampled: false,
+            source_points: None,
         };
 
         for segment in segments {
@@ -262,6 +476,21 @@ impl MetricStore {
             response.next_after = response.sequence.last().copied();
         }
         Ok(response)
+    }
+
+    pub fn read_sampled_history(
+        &self,
+        run_id: RunId,
+        segments: &[SegmentSource],
+        keys: &[String],
+        first_sequence: u64,
+        last_sequence: u64,
+        max_points: usize,
+    ) -> Result<HistoryResponse, StorageError> {
+        let mut sampler =
+            MinMaxHistorySampler::new(run_id, keys, first_sequence, last_sequence, max_points)?;
+        sampler.read_segments(self, segments)?;
+        Ok(sampler.finish())
     }
 
     pub fn remove_segment(&self, relative_path: &str) -> Result<(), StorageError> {
@@ -425,6 +654,68 @@ fn read_segment(
     Ok(())
 }
 
+fn read_segment_sampled(
+    path: &Path,
+    sampler: &mut MinMaxHistorySampler,
+) -> Result<(), StorageError> {
+    let file = File::open(path).map_err(|source| StorageError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema = builder.schema();
+    let mut projection_indices = vec![
+        schema.index_of(SEQUENCE_COLUMN)?,
+        schema.index_of(STEP_COLUMN)?,
+        schema.index_of(TIMESTAMP_COLUMN)?,
+    ];
+    projection_indices.extend(
+        sampler
+            .keys
+            .iter()
+            .filter_map(|key| schema.index_of(&metric_column(key)).ok()),
+    );
+    projection_indices.sort_unstable();
+    projection_indices.dedup();
+    let projection = ProjectionMask::roots(builder.parquet_schema(), projection_indices);
+    let reader = builder
+        .with_projection(projection)
+        .with_batch_size(PARQUET_BATCH_SIZE)
+        .build()?;
+
+    for batch in reader {
+        let batch = batch?;
+        let sequence = required_array::<UInt64Array>(&batch, SEQUENCE_COLUMN)?;
+        let step = required_array::<UInt64Array>(&batch, STEP_COLUMN)?;
+        let timestamp = required_array::<Int64Array>(&batch, TIMESTAMP_COLUMN)?;
+        let metric_columns = sampler
+            .keys
+            .iter()
+            .map(|key| {
+                batch
+                    .column_by_name(&metric_column(key))
+                    .and_then(|column| column.as_any().downcast_ref::<Float64Array>())
+            })
+            .collect::<Vec<_>>();
+        let mut values = Vec::with_capacity(sampler.keys.len());
+        for row_index in 0..batch.num_rows() {
+            values.clear();
+            values.extend(metric_columns.iter().map(|column| {
+                column.and_then(|column| {
+                    (!column.is_null(row_index)).then(|| column.value(row_index))
+                })
+            }));
+            sampler.observe(
+                sequence.value(row_index),
+                step.value(row_index),
+                timestamp.value(row_index),
+                &values,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn required_array<'a, T: 'static>(
     batch: &'a RecordBatch,
     name: &str,
@@ -487,7 +778,7 @@ mod tests {
     use runloom_protocol::{IngestBatchRequest, MetricPoint, ProjectId, RunId};
     use tempfile::tempdir;
 
-    use super::{MetricStore, SegmentSource, StorageLayout};
+    use super::{MetricStore, MinMaxHistorySampler, SegmentSource, StorageLayout};
 
     #[test]
     fn creates_independent_storage_roots() -> Result<(), Box<dyn std::error::Error>> {
@@ -548,6 +839,94 @@ mod tests {
         assert_eq!(history.sequence, vec![1, 2]);
         assert_eq!(history.metrics["loss"], vec![Some(2.0), Some(1.0)]);
         assert!(!history.metrics.contains_key("reward"));
+        Ok(())
+    }
+
+    #[test]
+    fn min_max_sampling_preserves_spikes_across_segments() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let store = MetricStore::new(directory.path());
+        let project_id = ProjectId::new();
+        let run_id = RunId::new();
+        let values = [
+            0.0, 1.0, 2.0, 100.0, -100.0, 3.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+        ];
+        let mut segments = Vec::new();
+        for (batch_sequence, chunk) in values.chunks(6).enumerate() {
+            let first = batch_sequence * 6;
+            let request = IngestBatchRequest {
+                batch_sequence: batch_sequence as u64,
+                points: chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, value)| {
+                        let index = first + offset;
+                        MetricPoint {
+                            sequence: index as u64 + 1,
+                            step: index as u64,
+                            timestamp_ms: index as i64,
+                            metrics: BTreeMap::from([("loss".to_owned(), *value)]),
+                        }
+                    })
+                    .collect(),
+            };
+            let segment = store.write_batch(
+                project_id,
+                run_id,
+                &format!("{batch_sequence:064x}"),
+                &request,
+            )?;
+            segments.push(SegmentSource {
+                relative_path: segment.relative_path,
+            });
+        }
+
+        let history =
+            store.read_sampled_history(run_id, &segments, &["loss".to_owned()], 1, 12, 4)?;
+
+        assert_eq!(history.sequence, vec![4, 5, 7, 12]);
+        assert_eq!(
+            history.metrics["loss"],
+            vec![Some(100.0), Some(-100.0), Some(10.0), Some(15.0)]
+        );
+        assert_eq!(history.source_points, Some(12));
+        assert!(history.sampled);
+        assert_eq!(history.next_after, None);
+        Ok(())
+    }
+
+    #[test]
+    fn multi_metric_sampling_keeps_a_strict_shared_row_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = RunId::new();
+        let mut sampler =
+            MinMaxHistorySampler::new(run_id, &["a".to_owned(), "b".to_owned()], 1, 5, 4)?;
+        for (index, (a, b)) in [
+            (0.0, 5.0),
+            (-10.0, 4.0),
+            (3.0, 100.0),
+            (20.0, -100.0),
+            (1.0, 0.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sequence = index as u64 + 1;
+            sampler.observe(sequence, sequence - 1, index as i64, &[Some(a), Some(b)]);
+        }
+        let history = sampler.finish();
+
+        assert_eq!(history.sequence, vec![2, 3, 4]);
+        assert!(history.sequence.len() <= 4);
+        assert_eq!(
+            history.metrics["a"],
+            vec![Some(-10.0), Some(3.0), Some(20.0)]
+        );
+        assert_eq!(
+            history.metrics["b"],
+            vec![Some(4.0), Some(100.0), Some(-100.0)]
+        );
         Ok(())
     }
 }

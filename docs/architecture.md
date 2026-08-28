@@ -68,7 +68,10 @@ strict I/O and CPU budgets.
 
 The query layer operates on projected Arrow columns. Requests name runs, metric
 columns, an x-axis, and display resolution. Downsampling occurs before response
-serialization and preserves extrema within display buckets.
+serialization and preserves extrema within display buckets. The min/max sampler
+walks segment-manifest pages against a fixed sequence extent and retains only
+rows referenced by per-metric extrema. Its response memory is therefore bounded
+by the requested point and column budgets rather than the raw run length.
 
 Every query has cancellation, a memory budget, a maximum response-value budget,
 a bounded worker permit, and cache keys scoped to per-run revisions. Response

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { getHealth, getHistory, getRuns } from "./api";
+import { getHealth, getHistory, getRuns, getSampledHistory } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -42,13 +42,32 @@ describe("getHealth", () => {
           }),
           { status: 200 },
         ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            run_id: "run-id",
+            sequence: [],
+            step: [],
+            timestamp_ms: [],
+            metrics: { loss: [] },
+            next_after: null,
+            sampled: true,
+            source_points: 200_000,
+          }),
+          { status: 200 },
+        ),
       );
     vi.stubGlobal("fetch", fetchMock);
 
     await getRuns("robot learning");
     await getHistory("run-id", ["loss"], 500);
+    await getSampledHistory("run-id", ["loss"], 1_200);
 
     expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/projects/robot%20learning/runs?limit=200");
     expect(fetchMock.mock.calls[1][0]).toBe("/api/v1/runs/run-id/history?keys=loss&limit=500");
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "/api/v1/runs/run-id/history?keys=loss&max_points=1200",
+    );
   });
 });

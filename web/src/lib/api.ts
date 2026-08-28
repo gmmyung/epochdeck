@@ -32,6 +32,8 @@ export type History = {
   timestamp_ms: number[];
   metrics: Record<string, Array<number | null>>;
   next_after: number | null;
+  sampled: boolean;
+  source_points: number | null;
 };
 
 export function getHealth(signal?: AbortSignal): Promise<Health> {
@@ -66,6 +68,19 @@ export function getHistory(
   signal?: AbortSignal,
 ): Promise<History> {
   const query = new URLSearchParams({ keys: keys.join(","), limit: String(limit) });
+  return getJson<History>(`/api/v1/runs/${encodeURIComponent(runId)}/history?${query}`, signal);
+}
+
+export function getSampledHistory(
+  runId: string,
+  keys: string[],
+  maxPoints = 2_000,
+  signal?: AbortSignal,
+): Promise<History> {
+  const query = new URLSearchParams({
+    keys: keys.join(","),
+    max_points: String(maxPoints),
+  });
   return getJson<History>(`/api/v1/runs/${encodeURIComponent(runId)}/history?${query}`, signal);
 }
 

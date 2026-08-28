@@ -17,7 +17,7 @@ use runloom_protocol::{
     MAX_HISTORY_KEYS, MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MetricKeyListResponse,
     ProjectListResponse, ResumePolicy, RunId, RunListResponse, RunRecord, RunState,
 };
-use runloom_storage::{MetricStore, SegmentSource, StorageError};
+use runloom_storage::{MetricStore, MinMaxHistorySampler, SegmentSource, StorageError};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -237,8 +237,8 @@ async fn finish_run(
 struct HistoryQuery {
     keys: String,
     after: Option<u64>,
-    #[serde(default = "default_history_limit")]
-    limit: usize,
+    limit: Option<usize>,
+    max_points: Option<usize>,
 }
 
 async fn history(
@@ -247,12 +247,24 @@ async fn history(
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<HistoryResponse>, HttpError> {
     let keys = parse_history_keys(&query.keys)?;
-    if query.limit == 0 || query.limit > MAX_HISTORY_POINTS {
+    if query.limit.is_some() && query.max_points.is_some() {
+        return Err(HttpError::invalid(
+            "history queries cannot combine limit and max_points",
+        ));
+    }
+    state.catalog.get_run(run_id).await?;
+    if let Some(max_points) = query.max_points {
+        validate_sample_points(max_points, keys.len())?;
+        return sampled_history(&state, run_id, keys, query.after, max_points)
+            .await
+            .map(Json);
+    }
+    let limit = query.limit.unwrap_or_else(default_history_limit);
+    if limit == 0 || limit > MAX_HISTORY_POINTS {
         return Err(HttpError::invalid(format!(
             "history limit must be between 1 and {MAX_HISTORY_POINTS}"
         )));
     }
-    state.catalog.get_run(run_id).await?;
     let segments = state
         .catalog
         .list_segments(run_id, query.after)
@@ -265,7 +277,6 @@ async fn history(
     let segment_page_full = segments.len() == MAX_SEGMENTS_PER_QUERY;
     let metrics = state.metrics.clone();
     let after = query.after;
-    let limit = query.limit;
     let _permit = Arc::clone(&state.query_permits)
         .acquire_owned()
         .await
@@ -279,6 +290,70 @@ async fn history(
         response.next_after = response.sequence.last().copied();
     }
     Ok(Json(response))
+}
+
+async fn sampled_history(
+    state: &AppState,
+    run_id: RunId,
+    keys: Vec<String>,
+    after: Option<u64>,
+    max_points: usize,
+) -> Result<HistoryResponse, HttpError> {
+    let Some(extent) = state.catalog.metric_extent(run_id, after).await? else {
+        return Ok(HistoryResponse {
+            run_id,
+            sequence: Vec::new(),
+            step: Vec::new(),
+            timestamp_ms: Vec::new(),
+            metrics: keys.into_iter().map(|key| (key, Vec::new())).collect(),
+            next_after: None,
+            sampled: true,
+            source_points: Some(0),
+        });
+    };
+    let mut sampler = MinMaxHistorySampler::new(
+        run_id,
+        &keys,
+        extent.first_sequence,
+        extent.last_sequence,
+        max_points,
+    )?;
+    let _permit = Arc::clone(&state.query_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
+    let mut segment_cursor = after;
+    loop {
+        let records = state.catalog.list_segments(run_id, segment_cursor).await?;
+        let Some(page_last) = records.last().map(|segment| segment.last_sequence) else {
+            break;
+        };
+        let page_full = records.len() == MAX_SEGMENTS_PER_QUERY;
+        let segments = records
+            .into_iter()
+            .map(|segment| SegmentSource {
+                relative_path: segment.relative_path,
+            })
+            .collect::<Vec<_>>();
+        let metrics = state.metrics.clone();
+        sampler =
+            tokio::task::spawn_blocking(move || -> Result<MinMaxHistorySampler, StorageError> {
+                sampler.read_segments(&metrics, &segments)?;
+                Ok(sampler)
+            })
+            .await
+            .map_err(|error| HttpError::internal(format!("query worker failed: {error}")))??;
+        if page_last >= extent.last_sequence || !page_full {
+            break;
+        }
+        if segment_cursor == Some(page_last) {
+            return Err(HttpError::internal(
+                "sampled history cursor did not advance",
+            ));
+        }
+        segment_cursor = Some(page_last);
+    }
+    Ok(sampler.finish())
 }
 
 fn validate_project_name(project: &str) -> Result<(), HttpError> {
@@ -377,6 +452,16 @@ fn parse_history_keys(value: &str) -> Result<Vec<String>, HttpError> {
 
 fn default_history_limit() -> usize {
     1_000
+}
+
+fn validate_sample_points(max_points: usize, key_count: usize) -> Result<(), HttpError> {
+    let minimum = key_count * 2;
+    if max_points < minimum || max_points > MAX_HISTORY_POINTS {
+        return Err(HttpError::invalid(format!(
+            "history max_points must be between {minimum} and {MAX_HISTORY_POINTS} for {key_count} requested metric key(s)"
+        )));
+    }
+    Ok(())
 }
 
 fn default_list_limit() -> usize {
@@ -566,6 +651,32 @@ mod tests {
         assert_eq!(history.sequence, vec![1]);
         assert_eq!(history.metrics["loss"], vec![Some(2.0)]);
         assert_eq!(history.next_after, Some(1));
+        assert!(!history.sampled);
+        assert_eq!(history.source_points, None);
+
+        let sampled_path = format!(
+            "/api/v1/runs/{}/history?keys=loss&max_points=2",
+            created.run.id
+        );
+        let response = router
+            .clone()
+            .oneshot(Request::get(sampled_path).body(Body::empty())?)
+            .await?;
+        let sampled: HistoryResponse = response_json(response).await?;
+        assert_eq!(sampled.sequence, vec![1, 2]);
+        assert_eq!(sampled.metrics["loss"], vec![Some(2.0), Some(1.0)]);
+        assert_eq!(sampled.source_points, Some(2));
+        assert!(sampled.sampled);
+
+        let invalid_path = format!(
+            "/api/v1/runs/{}/history?keys=loss&limit=2&max_points=2",
+            created.run.id
+        );
+        let response = router
+            .clone()
+            .oneshot(Request::get(invalid_path).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         let response = router
             .clone()

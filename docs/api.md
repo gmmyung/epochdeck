@@ -18,12 +18,18 @@ Create bodies accept `id`, `name`, `config`, and `resume`. Resume is one of
 - `GET /runs/{run_id}/metrics` lists discovered scalar keys.
 - `GET /runs/{run_id}/history?keys=loss,reward&limit=1000` returns a columnar
   page with sequence, step, timestamp, and only the requested metric columns.
+- `GET /runs/{run_id}/history?keys=loss&max_points=2000` scans the selected
+  columns across the run and returns a bounded min/max representation.
 
 Batch sequence and canonical request digest form the idempotency contract. An
 identical replay succeeds as a duplicate; reusing a sequence for different
 contents returns a conflict. History requests accept at most 32 columns and
-5,000 points. Continue a full-resolution scan with the returned `next_after`
-cursor. These response bounds are not retention quotas.
+5,000 points. `limit` selects full-resolution cursor pagination;
+`max_points` selects spike-preserving display sampling, and the two parameters
+are mutually exclusive. Sampled responses set `sampled` and `source_points`;
+full-resolution pages continue with the returned `next_after` cursor. A sampled
+budget must allow at least two extrema per requested metric. These response
+bounds are not retention quotas.
 
 ## Discovery
 

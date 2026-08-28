@@ -21,16 +21,17 @@ not a reduction in the final parity goal.
 - [x] Arrow conversion and immutable wide Parquet segments.
 - [x] Initial config, summary, nested scalar metrics, and explicit steps.
 - [x] Metric-key discovery and bounded columnar history APIs.
+- [x] Server-side, spike-preserving min/max downsampling.
 - [x] Workload-shaped storage benchmark harness.
 - [ ] Config mutation and non-numeric summary semantics.
-- [ ] Background compaction and server-side min/max downsampling.
+- [ ] Background compaction.
 - [ ] Full W&B lifecycle contract suite.
 
 ## Milestone 2: dashboard and monitoring
 
-- Project and run navigation.
+- [x] Project and run navigation.
 - Lazy, virtualized Canvas metric charts.
-- Server-side min/max downsampling.
+- [x] Server-side min/max downsampling.
 - Per-run revision caches and realtime deltas.
 - System metrics and alerts.
 

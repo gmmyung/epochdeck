@@ -66,5 +66,7 @@ accept inert compatibility flags.
 The current partial scalar contract supports finite numeric and boolean values,
 nested dictionaries flattened with `/`, explicit or automatic steps, durable
 local spooling, resumable batch delivery, Parquet persistence, and bounded
-column-projected history. Strings, media, tables, histograms, and config mutation
-remain unsupported and fail explicitly.
+column-projected history. Dashboard queries scan only requested columns and use
+a bounded min/max representation that preserves local spikes without deleting
+raw samples. Strings, media, tables, histograms, and config mutation remain
+unsupported and fail explicitly.

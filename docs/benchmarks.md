@@ -8,15 +8,15 @@ just benchmark-metrics 200000 180
 ```
 
 It generates 200,000 rows with 180 numeric metric columns, writes immutable
-Zstd-compressed wide Parquet segments, and then requests 5,000 values from one
-projected column. Temporary data is removed after each run.
+Zstd-compressed wide Parquet segments, and then scans one projected column into
+a 5,000-point min/max budget. Temporary data is removed after each run.
 
 Reference smoke result on an Apple M5 Pro on 2026-08-28:
 
 ```text
 rows=200000 metrics=180 segments=196
-write_seconds=6.660 stored_mib=114.78
-projected_query_seconds=0.002 returned_points=5000
+write_seconds=7.831 stored_mib=114.78
+sampled_query_seconds=0.037 source_points=200000 returned_points=5000
 ```
 
 This is a development measurement, not a cross-machine performance guarantee.

@@ -229,6 +229,10 @@ pub struct HistoryResponse {
     pub timestamp_ms: Vec<i64>,
     pub metrics: BTreeMap<String, Vec<Option<f64>>>,
     pub next_after: Option<u64>,
+    #[serde(default)]
+    pub sampled: bool,
+    #[serde(default)]
+    pub source_points: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,7 +255,9 @@ impl ApiError {
 mod tests {
     use std::str::FromStr;
 
-    use super::{HealthResponse, HealthStatus, ProjectId, ResumePolicy, RunId, RunState};
+    use super::{
+        HealthResponse, HealthStatus, HistoryResponse, ProjectId, ResumePolicy, RunId, RunState,
+    };
 
     #[test]
     fn identifiers_are_distinct_and_round_trip() -> Result<(), uuid::Error> {
@@ -273,6 +279,22 @@ mod tests {
     fn public_enums_use_stable_wire_names() -> Result<(), serde_json::Error> {
         assert_eq!(serde_json::to_string(&ResumePolicy::Must)?, "\"must\"");
         assert_eq!(serde_json::to_string(&RunState::Finished)?, "\"finished\"");
+        Ok(())
+    }
+
+    #[test]
+    fn history_sampling_metadata_is_backward_compatible() -> Result<(), serde_json::Error> {
+        let response: HistoryResponse = serde_json::from_value(serde_json::json!({
+            "run_id": RunId::new(),
+            "sequence": [],
+            "step": [],
+            "timestamp_ms": [],
+            "metrics": {},
+            "next_after": null
+        }))?;
+
+        assert!(!response.sampled);
+        assert_eq!(response.source_points, None);
         Ok(())
     }
 }

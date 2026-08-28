@@ -3,10 +3,10 @@
 
   import {
     getHealth,
-    getHistory,
     getMetricKeys,
     getProjects,
     getRuns,
+    getSampledHistory,
     type Health,
     type History,
     type Project,
@@ -113,7 +113,7 @@
 
   async function loadMetric(metric: string, signal: AbortSignal): Promise<void> {
     if (!selectedRun) return;
-    history = await getHistory(selectedRun.id, [metric], 5_000, signal);
+    history = await getSampledHistory(selectedRun.id, [metric], 2_000, signal);
   }
 
   function showError(reason: unknown): void {
@@ -263,8 +263,11 @@
                 </div>
                 <canvas bind:this={canvas} aria-label={`${selectedMetric} history chart`}></canvas>
                 <div class="chart-footer">
-                  <span>{history?.sequence.length ?? 0} points loaded</span>
-                  <span>bounded at 5,000</span>
+                  <span
+                    >{history?.sequence.length ?? 0} extrema from
+                    {(history?.source_points ?? 0).toLocaleString()} source points</span
+                  >
+                  <span>min/max sampled · 2,000 point budget</span>
                 </div>
               </article>
 

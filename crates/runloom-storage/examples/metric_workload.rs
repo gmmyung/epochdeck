@@ -53,7 +53,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let write_elapsed = started.elapsed();
 
     let query_started = Instant::now();
-    let history = store.read_history(run_id, &segments, &["metric_0".to_owned()], None, 5_000)?;
+    let history = store.read_sampled_history(
+        run_id,
+        &segments,
+        &["metric_0".to_owned()],
+        1,
+        rows as u64,
+        5_000,
+    )?;
     let query_elapsed = query_started.elapsed();
 
     println!(
@@ -66,8 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stored_bytes as f64 / (1024.0 * 1024.0)
     );
     println!(
-        "projected_query_seconds={:.3} returned_points={}",
+        "sampled_query_seconds={:.3} source_points={} returned_points={}",
         query_elapsed.as_secs_f64(),
+        history.source_points.unwrap_or_default(),
         history.sequence.len()
     );
     Ok(())

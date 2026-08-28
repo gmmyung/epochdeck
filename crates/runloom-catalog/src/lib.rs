@@ -119,6 +119,12 @@ pub struct SegmentRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricExtent {
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchStatus {
     Missing,
     Duplicate { metric_revision: u64 },
@@ -534,6 +540,45 @@ impl Catalog {
         rows.into_iter().map(segment_from_row).collect()
     }
 
+    pub async fn metric_extent(
+        &self,
+        run_id: RunId,
+        after_sequence: Option<u64>,
+    ) -> Result<Option<MetricExtent>, CatalogError> {
+        let after_sequence_i64 = after_sequence
+            .map(|value| to_i64(value, "history cursor"))
+            .transpose()?
+            .unwrap_or(-1);
+        let row = query(
+            "SELECT MIN(first_sequence) AS first_sequence, \
+                    MAX(last_sequence) AS last_sequence \
+             FROM metric_segments WHERE run_id = ? AND last_sequence > ?",
+        )
+        .bind(run_id.to_string())
+        .bind(after_sequence_i64)
+        .fetch_one(&self.pool)
+        .await?;
+        let Some(stored_first) = row.get::<Option<i64>, _>("first_sequence") else {
+            return Ok(None);
+        };
+        let stored_last = row
+            .get::<Option<i64>, _>("last_sequence")
+            .ok_or_else(|| CatalogError::InvalidData("metric extent has no end".to_owned()))?;
+        let stored_first = from_i64(stored_first, "first sequence")?;
+        let last_sequence = from_i64(stored_last, "last sequence")?;
+        let first_sequence = match after_sequence {
+            Some(cursor) => cursor
+                .checked_add(1)
+                .ok_or_else(|| CatalogError::InvalidData("history cursor overflow".to_owned()))?
+                .max(stored_first),
+            None => stored_first,
+        };
+        Ok((first_sequence <= last_sequence).then_some(MetricExtent {
+            first_sequence,
+            last_sequence,
+        }))
+    }
+
     async fn metric_revision(&self, run_id: RunId) -> Result<u64, CatalogError> {
         let mut transaction = self.pool.begin().await?;
         let revision = metric_revision_in(&mut transaction, run_id).await?;
@@ -711,7 +756,7 @@ mod tests {
     use runloom_protocol::{CreateRunRequest, ResumePolicy, RunState};
     use tempfile::tempdir;
 
-    use super::{Catalog, CatalogError};
+    use super::{Catalog, CatalogError, SegmentManifest};
 
     #[tokio::test]
     async fn creates_resumes_and_finishes_a_run() -> Result<(), Box<dyn std::error::Error>> {
@@ -735,6 +780,30 @@ mod tests {
         };
         let (_, resumed) = catalog.create_or_resume_run("robotics", &resume).await?;
         assert!(resumed);
+
+        catalog
+            .register_batch(
+                created.id,
+                0,
+                "digest",
+                &SegmentManifest {
+                    id: "segment-1".to_owned(),
+                    signature: "loss".to_owned(),
+                    relative_path: "segment-1.parquet".to_owned(),
+                    first_sequence: 1,
+                    last_sequence: 10,
+                    row_count: 10,
+                    byte_size: 100,
+                },
+                &BTreeMap::new(),
+            )
+            .await?;
+        let extent = catalog.metric_extent(created.id, Some(2)).await?;
+        assert_eq!(
+            extent.map(|extent| (extent.first_sequence, extent.last_sequence)),
+            Some((3, 10))
+        );
+        assert_eq!(catalog.metric_extent(created.id, Some(10)).await?, None);
 
         let finished = catalog.finish_run(created.id, &BTreeMap::new()).await?;
         assert_eq!(finished.state, RunState::Finished);

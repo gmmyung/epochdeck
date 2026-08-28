@@ -85,9 +85,16 @@ class RunloomClient:
         *,
         keys: list[str],
         after: int | None = None,
-        limit: int = 1_000,
+        limit: int | None = None,
+        max_points: int | None = None,
     ) -> dict[str, Any]:
-        params: dict[str, str | int] = {"keys": ",".join(keys), "limit": limit}
+        if limit is not None and max_points is not None:
+            raise ValueError("history cannot combine limit and max_points")
+        params: dict[str, str | int] = {"keys": ",".join(keys)}
+        if max_points is not None:
+            params["max_points"] = max_points
+        else:
+            params["limit"] = 1_000 if limit is None else limit
         if after is not None:
             params["after"] = after
         return self._request("GET", f"/api/v1/runs/{run_id}/history", params=params)
