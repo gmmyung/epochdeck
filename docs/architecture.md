@@ -147,8 +147,9 @@ column names, not materialized history. The catalog transaction validates that
 every referenced run belongs to the report project.
 
 The dashboard renders the grid directly from that definition. Metric histories
-remain lazy, sampled, cancellable, and capped at four concurrent requests, so a
-large report cannot turn into an unbounded fan-out or duplicate source data.
+remain lazy, aggregated, cancellable, and capped at four concurrent requests,
+so a large report cannot turn into an unbounded fan-out or duplicate source
+data.
 
 ### Dashboard
 
@@ -157,8 +158,24 @@ It requests values only for visible charts and selected metrics. Off-screen
 charts use browser content visibility and intersection observers; bounded
 columnar JSON responses render directly with Canvas.
 
-Realtime updates are deltas keyed by run sequence. The dashboard never polls
-complete histories.
+Run data is separated into summary, configuration, metrics, media, traces, and
+artifact tabs. Config and summary documents render as expandable trees. Metric
+keys are searchable, and each chart keeps interaction state locally for
+pan/zoom/selection, manual linear or logarithmic domains, smoothing, hover
+inspection, and line or exact min/max band display. The server re-aggregates the
+settled step viewport after pan, wheel zoom, or region zoom. Exact Parquet step
+statistics prune disjoint row groups; uncertain statistics fall back to reading
+so the aggregate remains lossless. Smoothing applies only to the bucket-last
+center line. Media snapshots are grouped by type and key into step timelines.
+Artifact manifests render as a tabbed file browser; whole ZIP responses are
+produced with fixed buffers on a bounded download worker, and the worker permit
+is retained through terminal stream-error delivery.
+
+Live charts compare per-run metric revisions and request a fresh bounded
+aggregate when a revision changes. They do not append raw deltas to existing
+buckets because later sequence values can update an older step bucket. The
+dashboard never requests complete histories for chart rendering. See
+[ADR 0012](adr/0012-exact-bucket-chart-history.md).
 
 ## Storage layout
 

@@ -19,6 +19,7 @@ runloom-storage = { path = "../runloom-storage" }
 rust-embed = { version = "8.0", optional = true }
 serde.workspace = true
 serde_json.workspace = true
+serde_urlencoded.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
@@ -26,6 +27,7 @@ tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 tempfile = "3.0"

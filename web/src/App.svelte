@@ -2,23 +2,22 @@
   import { onMount } from "svelte";
 
   import {
-    artifactFileUrl,
     blobUrl,
     getAlerts,
+    getChartHistory,
     getHealth,
-    getHistory,
     getMetricKeys,
     getProjects,
     getReports,
     getRun,
     getRuns,
-    getRichValues,
-    getRunArtifacts,
-    getSampledHistory,
-    getTraces,
+    getRichValuePage,
+    getRunArtifactPage,
+    getTracePage,
     type Alert,
+    type ChartHistory,
+    type ChartHistoryViewport,
     type Health,
-    type History,
     type Project,
     type Report,
     type ReportPanel,
@@ -28,18 +27,31 @@
     type TraceSpan,
   } from "./lib/api";
   import {
-    CHART_POINT_BUDGET,
-    DELTA_POINT_BUDGET,
-    HistoryCache,
-    mergeHistoryDelta,
-  } from "./lib/history-cache";
+    chartViewportKey as viewportKey,
+    metricChartRequestKey as metricRequestKey,
+    normalizeChartViewport as normalizedViewport,
+  } from "./lib/chart-request";
+  import { CHART_BUCKET_BUDGET, ChartHistoryCache } from "./lib/history-cache";
+  import ArtifactBrowser from "./lib/ArtifactBrowser.svelte";
+  import Icon from "./lib/Icon.svelte";
+  import JsonTreeNode from "./lib/JsonTreeNode.svelte";
+  import MediaTimeline from "./lib/MediaTimeline.svelte";
   import MetricChart from "./lib/MetricChart.svelte";
-  import HistogramChart from "./lib/HistogramChart.svelte";
   import MarkdownPanel from "./lib/MarkdownPanel.svelte";
+  import { filterMetricKeys } from "./lib/metric-filter";
 
   const MAX_CONCURRENT_CHART_REQUESTS = 4;
   const LIVE_REFRESH_MS = 2_000;
-  const historyCache = new HistoryCache();
+  const historyCache = new ChartHistoryCache();
+  const RUN_TABS = [
+    { id: "summary", label: "Summary", icon: "summary" },
+    { id: "configuration", label: "Configuration", icon: "settings" },
+    { id: "metrics", label: "Metrics", icon: "chart" },
+    { id: "media", label: "Media", icon: "media" },
+    { id: "traces", label: "Traces", icon: "trace" },
+    { id: "artifacts", label: "Artifacts", icon: "archive" },
+  ] as const;
+  type RunTab = (typeof RUN_TABS)[number]["id"];
 
   let health: Health | null = null;
   let projects: Project[] = [];
@@ -53,15 +65,26 @@
   let richValues: RichValue[] = [];
   let artifacts: RunArtifact[] = [];
   let traces: TraceSpan[] = [];
+  let activeRunTab: RunTab = "metrics";
+  let metricSearch = "";
+  let loadedRunTabs = new Set<RunTab>();
+  let loadingRunTabs = new Set<RunTab>();
+  let loadingMoreTab: RunTab | null = null;
+  let richValueCursor: string | null = null;
+  let artifactCursor: string | null = null;
+  let traceCursor: string | null = null;
   let traceSearch = "";
   let traceSearchLoading = false;
-  let histories: Record<string, History> = {};
-  let historyRevisions: Record<string, number> = {};
+  let histories: Record<string, ChartHistory> = {};
+  let historyRequestKeys: Record<string, string> = {};
+  let metricViewports: Record<string, ChartHistoryViewport | null> = {};
   let loadingMetrics = new Set<string>();
   let visibleMetrics = new Set<string>();
   let pendingMetrics: string[] = [];
   let activeChartRequests = 0;
-  let reportHistories: Record<string, History> = {};
+  let reportHistories: Record<string, ChartHistory> = {};
+  let reportHistoryRequestKeys: Record<string, string> = {};
+  let reportViewports: Record<string, ChartHistoryViewport | null> = {};
   let loadingReportMetrics = new Set<string>();
   let pendingReportMetrics: Array<{
     identity: string;
@@ -74,6 +97,9 @@
   let loading = true;
   let projectController: AbortController | null = null;
   let runController: AbortController | null = null;
+  let selectionGeneration = 0;
+
+  $: filteredMetricKeys = filterMetricKeys(metricKeys, metricSearch);
 
   onMount(() => {
     const controller = new AbortController();
@@ -118,28 +144,39 @@
   }
 
   async function chooseRun(run: Run): Promise<void> {
+    selectionGeneration += 1;
     runController?.abort();
     const controller = new AbortController();
     runController = controller;
     selectedReport = null;
     resetReportState();
     resetChartState();
+    metricKeys = [];
+    alerts = [];
+    richValues = [];
+    artifacts = [];
+    traces = [];
+    traceSearch = "";
+    loadedRunTabs = new Set();
+    loadingRunTabs = new Set();
+    loadingMoreTab = null;
+    richValueCursor = null;
+    artifactCursor = null;
+    traceCursor = null;
     selectedRun = run;
+    activeRunTab = "metrics";
+    metricSearch = "";
     error = null;
     try {
-      [metricKeys, alerts, richValues, artifacts, traces] = await Promise.all([
-        getMetricKeys(run.id, controller.signal),
-        getAlerts(run.id, controller.signal),
-        getRichValues(run.id, controller.signal),
-        getRunArtifacts(run.id, controller.signal),
-        getTraces(run.id, "", controller.signal),
-      ]);
+      metricKeys = await getMetricKeys(run.id, controller.signal);
+      loadedRunTabs = new Set(["configuration", "metrics"]);
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
     }
   }
 
   function resetRunSelection(): void {
+    selectionGeneration += 1;
     runController?.abort();
     selectedRun = null;
     selectedReport = null;
@@ -149,13 +186,22 @@
     artifacts = [];
     traces = [];
     traceSearch = "";
+    activeRunTab = "metrics";
+    metricSearch = "";
+    loadedRunTabs = new Set();
+    loadingRunTabs = new Set();
+    loadingMoreTab = null;
+    richValueCursor = null;
+    artifactCursor = null;
+    traceCursor = null;
     resetChartState();
     resetReportState();
   }
 
   function resetChartState(): void {
     histories = {};
-    historyRevisions = {};
+    historyRequestKeys = {};
+    metricViewports = {};
     loadingMetrics = new Set();
     visibleMetrics = new Set();
     pendingMetrics = [];
@@ -163,11 +209,14 @@
 
   function resetReportState(): void {
     reportHistories = {};
+    reportHistoryRequestKeys = {};
+    reportViewports = {};
     loadingReportMetrics = new Set();
     pendingReportMetrics = [];
   }
 
   function chooseReport(report: Report): void {
+    selectionGeneration += 1;
     runController?.abort();
     runController = new AbortController();
     selectedRun = null;
@@ -178,18 +227,52 @@
     artifacts = [];
     traces = [];
     traceSearch = "";
+    activeRunTab = "metrics";
+    metricSearch = "";
+    loadedRunTabs = new Set();
+    loadingRunTabs = new Set();
+    loadingMoreTab = null;
+    richValueCursor = null;
+    artifactCursor = null;
+    traceCursor = null;
     resetChartState();
     resetReportState();
     error = null;
   }
 
-  function reportChartVisible(panel: ReportPanel, metric: string): void {
+  function reportChartVisibility(panel: ReportPanel, metric: string, visible: boolean): void {
+    if (!visible) return;
     const runId = panel.run_id;
     if (!runId) return;
     const identity = `${panel.id}:${runId}:${metric}`;
-    if (reportHistories[identity] || loadingReportMetrics.has(identity)) return;
-    if (pendingReportMetrics.some((candidate) => candidate.identity === identity)) return;
-    pendingReportMetrics = [...pendingReportMetrics, { identity, runId, metric }];
+    queueReportMetric({ identity, runId, metric });
+  }
+
+  function reportChartViewport(
+    panel: ReportPanel,
+    metric: string,
+    stepMin: number | null,
+    stepMax: number | null,
+  ): void {
+    const runId = panel.run_id;
+    if (!runId) return;
+    const identity = `${panel.id}:${runId}:${metric}`;
+    const viewport = normalizedViewport(stepMin, stepMax);
+    if (viewportKey(reportViewports[identity] ?? null) === viewportKey(viewport)) return;
+    reportViewports = { ...reportViewports, [identity]: viewport };
+    queueReportMetric({ identity, runId, metric });
+  }
+
+  function queueReportMetric(request: { identity: string; runId: string; metric: string }): void {
+    const requestKey = viewportKey(reportViewports[request.identity] ?? null);
+    if (
+      reportHistoryRequestKeys[request.identity] === requestKey ||
+      loadingReportMetrics.has(request.identity)
+    ) {
+      return;
+    }
+    if (pendingReportMetrics.some((candidate) => candidate.identity === request.identity)) return;
+    pendingReportMetrics = [...pendingReportMetrics, request];
     drainReportMetricQueue();
   }
 
@@ -203,21 +286,41 @@
       const report = selectedReport;
       const controller = runController;
       if (!report || !controller) continue;
+      const generation = selectionGeneration;
+      const viewport = reportViewports[request.identity] ?? null;
+      const requestKey = viewportKey(viewport);
       activeReportRequests += 1;
       loadingReportMetrics = new Set([...loadingReportMetrics, request.identity]);
-      void getSampledHistory(request.runId, [request.metric], CHART_POINT_BUDGET, controller.signal)
+      void getChartHistory(request.runId, [request.metric], {
+        maxBuckets: CHART_BUCKET_BUDGET,
+        viewport: viewport ?? undefined,
+        signal: controller.signal,
+      })
         .then((history) => {
-          if (selectedReport?.id !== report.id) return;
+          if (generation !== selectionGeneration || selectedReport?.id !== report.id) return;
+          if (viewportKey(reportViewports[request.identity] ?? null) !== requestKey) return;
           reportHistories = { ...reportHistories, [request.identity]: history };
+          reportHistoryRequestKeys = {
+            ...reportHistoryRequestKeys,
+            [request.identity]: requestKey,
+          };
         })
         .catch((reason) => {
-          if (!controller.signal.aborted) showError(reason);
+          if (generation === selectionGeneration && !controller.signal.aborted) showError(reason);
         })
         .finally(() => {
           activeReportRequests -= 1;
-          const nextLoading = new Set(loadingReportMetrics);
-          nextLoading.delete(request.identity);
-          loadingReportMetrics = nextLoading;
+          if (generation === selectionGeneration) {
+            const nextLoading = new Set(loadingReportMetrics);
+            nextLoading.delete(request.identity);
+            loadingReportMetrics = nextLoading;
+            if (
+              selectedReport?.id === report.id &&
+              viewportKey(reportViewports[request.identity] ?? null) !== requestKey
+            ) {
+              queueReportMetric(request);
+            }
+          }
           drainReportMetricQueue();
         });
     }
@@ -227,14 +330,26 @@
     return `${panel.id}:${panel.run_id ?? ""}:${metric}`;
   }
 
-  function chartVisible(metric: string): void {
-    if (!visibleMetrics.has(metric)) visibleMetrics = new Set([...visibleMetrics, metric]);
+  function chartVisibility(metric: string, visible: boolean): void {
+    const next = new Set(visibleMetrics);
+    if (visible) next.add(metric);
+    else next.delete(metric);
+    visibleMetrics = next;
+    if (visible) queueMetric(metric);
+  }
+
+  function chartViewport(metric: string, stepMin: number | null, stepMax: number | null): void {
+    const viewport = normalizedViewport(stepMin, stepMax);
+    if (viewportKey(metricViewports[metric] ?? null) === viewportKey(viewport)) return;
+    metricViewports = { ...metricViewports, [metric]: viewport };
     queueMetric(metric);
   }
 
   function queueMetric(metric: string): void {
     const run = selectedRun;
-    if (!run || historyRevisions[metric] === run.metric_revision) return;
+    if (!run) return;
+    const requestKey = metricRequestKey(run.metric_revision, metricViewports[metric] ?? null);
+    if (historyRequestKeys[metric] === requestKey) return;
     if (loadingMetrics.has(metric) || pendingMetrics.includes(metric)) return;
     pendingMetrics = [...pendingMetrics, metric];
     drainMetricQueue();
@@ -247,59 +362,73 @@
       const run = selectedRun;
       const controller = runController;
       if (!run || !controller) continue;
+      const generation = selectionGeneration;
+      const viewport = metricViewports[metric] ?? null;
+      const requestKey = metricRequestKey(run.metric_revision, viewport);
       activeChartRequests += 1;
       loadingMetrics = new Set([...loadingMetrics, metric]);
-      void loadMetric(run, metric, controller.signal)
+      void loadMetric(run, metric, viewport, requestKey, generation, controller.signal)
         .catch((reason) => {
-          if (!controller.signal.aborted) showError(reason);
+          if (generation === selectionGeneration && !controller.signal.aborted) showError(reason);
         })
         .finally(() => {
           activeChartRequests -= 1;
-          const nextLoading = new Set(loadingMetrics);
-          nextLoading.delete(metric);
-          loadingMetrics = nextLoading;
+          if (generation === selectionGeneration) {
+            const nextLoading = new Set(loadingMetrics);
+            nextLoading.delete(metric);
+            loadingMetrics = nextLoading;
+            if (
+              selectedRun?.id === run.id &&
+              metricRequestKey(selectedRun.metric_revision, metricViewports[metric] ?? null) !==
+                requestKey
+            ) {
+              queueMetric(metric);
+            }
+          }
           drainMetricQueue();
         });
     }
   }
 
-  async function loadMetric(run: Run, metric: string, signal: AbortSignal): Promise<void> {
+  async function loadMetric(
+    run: Run,
+    metric: string,
+    viewport: ChartHistoryViewport | null,
+    requestKey: string,
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<void> {
     const revision = run.metric_revision;
-    const cached = historyCache.get(run.id, metric, revision);
+    const cached = historyCache.get(run.id, metric, revision, viewport?.stepMin, viewport?.stepMax);
     if (cached) {
-      publishHistory(run.id, metric, revision, cached);
+      publishHistory(run.id, metric, requestKey, generation, cached);
       return;
     }
 
-    const current = histories[metric];
-    let result: History | undefined;
-    if (current?.source_last_sequence !== null && current?.source_last_sequence !== undefined) {
-      const delta = await getHistory(
-        run.id,
-        [metric],
-        DELTA_POINT_BUDGET + 1,
-        signal,
-        current.source_last_sequence,
-      );
-      if (
-        delta.next_after === null &&
-        delta.sequence.length <= DELTA_POINT_BUDGET &&
-        current.sequence.length + delta.sequence.length <= CHART_POINT_BUDGET + DELTA_POINT_BUDGET
-      ) {
-        result = mergeHistoryDelta(current, delta, metric);
-      }
-    }
-    if (!result) {
-      result = await getSampledHistory(run.id, [metric], CHART_POINT_BUDGET, signal);
-    }
-    historyCache.set(run.id, metric, revision, result);
-    publishHistory(run.id, metric, revision, result);
+    const result = await getChartHistory(run.id, [metric], {
+      maxBuckets: CHART_BUCKET_BUDGET,
+      viewport: viewport ?? undefined,
+      signal,
+    });
+    historyCache.set(run.id, metric, revision, result, viewport?.stepMin, viewport?.stepMax);
+    publishHistory(run.id, metric, requestKey, generation, result);
   }
 
-  function publishHistory(runId: string, metric: string, revision: number, result: History): void {
-    if (selectedRun?.id !== runId) return;
+  function publishHistory(
+    runId: string,
+    metric: string,
+    requestKey: string,
+    generation: number,
+    result: ChartHistory,
+  ): void {
+    if (generation !== selectionGeneration || selectedRun?.id !== runId) return;
+    if (
+      metricRequestKey(selectedRun.metric_revision, metricViewports[metric] ?? null) !== requestKey
+    ) {
+      return;
+    }
     histories = { ...histories, [metric]: result };
-    historyRevisions = { ...historyRevisions, [metric]: revision };
+    historyRequestKeys = { ...historyRequestKeys, [metric]: requestKey };
   }
 
   async function refreshSelectedRun(): Promise<void> {
@@ -313,15 +442,27 @@
       const revisionChanged = latest.metric_revision !== selectedRun.metric_revision;
       selectedRun = latest;
       runs = runs.map((candidate) => (candidate.id === latest.id ? latest : candidate));
-      [alerts, richValues, artifacts, traces] = await Promise.all([
-        getAlerts(latest.id, controller.signal),
-        getRichValues(latest.id, controller.signal),
-        getRunArtifacts(latest.id, controller.signal),
-        getTraces(latest.id, traceSearch, controller.signal),
-      ]);
+      if (activeRunTab === "summary") alerts = await getAlerts(latest.id, controller.signal);
+      if (activeRunTab === "media") {
+        const page = await getRichValuePage(latest.id, undefined, controller.signal);
+        richValues = page.items;
+        richValueCursor = page.nextBefore;
+      }
+      if (activeRunTab === "artifacts") {
+        const page = await getRunArtifactPage(latest.id, undefined, controller.signal);
+        artifacts = page.items;
+        artifactCursor = page.nextBefore;
+      }
+      if (activeRunTab === "traces") {
+        const page = await getTracePage(latest.id, traceSearch, undefined, controller.signal);
+        traces = page.items;
+        traceCursor = page.nextBefore;
+      }
       if (revisionChanged) {
         metricKeys = await getMetricKeys(latest.id, controller.signal);
-        for (const metric of visibleMetrics) queueMetric(metric);
+        if (activeRunTab === "metrics") {
+          for (const metric of visibleMetrics) queueMetric(metric);
+        }
       }
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
@@ -346,51 +487,15 @@
     return new Date(timestampMs).toLocaleString();
   }
 
-  function metadataString(value: RichValue, key: string): string | undefined {
-    const result = value.metadata[key];
-    return typeof result === "string" ? result : undefined;
-  }
-
-  function histogramCounts(value: RichValue): number[] {
-    const counts = value.metadata.counts;
-    return Array.isArray(counts)
-      ? counts.filter((item): item is number => typeof item === "number")
-      : [];
-  }
-
-  function tableColumns(value: RichValue): string[] {
-    const columns = value.metadata.columns;
-    return Array.isArray(columns)
-      ? columns.filter((item): item is string => typeof item === "string")
-      : [];
-  }
-
-  function tablePreview(value: RichValue): unknown[][] {
-    const preview = value.metadata.preview;
-    return Array.isArray(preview)
-      ? preview.filter((item): item is unknown[] => Array.isArray(item))
-      : [];
-  }
-
-  function formatBytes(value: number): string {
-    if (value < 1024) return `${value} B`;
-    const units = ["KiB", "MiB", "GiB", "TiB"];
-    let size = value;
-    let unit = -1;
-    do {
-      size /= 1024;
-      unit += 1;
-    } while (size >= 1024 && unit < units.length - 1);
-    return `${size.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unit]}`;
-  }
-
   async function searchTraces(): Promise<void> {
     const run = selectedRun;
     const controller = runController;
     if (!run || !controller || traceSearchLoading) return;
     traceSearchLoading = true;
     try {
-      traces = await getTraces(run.id, traceSearch, controller.signal);
+      const page = await getTracePage(run.id, traceSearch, undefined, controller.signal);
+      traces = page.items;
+      traceCursor = page.nextBefore;
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
     } finally {
@@ -411,6 +516,106 @@
       if (typeof candidate.role !== "string" || typeof candidate.content !== "string") return [];
       return [{ role: candidate.role, content: candidate.content }];
     });
+  }
+
+  function selectRunTab(tab: RunTab): void {
+    activeRunTab = tab;
+    void ensureRunTabLoaded(tab);
+  }
+
+  async function ensureRunTabLoaded(tab: RunTab): Promise<void> {
+    const run = selectedRun;
+    const controller = runController;
+    if (
+      !run ||
+      !controller ||
+      loadedRunTabs.has(tab) ||
+      loadingRunTabs.has(tab) ||
+      tab === "configuration" ||
+      tab === "metrics"
+    ) {
+      return;
+    }
+    loadingRunTabs = new Set([...loadingRunTabs, tab]);
+    try {
+      if (tab === "summary") alerts = await getAlerts(run.id, controller.signal);
+      else if (tab === "media") {
+        const page = await getRichValuePage(run.id, undefined, controller.signal);
+        richValues = page.items;
+        richValueCursor = page.nextBefore;
+      } else if (tab === "artifacts") {
+        const page = await getRunArtifactPage(run.id, undefined, controller.signal);
+        artifacts = page.items;
+        artifactCursor = page.nextBefore;
+      } else if (tab === "traces") {
+        const page = await getTracePage(run.id, traceSearch, undefined, controller.signal);
+        traces = page.items;
+        traceCursor = page.nextBefore;
+      }
+      if (selectedRun?.id === run.id) loadedRunTabs = new Set([...loadedRunTabs, tab]);
+    } catch (reason) {
+      if (!controller.signal.aborted) showError(reason);
+    } finally {
+      const next = new Set(loadingRunTabs);
+      next.delete(tab);
+      loadingRunTabs = next;
+    }
+  }
+
+  async function loadMore(tab: "media" | "artifacts" | "traces"): Promise<void> {
+    const run = selectedRun;
+    const controller = runController;
+    const cursor =
+      tab === "media" ? richValueCursor : tab === "artifacts" ? artifactCursor : traceCursor;
+    if (!run || !controller || !cursor || loadingMoreTab) return;
+    loadingMoreTab = tab;
+    try {
+      if (tab === "media") {
+        const page = await getRichValuePage(run.id, cursor, controller.signal);
+        richValues = [...richValues, ...page.items];
+        richValueCursor = page.nextBefore;
+      } else if (tab === "artifacts") {
+        const page = await getRunArtifactPage(run.id, cursor, controller.signal);
+        artifacts = [...artifacts, ...page.items];
+        artifactCursor = page.nextBefore;
+      } else {
+        const page = await getTracePage(run.id, traceSearch, cursor, controller.signal);
+        traces = [...traces, ...page.items];
+        traceCursor = page.nextBefore;
+      }
+    } catch (reason) {
+      if (!controller.signal.aborted) showError(reason);
+    } finally {
+      loadingMoreTab = null;
+    }
+  }
+
+  function handleRunTabKey(event: KeyboardEvent, index: number): void {
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowRight") nextIndex = (index + 1) % RUN_TABS.length;
+    else if (event.key === "ArrowLeft") nextIndex = (index - 1 + RUN_TABS.length) % RUN_TABS.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = RUN_TABS.length - 1;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const next = RUN_TABS[nextIndex];
+    selectRunTab(next.id);
+    queueMicrotask(() => document.getElementById(`run-tab-${next.id}`)?.focus());
+  }
+
+  function runTabCount(tab: RunTab): number {
+    if (tab === "summary") return Object.keys(selectedRun?.summary ?? {}).length;
+    if (tab === "configuration") return Object.keys(selectedRun?.config ?? {}).length;
+    if (tab === "metrics") return metricKeys.length;
+    if (tab === "media") return richValues.length;
+    if (tab === "traces") return traces.length;
+    return artifacts.length;
+  }
+
+  function runTabCountLabel(tab: RunTab): string {
+    if (loadingRunTabs.has(tab)) return "…";
+    if (["media", "traces", "artifacts"].includes(tab) && !loadedRunTabs.has(tab)) return "—";
+    return runTabCount(tab).toLocaleString();
   }
 </script>
 
@@ -474,7 +679,15 @@
             {#each runs as run (run.id)}
               <button class:active={selectedRun?.id === run.id} onclick={() => chooseRun(run)}>
                 <span>{run.name}</span>
-                <small>{run.state} · r{run.metric_revision}</small>
+                <small
+                  class="run-list-state"
+                  class:live={run.state === "running"}
+                  class:finished={run.state === "finished"}
+                >
+                  <Icon name={run.state === "running" ? "activity" : "check"} size={12} />
+                  <span>{run.state}</span>
+                  <span>r{run.metric_revision}</span>
+                </small>
               </button>
             {/each}
           </div>
@@ -520,10 +733,14 @@
                         {@const identity = reportMetricIdentity(panel, metric)}
                         <MetricChart
                           {metric}
+                          {identity}
                           title={panel.metric_keys.length === 1 ? metric : metric}
                           history={reportHistories[identity]}
                           loading={loadingReportMetrics.has(identity)}
-                          onvisible={() => reportChartVisible(panel, metric)}
+                          onvisibilitychange={(_, visible) =>
+                            reportChartVisibility(panel, metric, visible)}
+                          onviewportchange={(_, stepMin, stepMax) =>
+                            reportChartViewport(panel, metric, stepMin, stepMax)}
                         />
                       {/each}
                     </div>
@@ -537,42 +754,58 @@
                 <p class="eyebrow">{selectedRun.project} / {selectedRun.id.slice(0, 8)}</p>
                 <h1>{selectedRun.name}</h1>
               </div>
-              <span class="run-state" class:live={selectedRun.state === "running"}
-                >{selectedRun.state}</span
+              <span
+                class="run-state"
+                class:live={selectedRun.state === "running"}
+                class:finished={selectedRun.state === "finished"}
               >
+                <Icon name={selectedRun.state === "running" ? "activity" : "check"} size={14} />
+                {selectedRun.state}
+              </span>
             </div>
 
-            <div class="document-cards">
-              <article>
-                <div class="card-heading"><strong>Summary</strong></div>
-                <dl>
-                  {#each Object.entries(selectedRun.summary) as [key, value]}
-                    <div>
-                      <dt>{key}</dt>
-                      <dd>{formatValue(value)}</dd>
-                    </div>
-                  {/each}
-                </dl>
-              </article>
-
-              <article>
-                <div class="card-heading"><strong>Configuration</strong></div>
-                <dl>
-                  {#each Object.entries(selectedRun.config) as [key, value]}
-                    <div>
-                      <dt>{key}</dt>
-                      <dd>{formatValue(value)}</dd>
-                    </div>
-                  {/each}
-                </dl>
-              </article>
+            <div class="run-tabs" role="tablist" aria-label="Run data">
+              {#each RUN_TABS as tab, index (tab.id)}
+                <button
+                  id={`run-tab-${tab.id}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={activeRunTab === tab.id}
+                  aria-controls={`run-panel-${tab.id}`}
+                  tabindex={activeRunTab === tab.id ? 0 : -1}
+                  class:active={activeRunTab === tab.id}
+                  onclick={() => selectRunTab(tab.id)}
+                  onkeydown={(event) => handleRunTabKey(event, index)}
+                >
+                  <Icon name={tab.icon} size={15} />
+                  <span>{tab.label}</span>
+                  <small>{runTabCountLabel(tab.id)}</small>
+                </button>
+              {/each}
             </div>
 
-            {#if alerts.length > 0}
-              <article class="alerts-card">
-                <div class="card-heading">
-                  <strong>Alerts</strong>
-                  <small>{alerts.length} most recent</small>
+            <div
+              class="run-tab-panel"
+              id="run-panel-summary"
+              role="tabpanel"
+              aria-labelledby="run-tab-summary"
+              hidden={activeRunTab !== "summary"}
+            >
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Final and derived values</p>
+                  <h2>Summary</h2>
+                </div>
+                <span>{Object.keys(selectedRun.summary).length.toLocaleString()} fields</span>
+              </div>
+              <div class="tree-panel">
+                <JsonTreeNode name="" value={selectedRun.summary} root />
+              </div>
+
+              {#if alerts.length > 0}
+                <div class="section-heading alerts-heading">
+                  <h2>Alerts</h2>
+                  <span>{alerts.length} most recent</span>
                 </div>
                 <div class="alert-list">
                   {#each alerts as alert (alert.id)}
@@ -594,197 +827,235 @@
                     </div>
                   {/each}
                 </div>
-              </article>
-            {/if}
+              {/if}
+            </div>
 
-            {#if richValues.length > 0}
-              <div class="metrics-heading">
+            <div
+              class="run-tab-panel"
+              id="run-panel-configuration"
+              role="tabpanel"
+              aria-labelledby="run-tab-configuration"
+              hidden={activeRunTab !== "configuration"}
+            >
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Expandable run inputs</p>
+                  <h2>Configuration</h2>
+                </div>
+                <span>{Object.keys(selectedRun.config).length.toLocaleString()} fields</span>
+              </div>
+              <div class="tree-panel">
+                <JsonTreeNode name="" value={selectedRun.config} root />
+              </div>
+            </div>
+
+            <div
+              class="run-tab-panel"
+              id="run-panel-metrics"
+              role="tabpanel"
+              aria-labelledby="run-tab-metrics"
+              hidden={activeRunTab !== "metrics"}
+            >
+              <div class="section-heading metrics-toolbar">
+                <div>
+                  <p class="eyebrow">Exact bucket envelopes · four concurrent queries</p>
+                  <h2>Metrics</h2>
+                </div>
+                <label class="search-control">
+                  <Icon name="search" size={15} />
+                  <input
+                    type="search"
+                    aria-label="Search metrics"
+                    placeholder="Search metric keys"
+                    bind:value={metricSearch}
+                  />
+                </label>
+                <span>
+                  {filteredMetricKeys.length.toLocaleString()} of {metricKeys.length.toLocaleString()}
+                </span>
+              </div>
+              {#if filteredMetricKeys.length > 0}
+                <div class="metric-grid">
+                  {#each filteredMetricKeys as metric (`${selectedRun.id}:${metric}`)}
+                    <MetricChart
+                      {metric}
+                      identity={`${selectedRun.id}:${metric}`}
+                      history={histories[metric]}
+                      loading={loadingMetrics.has(metric)}
+                      onvisibilitychange={chartVisibility}
+                      onviewportchange={chartViewport}
+                    />
+                  {/each}
+                </div>
+              {:else}
+                <section class="metric-empty">
+                  {metricKeys.length === 0
+                    ? "No scalar metrics logged yet."
+                    : "No metric keys match this search."}
+                </section>
+              {/if}
+            </div>
+
+            <div
+              class="run-tab-panel"
+              id="run-panel-media"
+              role="tabpanel"
+              aria-labelledby="run-tab-media"
+              hidden={activeRunTab !== "media"}
+            >
+              <div class="section-heading">
                 <div>
                   <p class="eyebrow">Native playback and previews</p>
                   <h2>Media & data</h2>
                 </div>
-                <span>{richValues.length} most recent</span>
+                <span>{richValues.length.toLocaleString()} snapshots</span>
               </div>
-              <div class="rich-grid">
-                {#each richValues as value (value.id)}
-                  <article class="rich-card">
-                    <div class="card-heading">
-                      <div>
-                        <small>{value.kind} · step {value.step}</small><strong>{value.key}</strong>
-                      </div>
-                      {#if value.blob}
-                        <a href={blobUrl(value.blob)} download={value.blob.file_name ?? undefined}
-                          >download</a
-                        >
-                      {/if}
-                    </div>
-                    {#if value.kind === "image" && value.blob}
-                      <img
-                        loading="lazy"
-                        src={blobUrl(value.blob)}
-                        alt={metadataString(value, "caption") ?? value.key}
-                      />
-                    {:else if value.kind === "audio" && value.blob}
-                      <audio controls preload="metadata" src={blobUrl(value.blob)}></audio>
-                    {:else if value.kind === "video" && value.blob}
-                      <!-- svelte-ignore a11y_media_has_caption -->
-                      <video controls preload="metadata" src={blobUrl(value.blob)}></video>
-                    {:else if value.kind === "histogram"}
-                      <HistogramChart counts={histogramCounts(value)} label={value.key} />
-                    {:else if value.kind === "table"}
-                      <div class="table-preview">
-                        <table>
-                          <thead
-                            ><tr
-                              >{#each tableColumns(value) as column}<th>{column}</th>{/each}</tr
-                            ></thead
-                          >
-                          <tbody>
-                            {#each tablePreview(value) as row}
-                              <tr
-                                >{#each row as cell}<td>{formatValue(cell)}</td>{/each}</tr
-                              >
-                            {/each}
-                          </tbody>
-                        </table>
-                      </div>
-                    {/if}
-                    {#if metadataString(value, "caption")}<p class="media-caption">
-                        {metadataString(value, "caption")}
-                      </p>{/if}
-                  </article>
-                {/each}
-              </div>
-            {/if}
+              {#if loadingRunTabs.has("media")}
+                <section class="metric-empty">Loading media…</section>
+              {:else}
+                <MediaTimeline values={richValues} />
+                {#if richValueCursor}
+                  <button
+                    class="load-more"
+                    type="button"
+                    disabled={loadingMoreTab !== null}
+                    onclick={() => void loadMore("media")}
+                    >{loadingMoreTab === "media" ? "Loading…" : "Load 100 more"}</button
+                  >
+                {/if}
+              {/if}
+            </div>
 
-            {#if artifacts.length > 0}
-              <div class="metrics-heading">
+            <div
+              class="run-tab-panel"
+              id="run-panel-traces"
+              role="tabpanel"
+              aria-labelledby="run-tab-traces"
+              hidden={activeRunTab !== "traces"}
+            >
+              <div class="section-heading trace-heading">
+                <div>
+                  <p class="eyebrow">Indexed metadata · payloads in object storage</p>
+                  <h2>Traces</h2>
+                </div>
+                <form
+                  class="trace-search"
+                  onsubmit={(event) => {
+                    event.preventDefault();
+                    void searchTraces();
+                  }}
+                >
+                  <label class="search-control">
+                    <Icon name="search" size={15} />
+                    <input
+                      aria-label="Search traces"
+                      placeholder="Search traces and messages"
+                      bind:value={traceSearch}
+                    />
+                  </label>
+                  <button
+                    class="icon-button"
+                    type="submit"
+                    disabled={traceSearchLoading}
+                    aria-label="Search traces"><Icon name="search" size={15} /></button
+                  >
+                </form>
+              </div>
+              {#if loadingRunTabs.has("traces")}
+                <section class="metric-empty">Loading traces…</section>
+              {:else if traces.length > 0}
+                <div class="trace-list">
+                  {#each traces as span (span.id)}
+                    <article class="trace-card" class:trace-error={span.status === "error"}>
+                      <div class="trace-title">
+                        <span>{span.kind}</span>
+                        <strong>{span.name}</strong>
+                        <small>{span.status} · {traceDuration(span)}</small>
+                        {#if span.payload}
+                          <a
+                            class="icon-button"
+                            href={blobUrl(span.payload)}
+                            download={span.payload.file_name ?? undefined}
+                            aria-label={`Download ${span.name} payload`}
+                            ><Icon name="download" size={15} /></a
+                          >
+                        {/if}
+                      </div>
+                      <div class="trace-identifiers">
+                        <span>trace {span.trace_id}</span>
+                        {#if span.parent_span_id}<span>parent {span.parent_span_id}</span>{/if}
+                        <span>{span.step === null ? "no step" : `step ${span.step}`}</span>
+                      </div>
+                      {#if Object.keys(span.attributes).length > 0}
+                        <dl class="trace-attributes">
+                          {#each Object.entries(span.attributes) as [key, value]}
+                            <div>
+                              <dt>{key}</dt>
+                              <dd>{formatValue(value)}</dd>
+                            </div>
+                          {/each}
+                        </dl>
+                      {/if}
+                      {#if traceMessages(span).length > 0}
+                        <div class="trace-messages">
+                          {#each traceMessages(span) as message}
+                            <div>
+                              <strong>{message.role}</strong>
+                              <p>{message.content}</p>
+                            </div>
+                          {/each}
+                        </div>
+                      {/if}
+                    </article>
+                  {/each}
+                </div>
+              {:else}
+                <section class="metric-empty">
+                  {traceSearch.trim()
+                    ? "No traces match this search."
+                    : "No structured traces logged yet."}
+                </section>
+              {/if}
+              {#if traceCursor}
+                <button
+                  class="load-more"
+                  type="button"
+                  disabled={loadingMoreTab !== null}
+                  onclick={() => void loadMore("traces")}
+                  >{loadingMoreTab === "traces" ? "Loading…" : "Load 100 more"}</button
+                >
+              {/if}
+            </div>
+
+            <div
+              class="run-tab-panel"
+              id="run-panel-artifacts"
+              role="tabpanel"
+              aria-labelledby="run-tab-artifacts"
+              hidden={activeRunTab !== "artifacts"}
+            >
+              <div class="section-heading">
                 <div>
                   <p class="eyebrow">Versioned inputs and outputs</p>
                   <h2>Artifacts</h2>
                 </div>
-                <span>{artifacts.length} lineage links</span>
+                <span>{artifacts.length.toLocaleString()} lineage links</span>
               </div>
-              <div class="artifact-list">
-                {#each artifacts as linked (`${linked.artifact.id}:${linked.relation}`)}
-                  <article class="artifact-card">
-                    <div class="artifact-title">
-                      <span class:artifact-input={linked.relation === "input"}
-                        >{linked.relation}</span
-                      >
-                      <strong>{linked.artifact.name}:v{linked.artifact.version}</strong>
-                      <small>{linked.artifact.type}</small>
-                    </div>
-                    {#if linked.artifact.aliases.length > 0}
-                      <div class="artifact-aliases">
-                        {#each linked.artifact.aliases as alias}<span>{alias}</span>{/each}
-                      </div>
-                    {/if}
-                    {#if linked.artifact.description}<p>{linked.artifact.description}</p>{/if}
-                    <div class="artifact-files">
-                      {#each linked.artifact.entries as entry}
-                        <a
-                          href={artifactFileUrl(linked.artifact.id, entry.path)}
-                          download={entry.blob.file_name ?? entry.path}
-                        >
-                          <span>{entry.path}</span><small>{formatBytes(entry.blob.size)}</small>
-                        </a>
-                      {/each}
-                    </div>
-                  </article>
-                {/each}
-              </div>
-            {/if}
-
-            <div class="metrics-heading trace-heading">
-              <div>
-                <p class="eyebrow">Indexed metadata · payloads in object storage</p>
-                <h2>Traces</h2>
-              </div>
-              <form
-                class="trace-search"
-                onsubmit={(event) => {
-                  event.preventDefault();
-                  void searchTraces();
-                }}
-              >
-                <input
-                  aria-label="Search traces"
-                  placeholder="Search traces and messages"
-                  bind:value={traceSearch}
-                />
-                <button type="submit" disabled={traceSearchLoading}
-                  >{traceSearchLoading ? "Searching" : "Search"}</button
-                >
-              </form>
+              {#if loadingRunTabs.has("artifacts")}
+                <section class="metric-empty">Loading artifacts…</section>
+              {:else}
+                <ArtifactBrowser {artifacts} />
+                {#if artifactCursor}
+                  <button
+                    class="load-more"
+                    type="button"
+                    disabled={loadingMoreTab !== null}
+                    onclick={() => void loadMore("artifacts")}
+                    >{loadingMoreTab === "artifacts" ? "Loading…" : "Load 100 more"}</button
+                  >
+                {/if}
+              {/if}
             </div>
-            {#if traces.length > 0}
-              <div class="trace-list">
-                {#each traces as span (span.id)}
-                  <article class="trace-card" class:trace-error={span.status === "error"}>
-                    <div class="trace-title">
-                      <span>{span.kind}</span>
-                      <strong>{span.name}</strong>
-                      <small>{span.status} · {traceDuration(span)}</small>
-                      {#if span.payload}<a href={blobUrl(span.payload)}>payload</a>{/if}
-                    </div>
-                    <div class="trace-identifiers">
-                      <span>trace {span.trace_id}</span>
-                      {#if span.parent_span_id}<span>parent {span.parent_span_id}</span>{/if}
-                      <span>{span.step === null ? "no step" : `step ${span.step}`}</span>
-                    </div>
-                    {#if Object.keys(span.attributes).length > 0}
-                      <dl class="trace-attributes">
-                        {#each Object.entries(span.attributes) as [key, value]}
-                          <div>
-                            <dt>{key}</dt>
-                            <dd>{formatValue(value)}</dd>
-                          </div>
-                        {/each}
-                      </dl>
-                    {/if}
-                    {#if traceMessages(span).length > 0}
-                      <div class="trace-messages">
-                        {#each traceMessages(span) as message}
-                          <div>
-                            <strong>{message.role}</strong>
-                            <p>{message.content}</p>
-                          </div>
-                        {/each}
-                      </div>
-                    {/if}
-                  </article>
-                {/each}
-              </div>
-            {:else}
-              <section class="metric-empty">
-                {traceSearch.trim()
-                  ? "No traces match this search."
-                  : "No structured traces logged yet."}
-              </section>
-            {/if}
-
-            <div class="metrics-heading">
-              <div>
-                <p class="eyebrow">Bounded histories</p>
-                <h2>Metrics</h2>
-              </div>
-              <span>{metricKeys.length.toLocaleString()} keys · four concurrent queries</span>
-            </div>
-            {#if metricKeys.length > 0}
-              <div class="metric-grid">
-                {#each metricKeys as metric (metric)}
-                  <MetricChart
-                    {metric}
-                    history={histories[metric]}
-                    loading={loadingMetrics.has(metric)}
-                    onvisible={chartVisible}
-                  />
-                {/each}
-              </div>
-            {:else}
-              <section class="metric-empty">No scalar metrics logged yet.</section>
-            {/if}
           {:else}
             <section class="empty">This project has no runs.</section>
           {/if}

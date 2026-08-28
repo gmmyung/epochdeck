@@ -29,6 +29,8 @@ a conflict.
   page with sequence, step, timestamp, and only the requested metric columns.
 - `GET /runs/{run_id}/history?keys=loss&max_points=2000` scans the selected
   columns across the run and returns a bounded min/max representation.
+- `GET /runs/{run_id}/chart-history?key=loss&max_buckets=1000` returns exact
+  per-bucket minimum, maximum, and last values for chart rendering.
 
 Batch sequence and canonical request digest form the idempotency contract. An
 identical replay succeeds as a duplicate; reusing a sequence for different
@@ -41,6 +43,56 @@ budget must allow at least two extrema per requested metric. History responses
 include `source_last_sequence`, allowing a revision-aware client to request only
 new rows after a sampled snapshot. These response bounds are not retention
 quotas.
+
+Chart history is a separate aggregate contract; raw cursor pagination on
+`/history` is unchanged. Repeat the percent-encoded `key` parameter to request
+multiple metrics. `max_buckets` is between 1 and 2,000, and the product
+of requested metric keys and buckets cannot exceed 5,000 metric-bucket cells.
+When omitted, the server uses the smaller of 1,000 buckets and the per-key share
+of that global limit. Optional `step_min` and `step_max` are an inclusive
+viewport and must be supplied together in ascending order. Without a viewport,
+the server discovers the union step extent containing a non-null requested
+metric. All scans project only the requested Parquet columns and use a frozen
+sequence watermark, so concurrent ingestion appears in the next snapshot.
+Explicit viewports also prune Parquet row groups whose exact step statistics
+prove they cannot overlap the requested range. Missing, inexact, deprecated, or
+internally inconsistent statistics disable pruning for that row group rather
+than risking the loss of source values.
+
+The response is columnar and keeps sparse metrics independent:
+
+```json
+{
+  "run_id": "019c...",
+  "step_min": 0,
+  "step_max": 9999,
+  "bucket_count": 1000,
+  "source_points": 10000,
+  "source_last_sequence": 10000,
+  "metrics": {
+    "loss": {
+      "source_points": 9998,
+      "bucket": [0, 1],
+      "last_step": [9, 19],
+      "last_timestamp_ms": [1710000000009, 1710000000019],
+      "minimum": [0.82, 0.71],
+      "maximum": [1.14, 0.93],
+      "last": [0.88, 0.74]
+    }
+  }
+}
+```
+
+Each metric's arrays are aligned and omit buckets in which that metric has no
+value. `minimum` and `maximum` are the exact extrema of every source value for
+that metric in the bucket. `last` is selected by greatest run sequence even
+when steps repeat or move backward; `last_step` and `last_timestamp_ms` come
+from that same point. The bucket index is
+`floor((step - step_min) * bucket_count / (step_max - step_min + 1))`.
+The dashboard draws Band directly from `minimum`/`maximum` and may smooth the
+`last` trend column; it must not construct a rolling envelope from sampled
+points. `source_points` at the top level counts rows containing any requested
+metric, while each metric reports its own non-null source count.
 
 ## Monitoring
 
@@ -90,6 +142,8 @@ Exact manifest retries are idempotent.
   alias such as `latest` or `best`.
 - `GET /artifacts/{artifact_id}` returns one immutable manifest.
 - `GET /artifacts/{artifact_id}/lineage` returns bounded input/output run IDs.
+- `GET /artifacts/{artifact_id}/download` streams every manifest entry as a ZIP
+  archive.
 - `GET /artifacts/{artifact_id}/files/{path}` streams one manifest entry with
   range support.
 
@@ -98,6 +152,10 @@ contains up to 4,096 unique relative POSIX paths and a total 2 MiB manifest
 budget; these are metadata bounds, not file-size or retention quotas. The server
 verifies every referenced SHA-256 object before allocating the version in one
 SQLite transaction. Stable request IDs make a lost create response replay-safe.
+Whole-artifact downloads preserve validated relative POSIX entry paths, use
+stored ZIP entries, and stream through a fixed-size buffer rather than staging
+or retaining the complete archive. Responses provide both an ASCII fallback and
+UTF-8 `filename*` in `Content-Disposition`.
 
 Project artifact and run-link responses include `next_before` cursors. The
 artifact ID order is stable and allows complete lineage scans without loading a
@@ -160,10 +218,10 @@ run in the same project and one to eight metric keys. Markdown panels contain a
 bounded document and cannot reference run metrics. The complete serialized
 layout is capped at 256 KiB.
 
-Reports store no metric copies or sampled results. The dashboard lazily requests
-each visible metric from its referenced run with a fixed point budget and at
-most four concurrent chart queries. Report creation validates all referenced
-runs before committing the layout transaction.
+Reports store no metric copies or aggregate results. The dashboard lazily
+requests exact min/max/last buckets for each visible metric with a fixed bucket
+budget and at most four concurrent chart queries. Report creation validates all
+referenced runs before committing the layout transaction.
 
 Report list responses use the same `next_before` cursor convention.
 

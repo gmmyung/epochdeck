@@ -75,9 +75,10 @@ accept inert compatibility flags.
 The current partial scalar contract supports finite numeric and boolean values,
 nested dictionaries flattened with `/`, explicit or automatic steps, durable
 local spooling, resumable batch delivery, Parquet persistence, and bounded
-column-projected history. Dashboard queries scan only requested columns and use
-a bounded min/max representation that preserves local spikes without deleting
-raw samples. Background compaction transparently reduces immutable segment
+column-projected history. Dashboard charts scan only requested columns and use
+bounded exact min/max/last buckets that preserve source spikes without deleting
+raw samples; settled step viewports are re-aggregated for zoom detail.
+Background compaction transparently reduces immutable segment
 counts without changing logical revisions or history results. Config supports
 controlled shallow updates, and summaries support
 bounded JSON strings, booleans, nulls, arrays, nested objects, and explicit
@@ -95,15 +96,17 @@ durable run step with scalar values. Media and table bytes are hashed and copied
 into the local spool before `log` returns, uploaded by streaming PUT, and stored
 once in the server's SHA-256 blob root. The dashboard uses lazy images,
 metadata-only audio/video loading, HTTP range playback, bounded table previews,
-and Canvas histograms. The wider W&B media row-grouping, array conversion, and
-incremental mutable-table surface remains partial.
+Canvas histograms, and key-grouped step timelines. The wider W&B array
+conversion and incremental mutable-table surface remains partial.
 
 Artifacts are immutable project-scoped collections with transactional `v0`,
 `v1`, ... version allocation, movable aliases, bounded manifests, exact retry
 IDs, and explicit input/output run links. File content reuses the rich-data CAS;
-artifact download endpoints stream files with range support. The SDK snapshots
-files into its spool before journaling a create operation and drains creates and
-lineage links fairly with metrics, rich values, and alerts.
+individual downloads support ranges, and whole-artifact ZIP downloads stream
+through a bounded producer without buffering an archive in memory. The dashboard
+provides artifact tabs, directory navigation, and per-file downloads. The SDK
+snapshots files into its spool before journaling a create operation and drains
+creates and lineage links fairly with metrics, rich values, and alerts.
 
 Structured traces store bounded searchable names, attributes, and message
 previews in SQLite while complete JSON inputs, outputs, and messages live in the
@@ -130,8 +133,8 @@ agents remain outside the current partial W&B surface and fail explicitly.
 
 Reports are durable project-scoped grid definitions with typed metric and
 Markdown panels. Report metric references are validated against project runs,
-and the dashboard renders their histories with lazy bounded sampling and a
-four-request concurrency cap. Definitions can be created, listed, replaced, and
+and the dashboard renders their histories with lazy exact-bucket aggregation and
+a four-request concurrency cap. Definitions can be created, listed, replaced, and
 deleted through the HTTP and public Python APIs. The Markdown renderer supports
 safe headings, paragraphs, lists, and fenced code. Arbitrary W&B report blocks,
 inline rich text, collaborative editing, and hosted sharing semantics remain

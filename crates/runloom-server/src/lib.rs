@@ -7,15 +7,18 @@ pub use compaction::{CompactionConfig, MetricRuntime, run_compaction_worker};
 use compaction::{CompactionOutcome, compact_once};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, State};
 #[cfg(feature = "embedded-dashboard")]
-use axum::http::{HeaderValue, Uri, header};
+use axum::http::Uri;
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
@@ -27,32 +30,34 @@ use runloom_catalog::{
 use runloom_protocol::{
     AlertId, AlertListResponse, ApiError, ArtifactId, ArtifactLineageResponse,
     ArtifactListResponse, ArtifactRecord, ArtifactRelation, BlobRef, BlobUploadResponse,
-    ClaimSweepTrialRequest, ClaimSweepTrialResponse, CompleteSweepTrialRequest,
-    ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse, CreateArtifactRequest,
-    CreateArtifactResponse, CreateReportRequest, CreateReportResponse, CreateRichValueRequest,
-    CreateRichValueResponse, CreateRunRequest, CreateRunResponse, CreateSweepRequest,
-    CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse, DiagnosticsResponse,
-    FinishRunRequest, FinishRunResponse, HealthResponse, HistoryResponse, IngestBatchRequest,
-    IngestBatchResponse, MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES, MAX_ARTIFACT_ENTRIES,
-    MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS,
-    MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES,
-    MAX_SUMMARY_BYTES, MAX_TRACE_METADATA_BYTES, MetricKeyListResponse, ProjectListResponse,
-    ReportId, ReportLayout, ReportListResponse, ReportPanelKind, ReportRecord, ResumePolicy,
-    RichValueId, RichValueKind, RichValueListResponse, RunArtifactListResponse, RunId,
-    RunListResponse, RunQueryRequest, RunQueryResponse, RunRecord, RunState, RunUpdateResponse,
-    SlowRequestRecord, SummaryUpdateRequest, SweepId, SweepListResponse, SweepTrialId,
-    SweepTrialListResponse, SweepTrialRecord, SweepTrialState, TraceSpanId, TraceSpanListResponse,
-    UpdateReportRequest, UseArtifactRequest,
+    ChartHistoryResponse, ChartMetricHistory, ClaimSweepTrialRequest, ClaimSweepTrialResponse,
+    CompleteSweepTrialRequest, ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse,
+    CreateArtifactRequest, CreateArtifactResponse, CreateReportRequest, CreateReportResponse,
+    CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest, CreateRunResponse,
+    CreateSweepRequest, CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse,
+    DiagnosticsResponse, FinishRunRequest, FinishRunResponse, HealthResponse, HistoryResponse,
+    IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES,
+    MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS, MAX_CHART_BUCKET_CELLS,
+    MAX_CHART_BUCKETS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS, MAX_HISTORY_POINTS,
+    MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES,
+    MAX_TRACE_METADATA_BYTES, MetricKeyListResponse, ProjectListResponse, ReportId, ReportLayout,
+    ReportListResponse, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId, RichValueKind,
+    RichValueListResponse, RunArtifactListResponse, RunId, RunListResponse, RunQueryRequest,
+    RunQueryResponse, RunRecord, RunState, RunUpdateResponse, SlowRequestRecord,
+    SummaryUpdateRequest, SweepId, SweepListResponse, SweepTrialId, SweepTrialListResponse,
+    SweepTrialRecord, SweepTrialState, TraceSpanId, TraceSpanListResponse, UpdateReportRequest,
+    UseArtifactRequest,
 };
 use runloom_storage::{
-    BlobStore, MetricStore, MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
+    BlobStore, ChartHistorySampler, ChartStepExtent, ChartStepExtentScanner, MetricStore,
+    MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
 };
 #[cfg(feature = "embedded-dashboard")]
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, Semaphore, mpsc};
 use tower::ServiceExt;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeFile;
@@ -64,6 +69,7 @@ const MAX_RUN_NAME_BYTES: usize = 256;
 const MAX_METRIC_KEY_BYTES: usize = 256;
 const INGEST_WORKERS: usize = 2;
 const QUERY_WORKERS: usize = 4;
+const ARTIFACT_DOWNLOAD_WORKERS: usize = 4;
 const MAX_LIST_ITEMS: usize = 200;
 const MAX_MIME_TYPE_BYTES: usize = 256;
 const MAX_FILE_NAME_BYTES: usize = 512;
@@ -72,6 +78,8 @@ const MAX_ARTIFACT_TYPE_BYTES: usize = 64;
 const MAX_ARTIFACT_ALIAS_BYTES: usize = 128;
 const MAX_ARTIFACT_PATH_BYTES: usize = 1_024;
 const MAX_ARTIFACT_DESCRIPTION_BYTES: usize = 64 * 1024;
+const ARTIFACT_ZIP_CHUNK_BYTES: usize = 64 * 1024;
+const ARTIFACT_ZIP_CHANNEL_CAPACITY: usize = 2;
 const MAX_TRACE_ID_BYTES: usize = 128;
 const MAX_TRACE_NAME_BYTES: usize = 256;
 const MAX_TRACE_SEARCH_BYTES: usize = 256;
@@ -85,6 +93,7 @@ const MAX_REPORT_MARKDOWN_BYTES: usize = 64 * 1024;
 const DEFAULT_SLOW_REQUEST_MS: u64 = 1_000;
 const MAX_RECENT_SLOW_REQUESTS: usize = 64;
 const MAX_DIAGNOSTIC_PATH_BYTES: usize = 512;
+const DEFAULT_CHART_BUCKETS: usize = 1_000;
 
 #[derive(Debug, Clone)]
 struct AppState {
@@ -93,6 +102,7 @@ struct AppState {
     blobs: BlobStore,
     ingest_permits: Arc<Semaphore>,
     query_permits: Arc<Semaphore>,
+    artifact_download_permits: Arc<Semaphore>,
     telemetry: Arc<RequestTelemetry>,
 }
 
@@ -222,6 +232,10 @@ pub fn app_with_runtime_and_blobs(
         )
         .route("/api/v1/artifacts/{artifact_id}", get(get_artifact))
         .route(
+            "/api/v1/artifacts/{artifact_id}/download",
+            get(download_artifact),
+        )
+        .route(
             "/api/v1/artifacts/{artifact_id}/lineage",
             get(get_artifact_lineage),
         )
@@ -236,12 +250,14 @@ pub fn app_with_runtime_and_blobs(
         .route("/api/v1/traces/{span_id}", get(get_trace_span))
         .route("/api/v1/blobs/{digest}", put(upload_blob).get(get_blob))
         .route("/api/v1/runs/{run_id}/history", get(history))
+        .route("/api/v1/runs/{run_id}/chart-history", get(chart_history))
         .with_state(AppState {
             catalog,
             metrics,
             blobs,
             ingest_permits: Arc::new(Semaphore::new(INGEST_WORKERS)),
             query_permits: Arc::new(Semaphore::new(QUERY_WORKERS)),
+            artifact_download_permits: Arc::new(Semaphore::new(ARTIFACT_DOWNLOAD_WORKERS)),
             telemetry: Arc::clone(&telemetry),
         })
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -315,7 +331,7 @@ async fn record_request(
     let _active_guard = ActiveRequestGuard(Arc::clone(&telemetry));
     let method = request.method().to_string();
     let path = truncate_diagnostic_path(request.uri().path());
-    let history_query = path.ends_with("/history");
+    let history_query = path.ends_with("/history") || path.ends_with("/chart-history");
     let started_at = Instant::now();
     let response = next.run(request).await;
     let elapsed = started_at.elapsed();
@@ -692,16 +708,16 @@ async fn create_run(
 }
 
 async fn next_run_position(state: &AppState, run_id: RunId) -> Result<(u64, u64), HttpError> {
+    let _permit = Arc::clone(&state.query_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
     let _snapshot = state.metrics.read_snapshot().await;
     let rich_next_step = state.catalog.rich_value_next_step(run_id).await?;
     let Some(segment) = state.catalog.last_segment(run_id).await? else {
         return Ok((1, rich_next_step));
     };
     let metrics = state.metrics.store().clone();
-    let _permit = Arc::clone(&state.query_permits)
-        .acquire_owned()
-        .await
-        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
     let tail =
         tokio::task::spawn_blocking(move || metrics.read_segment_tail(&segment.relative_path))
             .await
@@ -1115,6 +1131,254 @@ async fn get_artifact_lineage(
     }))
 }
 
+#[derive(Debug)]
+struct ArtifactZipEntry {
+    path: String,
+    blob_path: PathBuf,
+    size: u64,
+}
+
+struct ArtifactZipWriter {
+    sender: mpsc::Sender<Result<Bytes, io::Error>>,
+    buffer: Vec<u8>,
+}
+
+impl ArtifactZipWriter {
+    fn new(sender: mpsc::Sender<Result<Bytes, io::Error>>) -> Self {
+        Self {
+            sender,
+            buffer: Vec::with_capacity(ARTIFACT_ZIP_CHUNK_BYTES),
+        }
+    }
+
+    fn send_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let chunk = Bytes::from(std::mem::replace(
+            &mut self.buffer,
+            Vec::with_capacity(ARTIFACT_ZIP_CHUNK_BYTES),
+        ));
+        self.sender
+            .blocking_send(Ok(chunk))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ZIP client disconnected"))
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.send_buffer()
+    }
+}
+
+impl Write for ArtifactZipWriter {
+    fn write(&mut self, source: &[u8]) -> io::Result<usize> {
+        if source.is_empty() {
+            return Ok(0);
+        }
+        if self.buffer.len() == ARTIFACT_ZIP_CHUNK_BYTES {
+            self.send_buffer()?;
+        }
+        let written = source
+            .len()
+            .min(ARTIFACT_ZIP_CHUNK_BYTES - self.buffer.len());
+        self.buffer.extend_from_slice(&source[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.send_buffer()
+    }
+}
+
+async fn download_artifact(
+    State(state): State<AppState>,
+    Path(artifact_id): Path<ArtifactId>,
+) -> Result<Response, HttpError> {
+    let artifact = state.catalog.get_artifact(artifact_id).await?;
+    let permit = Arc::clone(&state.artifact_download_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
+    let blobs = state.blobs.clone();
+    let manifest_entries = artifact.entries.clone();
+    let (entries, permit) = tokio::task::spawn_blocking(move || {
+        prepare_artifact_zip_entries(&blobs, &manifest_entries).map(|entries| (entries, permit))
+    })
+    .await
+    .map_err(|error| HttpError::internal(format!("artifact ZIP worker failed: {error}")))??;
+
+    let file_name = artifact_zip_file_name(&artifact.name, artifact.version);
+    let content_disposition = artifact_download_content_disposition(&file_name)?;
+    let (sender, receiver) = mpsc::channel(ARTIFACT_ZIP_CHANNEL_CAPACITY);
+    let error_sender = sender.clone();
+    tokio::spawn(async move {
+        let result =
+            tokio::task::spawn_blocking(move || stream_artifact_zip(entries, sender)).await;
+        let error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(io::Error::other(format!(
+                "artifact ZIP worker failed: {error}"
+            ))),
+        };
+        if let Some(error) = error {
+            tracing::error!(%error, "artifact ZIP stream failed");
+            let _ = error_sender.send(Err(error)).await;
+        }
+        drop(permit);
+    });
+
+    let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    });
+    let mut response = Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_DISPOSITION, content_disposition);
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
+}
+
+fn prepare_artifact_zip_entries(
+    blobs: &BlobStore,
+    entries: &[runloom_protocol::ArtifactEntry],
+) -> Result<Vec<ArtifactZipEntry>, HttpError> {
+    entries
+        .iter()
+        .map(|entry| {
+            validate_artifact_path(&entry.path).map_err(|_| {
+                HttpError::internal(format!(
+                    "artifact contains an invalid ZIP entry path: {}",
+                    entry.path
+                ))
+            })?;
+            let blob_path = blobs
+                .path(&entry.blob.digest)
+                .map_err(|error| HttpError::internal(error.to_string()))?;
+            let metadata = std::fs::metadata(&blob_path).map_err(|error| {
+                HttpError::internal(format!(
+                    "failed to inspect artifact blob for '{}': {error}",
+                    entry.path
+                ))
+            })?;
+            if !metadata.is_file() || metadata.len() != entry.blob.size {
+                return Err(HttpError::internal(format!(
+                    "artifact blob for '{}' does not match its manifest",
+                    entry.path
+                )));
+            }
+            Ok(ArtifactZipEntry {
+                path: entry.path.clone(),
+                blob_path,
+                size: entry.blob.size,
+            })
+        })
+        .collect()
+}
+
+fn stream_artifact_zip(
+    entries: Vec<ArtifactZipEntry>,
+    sender: mpsc::Sender<Result<Bytes, io::Error>>,
+) -> io::Result<()> {
+    let output = ArtifactZipWriter::new(sender);
+    let mut archive = zip::ZipWriter::new_stream(output);
+    for entry in entries {
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .large_file(entry.size >= u64::from(u32::MAX))
+            .unix_permissions(0o644);
+        archive
+            .start_file(&entry.path, options)
+            .map_err(io::Error::other)?;
+        let mut source = std::fs::File::open(&entry.blob_path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to open artifact blob for '{}': {error}", entry.path),
+            )
+        })?;
+        let copied = io::copy(&mut source, &mut archive)?;
+        if copied != entry.size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "artifact blob for '{}' changed size while streaming",
+                    entry.path
+                ),
+            ));
+        }
+    }
+    archive
+        .finish()
+        .map_err(io::Error::other)?
+        .into_inner()
+        .finish()
+}
+
+fn artifact_zip_file_name(name: &str, version: u64) -> String {
+    let sanitized = name
+        .chars()
+        .map(|character| {
+            if character.is_control() || r#"<>:\"/\|?*"#.contains(character) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches(|character| character == ' ' || character == '.');
+    let stem = if sanitized.is_empty() {
+        "artifact"
+    } else {
+        sanitized
+    };
+    format!("{stem}-v{version}.zip")
+}
+
+fn artifact_download_content_disposition(file_name: &str) -> Result<HeaderValue, HttpError> {
+    let fallback = file_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let encoded = encode_rfc8187(file_name);
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    ))
+    .map_err(|error| HttpError::internal(format!("invalid artifact download filename: {error}")))
+}
+
+fn encode_rfc8187(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
+        {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
 async fn get_artifact_file(
     State(state): State<AppState>,
     Path((artifact_id, artifact_path)): Path<(ArtifactId, String)>,
@@ -1362,6 +1626,235 @@ struct HistoryQuery {
     max_points: Option<usize>,
 }
 
+#[derive(Debug)]
+struct ChartHistoryQuery {
+    keys: Vec<String>,
+    max_buckets: Option<usize>,
+    step_min: Option<u64>,
+    step_max: Option<u64>,
+}
+
+struct ChartQueryLease {
+    _snapshot: OwnedRwLockReadGuard<()>,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct CancelChartQueryOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelChartQueryOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+async fn chart_history(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<ChartHistoryResponse>, HttpError> {
+    let query = parse_chart_history_query(raw_query.as_deref())?;
+    let keys = query.keys;
+    let max_buckets = query
+        .max_buckets
+        .unwrap_or_else(|| DEFAULT_CHART_BUCKETS.min(MAX_CHART_BUCKET_CELLS / keys.len()));
+    validate_chart_buckets(max_buckets, keys.len())?;
+    let requested_viewport = validate_chart_viewport(query.step_min, query.step_max)?;
+    state.catalog.get_run(run_id).await?;
+    let permit = Arc::clone(&state.query_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
+    let snapshot = state.metrics.read_snapshot().await;
+    let source_extent = state.catalog.metric_extent(run_id, None).await?;
+    let source_last_sequence = source_extent.map(|extent| extent.last_sequence);
+    let Some(source_extent) = source_extent else {
+        let mut response = match requested_viewport {
+            Some(viewport) => empty_chart_history_in_viewport(run_id, &keys, viewport, max_buckets),
+            None => empty_chart_history(run_id, &keys),
+        };
+        response.source_last_sequence = source_last_sequence;
+        return Ok(Json(response));
+    };
+
+    let mut lease = ChartQueryLease {
+        _snapshot: snapshot,
+        _permit: permit,
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelChartQueryOnDrop(Arc::clone(&cancelled));
+    let viewport = match requested_viewport {
+        Some(viewport) => Some(viewport),
+        None => {
+            let scanner = ChartStepExtentScanner::new(
+                &keys,
+                source_extent.first_sequence,
+                source_extent.last_sequence,
+            )?;
+            let (scanner, returned_lease) = scan_chart_step_extent(
+                &state,
+                run_id,
+                source_extent.last_sequence,
+                scanner,
+                lease,
+                Arc::clone(&cancelled),
+            )
+            .await?;
+            lease = returned_lease;
+            scanner.finish()
+        }
+    };
+    let Some(viewport) = viewport else {
+        let mut response = empty_chart_history(run_id, &keys);
+        response.source_last_sequence = source_last_sequence;
+        return Ok(Json(response));
+    };
+    let sampler = ChartHistorySampler::new(
+        run_id,
+        &keys,
+        source_extent.first_sequence,
+        source_extent.last_sequence,
+        viewport.minimum,
+        viewport.maximum,
+        max_buckets,
+    )?;
+    let (sampler, _lease) = sample_chart_history(
+        &state,
+        run_id,
+        source_extent.last_sequence,
+        sampler,
+        lease,
+        Arc::clone(&cancelled),
+    )
+    .await?;
+    let mut response = sampler.finish();
+    response.source_last_sequence = source_last_sequence;
+    Ok(Json(response))
+}
+
+async fn scan_chart_step_extent(
+    state: &AppState,
+    run_id: RunId,
+    source_last_sequence: u64,
+    mut scanner: ChartStepExtentScanner,
+    mut lease: ChartQueryLease,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(ChartStepExtentScanner, ChartQueryLease), HttpError> {
+    let mut segment_cursor = None;
+    loop {
+        let records = state.catalog.list_segments(run_id, segment_cursor).await?;
+        let Some(page_last) = records.last().map(|segment| segment.last_sequence) else {
+            break;
+        };
+        let page_full = records.len() == MAX_SEGMENTS_PER_QUERY;
+        let segments = records
+            .into_iter()
+            .map(|segment| SegmentSource {
+                relative_path: segment.relative_path,
+            })
+            .collect::<Vec<_>>();
+        let metrics = state.metrics.store().clone();
+        let worker_cancelled = Arc::clone(&cancelled);
+        (scanner, lease) = tokio::task::spawn_blocking(move || -> Result<_, StorageError> {
+            scanner.read_segments(&metrics, &segments, &worker_cancelled)?;
+            Ok((scanner, lease))
+        })
+        .await
+        .map_err(|error| HttpError::internal(format!("query worker failed: {error}")))??;
+        if page_last >= source_last_sequence || !page_full {
+            break;
+        }
+        if segment_cursor == Some(page_last) {
+            return Err(HttpError::internal(
+                "chart history extent cursor did not advance",
+            ));
+        }
+        segment_cursor = Some(page_last);
+    }
+    Ok((scanner, lease))
+}
+
+async fn sample_chart_history(
+    state: &AppState,
+    run_id: RunId,
+    source_last_sequence: u64,
+    mut sampler: ChartHistorySampler,
+    mut lease: ChartQueryLease,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(ChartHistorySampler, ChartQueryLease), HttpError> {
+    let mut segment_cursor = None;
+    loop {
+        let records = state.catalog.list_segments(run_id, segment_cursor).await?;
+        let Some(page_last) = records.last().map(|segment| segment.last_sequence) else {
+            break;
+        };
+        let page_full = records.len() == MAX_SEGMENTS_PER_QUERY;
+        let segments = records
+            .into_iter()
+            .map(|segment| SegmentSource {
+                relative_path: segment.relative_path,
+            })
+            .collect::<Vec<_>>();
+        let metrics = state.metrics.store().clone();
+        let worker_cancelled = Arc::clone(&cancelled);
+        (sampler, lease) = tokio::task::spawn_blocking(move || -> Result<_, StorageError> {
+            sampler.read_segments(&metrics, &segments, &worker_cancelled)?;
+            Ok((sampler, lease))
+        })
+        .await
+        .map_err(|error| HttpError::internal(format!("query worker failed: {error}")))??;
+        if page_last >= source_last_sequence || !page_full {
+            break;
+        }
+        if segment_cursor == Some(page_last) {
+            return Err(HttpError::internal(
+                "chart history sampling cursor did not advance",
+            ));
+        }
+        segment_cursor = Some(page_last);
+    }
+    Ok((sampler, lease))
+}
+
+fn empty_chart_history(run_id: RunId, keys: &[String]) -> ChartHistoryResponse {
+    ChartHistoryResponse {
+        run_id,
+        step_min: None,
+        step_max: None,
+        bucket_count: 0,
+        source_points: 0,
+        source_last_sequence: None,
+        metrics: keys
+            .iter()
+            .cloned()
+            .map(|key| (key, ChartMetricHistory::default()))
+            .collect(),
+    }
+}
+
+fn empty_chart_history_in_viewport(
+    run_id: RunId,
+    keys: &[String],
+    viewport: ChartStepExtent,
+    max_buckets: usize,
+) -> ChartHistoryResponse {
+    let span = u128::from(viewport.maximum - viewport.minimum) + 1;
+    let bucket_count = usize::try_from(span.min(max_buckets as u128))
+        .expect("validated chart bucket count fits usize");
+    ChartHistoryResponse {
+        run_id,
+        step_min: Some(viewport.minimum),
+        step_max: Some(viewport.maximum),
+        bucket_count,
+        source_points: 0,
+        source_last_sequence: None,
+        metrics: keys
+            .iter()
+            .cloned()
+            .map(|key| (key, ChartMetricHistory::default()))
+            .collect(),
+    }
+}
+
 async fn history(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
@@ -1386,6 +1879,10 @@ async fn history(
             "history limit must be between 1 and {MAX_HISTORY_POINTS}"
         )));
     }
+    let _permit = Arc::clone(&state.query_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
     let _snapshot = state.metrics.read_snapshot().await;
     let segments = state
         .catalog
@@ -1399,10 +1896,6 @@ async fn history(
     let segment_page_full = segments.len() == MAX_SEGMENTS_PER_QUERY;
     let metrics = state.metrics.store().clone();
     let after = query.after;
-    let _permit = Arc::clone(&state.query_permits)
-        .acquire_owned()
-        .await
-        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
     let mut response = tokio::task::spawn_blocking(move || {
         metrics.read_history(run_id, &segments, &keys, after, limit)
     })
@@ -1421,6 +1914,10 @@ async fn sampled_history(
     after: Option<u64>,
     max_points: usize,
 ) -> Result<HistoryResponse, HttpError> {
+    let _permit = Arc::clone(&state.query_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
     let _snapshot = state.metrics.read_snapshot().await;
     let Some(extent) = state.catalog.metric_extent(run_id, after).await? else {
         return Ok(HistoryResponse {
@@ -1442,10 +1939,6 @@ async fn sampled_history(
         extent.last_sequence,
         max_points,
     )?;
-    let _permit = Arc::clone(&state.query_permits)
-        .acquire_owned()
-        .await
-        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
     let mut segment_cursor = after;
     loop {
         let records = state.catalog.list_segments(run_id, segment_cursor).await?;
@@ -1825,6 +2318,65 @@ fn parse_history_keys(value: &str) -> Result<Vec<String>, HttpError> {
     Ok(keys.into_iter().collect())
 }
 
+fn parse_chart_history_query(value: Option<&str>) -> Result<ChartHistoryQuery, HttpError> {
+    let pairs = serde_urlencoded::from_str::<Vec<(String, String)>>(value.unwrap_or_default())
+        .map_err(|error| HttpError::invalid(format!("invalid chart history query: {error}")))?;
+    let mut keys = BTreeSet::new();
+    let mut max_buckets = None;
+    let mut step_min = None;
+    let mut step_max = None;
+    for (name, value) in pairs {
+        match name.as_str() {
+            "key" => {
+                if value.is_empty()
+                    || value.len() > MAX_METRIC_KEY_BYTES
+                    || value.chars().any(char::is_control)
+                {
+                    return Err(HttpError::invalid(format!(
+                        "chart metric keys must contain 1 to {MAX_METRIC_KEY_BYTES} non-control bytes"
+                    )));
+                }
+                keys.insert(value);
+            }
+            "max_buckets" => {
+                parse_unique_unsigned_parameter(&mut max_buckets, &name, &value)?;
+            }
+            "step_min" => parse_unique_unsigned_parameter(&mut step_min, &name, &value)?,
+            "step_max" => parse_unique_unsigned_parameter(&mut step_max, &name, &value)?,
+            _ => {}
+        }
+    }
+    if keys.is_empty() || keys.len() > MAX_HISTORY_KEYS {
+        return Err(HttpError::invalid(format!(
+            "chart history queries must request 1 to {MAX_HISTORY_KEYS} metric keys"
+        )));
+    }
+    Ok(ChartHistoryQuery {
+        keys: keys.into_iter().collect(),
+        max_buckets,
+        step_min,
+        step_max,
+    })
+}
+
+fn parse_unique_unsigned_parameter<T: FromStr>(
+    target: &mut Option<T>,
+    name: &str,
+    value: &str,
+) -> Result<(), HttpError> {
+    if target.is_some() {
+        return Err(HttpError::invalid(format!(
+            "chart history query parameter '{name}' cannot be repeated"
+        )));
+    }
+    *target = Some(value.parse().map_err(|_| {
+        HttpError::invalid(format!(
+            "chart history query parameter '{name}' must be an unsigned integer"
+        ))
+    })?);
+    Ok(())
+}
+
 fn default_history_limit() -> usize {
     1_000
 }
@@ -1837,6 +2389,37 @@ fn validate_sample_points(max_points: usize, key_count: usize) -> Result<(), Htt
         )));
     }
     Ok(())
+}
+
+fn validate_chart_buckets(max_buckets: usize, key_count: usize) -> Result<(), HttpError> {
+    let cells = max_buckets
+        .checked_mul(key_count)
+        .ok_or_else(|| HttpError::invalid("chart history bucket budget overflow"))?;
+    if max_buckets == 0 || max_buckets > MAX_CHART_BUCKETS || cells > MAX_CHART_BUCKET_CELLS {
+        let maximum = MAX_CHART_BUCKETS.min(MAX_CHART_BUCKET_CELLS / key_count);
+        return Err(HttpError::invalid(format!(
+            "chart history max_buckets must be between 1 and {maximum} for {key_count} requested metric key(s)"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_chart_viewport(
+    step_min: Option<u64>,
+    step_max: Option<u64>,
+) -> Result<Option<ChartStepExtent>, HttpError> {
+    match (step_min, step_max) {
+        (None, None) => Ok(None),
+        (Some(minimum), Some(maximum)) if minimum <= maximum => {
+            Ok(Some(ChartStepExtent { minimum, maximum }))
+        }
+        (Some(_), Some(_)) => Err(HttpError::invalid(
+            "chart history step_min must not exceed step_max",
+        )),
+        _ => Err(HttpError::invalid(
+            "chart history step_min and step_max must be provided together",
+        )),
+    }
 }
 
 fn default_list_limit() -> usize {
@@ -2145,6 +2728,7 @@ impl From<StorageError> for HttpError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::io::{Cursor, Read};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
@@ -2154,7 +2738,7 @@ mod tests {
     use runloom_catalog::Catalog;
     use runloom_protocol::{
         AlertId, AlertLevel, AlertListResponse, ArtifactEntry, ArtifactListResponse, BlobRef,
-        BlobUploadResponse, ClaimSweepTrialRequest, ClaimSweepTrialResponse,
+        BlobUploadResponse, ChartHistoryResponse, ClaimSweepTrialRequest, ClaimSweepTrialResponse,
         CompleteSweepTrialRequest, ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse,
         CreateArtifactRequest, CreateArtifactResponse, CreateReportRequest, CreateReportResponse,
         CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest, CreateRunResponse,
@@ -2703,6 +3287,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chart_history_returns_exact_sparse_buckets_and_validates_viewports()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let created: CreateRunResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/charts/runs",
+                    &CreateRunRequest {
+                        id: None,
+                        name: Some("nonmonotonic".to_owned()),
+                        config: BTreeMap::new(),
+                        resume: ResumePolicy::Never,
+                        sweep_trial_id: None,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        let points = [
+            (1, 4, Some(10.0), None),
+            (2, 1, Some(-5.0), Some(100.0)),
+            (3, 4, Some(7.0), None),
+            (4, 0, None, Some(50.0)),
+            (5, 8, Some(20.0), None),
+            (6, 6, None, Some(-1.0)),
+            (7, 5, Some(15.0), Some(2.0)),
+        ]
+        .into_iter()
+        .map(|(sequence, step, a, b)| {
+            let mut metrics = BTreeMap::new();
+            if let Some(value) = a {
+                metrics.insert("a".to_owned(), value);
+            }
+            if let Some(value) = b {
+                metrics.insert("b".to_owned(), value);
+            }
+            MetricPoint {
+                sequence,
+                step,
+                timestamp_ms: sequence as i64 * 10,
+                metrics,
+            }
+        })
+        .collect();
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{}/batches", created.run.id),
+                &IngestBatchRequest {
+                    batch_sequence: 1,
+                    points,
+                },
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let path = format!(
+            "/api/v1/runs/{}/chart-history?key=a&key=b&key=missing&max_buckets=2",
+            created.run.id
+        );
+        let response: ChartHistoryResponse = response_json(
+            router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(response.step_min, Some(0));
+        assert_eq!(response.step_max, Some(8));
+        assert_eq!(response.bucket_count, 2);
+        assert_eq!(response.source_points, 7);
+        assert_eq!(response.source_last_sequence, Some(7));
+        assert_eq!(response.metrics["a"].minimum, vec![-5.0, 15.0]);
+        assert_eq!(response.metrics["a"].maximum, vec![10.0, 20.0]);
+        assert_eq!(response.metrics["a"].last, vec![7.0, 15.0]);
+        assert_eq!(response.metrics["a"].last_step, vec![4, 5]);
+        assert_eq!(response.metrics["b"].minimum, vec![50.0, -1.0]);
+        assert_eq!(response.metrics["b"].maximum, vec![100.0, 2.0]);
+        assert_eq!(response.metrics["b"].last, vec![50.0, 2.0]);
+        assert_eq!(response.metrics["b"].last_step, vec![0, 5]);
+        assert_eq!(response.metrics["missing"].source_points, 0);
+        assert!(response.metrics["missing"].bucket.is_empty());
+
+        let viewport_path = format!(
+            "/api/v1/runs/{}/chart-history?key=a&key=b&max_buckets=1&step_min=1&step_max=4",
+            created.run.id
+        );
+        let viewport: ChartHistoryResponse = response_json(
+            router
+                .clone()
+                .oneshot(Request::get(viewport_path).body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(viewport.source_points, 3);
+        assert_eq!(viewport.metrics["a"].minimum, vec![-5.0]);
+        assert_eq!(viewport.metrics["a"].maximum, vec![10.0]);
+        assert_eq!(viewport.metrics["a"].last, vec![7.0]);
+        assert_eq!(viewport.metrics["b"].last, vec![100.0]);
+
+        let comma_key: ChartHistoryResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/runs/{}/chart-history?key=comma%2Ckey&step_min=0&step_max=1",
+                        created.run.id
+                    ))
+                    .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert!(comma_key.metrics.contains_key("comma,key"));
+
+        for query in [
+            "key=a&step_min=1",
+            "key=a&step_min=5&step_max=4",
+            "key=a&max_buckets=0",
+            "key=a&key=b&key=missing&max_buckets=2000",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/runs/{}/chart-history?{query}",
+                        created.run.id
+                    ))
+                    .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn lifecycle_is_idempotent_and_history_is_columnar()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
@@ -2943,10 +3669,16 @@ mod tests {
             description: Some("trained policy".to_owned()),
             metadata: BTreeMap::from([("framework".to_owned(), "jax".into())]),
             aliases: vec!["latest".to_owned()],
-            entries: vec![ArtifactEntry {
-                path: "checkpoint.bin".to_owned(),
-                blob: uploaded.blob.clone(),
-            }],
+            entries: vec![
+                ArtifactEntry {
+                    path: "checkpoint.bin".to_owned(),
+                    blob: uploaded.blob.clone(),
+                },
+                ArtifactEntry {
+                    path: "metadata/정책.json".to_owned(),
+                    blob: uploaded.blob.clone(),
+                },
+            ],
         };
         let response = router
             .clone()
@@ -3048,6 +3780,36 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(to_bytes(response.into_body(), 64).await?, &video[0..=5]);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/artifacts/{}/download",
+                    version_zero.artifact.id
+                ))
+                .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/zip");
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename=\"policy-v0.zip\"; filename*=UTF-8''policy-v0.zip"
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert!(response.headers().get("content-length").is_none());
+        let body = to_bytes(response.into_body(), 64 * 1024).await?;
+        let mut archive = zip::ZipArchive::new(Cursor::new(body))?;
+        assert_eq!(archive.len(), 2);
+        for path in ["checkpoint.bin", "metadata/정책.json"] {
+            let mut file = archive.by_name(path)?;
+            assert_eq!(file.compression(), zip::CompressionMethod::Stored);
+            assert_eq!(file.unix_mode(), Some(0o100644));
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+            assert_eq!(contents, video);
+        }
 
         let trace_payload = br#"{"inputs":{"prompt":"reward"},"outputs":{"text":"reward is 3"},"messages":[{"role":"assistant","content":"reward is 3"}]}"#;
         let trace_digest = format!("{:x}", Sha256::digest(trace_payload));
@@ -3367,6 +4129,21 @@ mod tests {
                 .iter()
                 .all(|source| !metrics_root.join(&source.relative_path).exists())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_download_filename_is_safe_and_utf8_compatible()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let file_name = super::artifact_zip_file_name(r#" policy:"정책". "#, 7);
+        assert_eq!(file_name, "policy__정책_-v7.zip");
+        let disposition = super::artifact_download_content_disposition(&file_name)
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        assert_eq!(
+            disposition.to_str()?,
+            "attachment; filename=\"policy_____-v7.zip\"; filename*=UTF-8''policy__%EC%A0%95%EC%B1%85_-v7.zip"
+        );
+        assert_eq!(super::artifact_zip_file_name("...", 0), "artifact-v0.zip");
         Ok(())
     }
 

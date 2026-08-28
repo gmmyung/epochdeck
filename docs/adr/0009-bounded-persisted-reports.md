@@ -21,10 +21,10 @@ Creation validates all run references in the catalog transaction. Updates
 replace the current pre-alpha definition directly. Reports never store history,
 downsampled results, or blob content.
 
-The dashboard turns visible metric panels into ordinary sampled history calls.
-It cancels requests when selection changes and admits at most four concurrently.
-Markdown is parsed into a small safe block model and rendered as Svelte text
-nodes rather than injected HTML.
+The dashboard turns visible metric panels into ordinary exact-bucket chart
+history calls. It cancels requests when selection changes and admits at most
+four concurrently. Markdown is parsed into a small safe block model and
+rendered as Svelte text nodes rather than injected HTML.
 
 ## Consequences
 

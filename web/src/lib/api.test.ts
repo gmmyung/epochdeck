@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  artifactArchiveUrl,
   blobUrl,
   artifactFileUrl,
   getAlerts,
+  getChartHistory,
   getHealth,
   getHistory,
   getReports,
@@ -125,6 +127,42 @@ describe("getHealth", () => {
     );
   });
 
+  it("requests exact chart buckets for encoded metric keys and a paired viewport", async () => {
+    const chartHistory = {
+      run_id: "run/id",
+      step_min: 10,
+      step_max: 20,
+      bucket_count: 512,
+      source_points: 4,
+      source_last_sequence: 9,
+      metrics: {
+        "train/loss": {
+          source_points: 4,
+          bucket: [0, 511],
+          last_step: [10, 20],
+          last_timestamp_ms: [100, 200],
+          minimum: [0.5, 0.25],
+          maximum: [1, 0.75],
+          last: [0.75, 0.5],
+        },
+      },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(chartHistory), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      getChartHistory("run/id", ["train/loss", "comma,key", "reward + bonus"], {
+        maxBuckets: 512,
+        viewport: { stepMin: 10, stepMax: 20 },
+      }),
+    ).resolves.toEqual(chartHistory);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/v1/runs/run%2Fid/chart-history?key=train%2Floss&key=comma%2Ckey&key=reward+%2B+bonus&max_buckets=512&step_min=10&step_max=20",
+    );
+  });
+
   it("loads a bounded alert page", async () => {
     const fetchMock = vi
       .fn()
@@ -159,10 +197,11 @@ describe("getHealth", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(getRunArtifacts("run/id")).resolves.toEqual([]);
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/runs/run%2Fid/artifacts");
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/runs/run%2Fid/artifacts?limit=100");
     expect(artifactFileUrl("artifact/id", "checkpoints/best model.bin")).toBe(
       "/api/v1/artifacts/artifact%2Fid/files/checkpoints/best%20model.bin",
     );
+    expect(artifactArchiveUrl("artifact/id")).toBe("/api/v1/artifacts/artifact%2Fid/download");
   });
 
   it("loads bounded traces with an encoded full-text query", async () => {

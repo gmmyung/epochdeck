@@ -37,6 +37,37 @@ export type History = {
   source_last_sequence: number | null;
 };
 
+export type ChartMetricHistory = {
+  source_points: number;
+  bucket: number[];
+  last_step: number[];
+  last_timestamp_ms: number[];
+  minimum: number[];
+  maximum: number[];
+  last: number[];
+};
+
+export type ChartHistory = {
+  run_id: string;
+  step_min: number | null;
+  step_max: number | null;
+  bucket_count: number;
+  source_points: number;
+  source_last_sequence: number | null;
+  metrics: Record<string, ChartMetricHistory>;
+};
+
+export type ChartHistoryViewport = {
+  stepMin: number;
+  stepMax: number;
+};
+
+export type ChartHistoryOptions = {
+  maxBuckets?: number;
+  viewport?: ChartHistoryViewport;
+  signal?: AbortSignal;
+};
+
 export type Alert = {
   id: string;
   run_id: string;
@@ -90,6 +121,11 @@ export type Artifact = {
 export type RunArtifact = {
   artifact: Artifact;
   relation: "input" | "output";
+};
+
+export type CursorPage<T> = {
+  items: T[];
+  nextBefore: string | null;
 };
 
 export type TraceSpan = {
@@ -180,11 +216,21 @@ export async function getAlerts(runId: string, signal?: AbortSignal): Promise<Al
 }
 
 export async function getRichValues(runId: string, signal?: AbortSignal): Promise<RichValue[]> {
+  return (await getRichValuePage(runId, undefined, signal)).items;
+}
+
+export async function getRichValuePage(
+  runId: string,
+  before?: string,
+  signal?: AbortSignal,
+): Promise<CursorPage<RichValue>> {
+  const query = new URLSearchParams({ limit: "100" });
+  if (before) query.set("before", before);
   const result = await getJson<{ values: RichValue[]; next_before: string | null }>(
-    `/api/v1/runs/${encodeURIComponent(runId)}/rich-values?limit=100`,
+    `/api/v1/runs/${encodeURIComponent(runId)}/rich-values?${query}`,
     signal,
   );
-  return result.values;
+  return { items: result.values, nextBefore: result.next_before };
 }
 
 export function blobUrl(blob: BlobRef): string {
@@ -193,11 +239,21 @@ export function blobUrl(blob: BlobRef): string {
 }
 
 export async function getRunArtifacts(runId: string, signal?: AbortSignal): Promise<RunArtifact[]> {
-  const result = await getJson<{ artifacts: RunArtifact[] }>(
-    `/api/v1/runs/${encodeURIComponent(runId)}/artifacts`,
+  return (await getRunArtifactPage(runId, undefined, signal)).items;
+}
+
+export async function getRunArtifactPage(
+  runId: string,
+  before?: string,
+  signal?: AbortSignal,
+): Promise<CursorPage<RunArtifact>> {
+  const query = new URLSearchParams({ limit: "100" });
+  if (before) query.set("before", before);
+  const result = await getJson<{ artifacts: RunArtifact[]; next_before: string | null }>(
+    `/api/v1/runs/${encodeURIComponent(runId)}/artifacts?${query}`,
     signal,
   );
-  return result.artifacts;
+  return { items: result.artifacts, nextBefore: result.next_before };
 }
 
 export function artifactFileUrl(artifactId: string, path: string): string {
@@ -205,18 +261,32 @@ export function artifactFileUrl(artifactId: string, path: string): string {
   return `/api/v1/artifacts/${encodeURIComponent(artifactId)}/files/${encodedPath}`;
 }
 
+export function artifactArchiveUrl(artifactId: string): string {
+  return `/api/v1/artifacts/${encodeURIComponent(artifactId)}/download`;
+}
+
 export async function getTraces(
   runId: string,
   query = "",
   signal?: AbortSignal,
 ): Promise<TraceSpan[]> {
+  return (await getTracePage(runId, query, undefined, signal)).items;
+}
+
+export async function getTracePage(
+  runId: string,
+  query = "",
+  before?: string,
+  signal?: AbortSignal,
+): Promise<CursorPage<TraceSpan>> {
   const params = new URLSearchParams({ limit: "100" });
   if (query.trim()) params.set("q", query.trim());
+  if (before) params.set("before", before);
   const result = await getJson<{ spans: TraceSpan[]; next_before: string | null }>(
     `/api/v1/runs/${encodeURIComponent(runId)}/traces?${params}`,
     signal,
   );
-  return result.spans;
+  return { items: result.spans, nextBefore: result.next_before };
 }
 
 export function getHistory(
@@ -242,6 +312,26 @@ export function getSampledHistory(
     max_points: String(maxPoints),
   });
   return getJson<History>(`/api/v1/runs/${encodeURIComponent(runId)}/history?${query}`, signal);
+}
+
+export function getChartHistory(
+  runId: string,
+  keys: string[],
+  options: ChartHistoryOptions = {},
+): Promise<ChartHistory> {
+  const query = new URLSearchParams();
+  for (const key of keys) query.append("key", key);
+  if (options.maxBuckets !== undefined) {
+    query.set("max_buckets", String(options.maxBuckets));
+  }
+  if (options.viewport) {
+    query.set("step_min", String(options.viewport.stepMin));
+    query.set("step_max", String(options.viewport.stepMax));
+  }
+  return getJson<ChartHistory>(
+    `/api/v1/runs/${encodeURIComponent(runId)}/chart-history?${query}`,
+    options.signal,
+  );
 }
 
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {

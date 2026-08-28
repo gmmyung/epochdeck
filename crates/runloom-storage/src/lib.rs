@@ -16,7 +16,11 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
-use runloom_protocol::{HistoryResponse, IngestBatchRequest, ProjectId, RunId};
+use parquet::file::statistics::Statistics;
+use runloom_protocol::{
+    ChartHistoryResponse, ChartMetricHistory, HistoryResponse, IngestBatchRequest,
+    MAX_CHART_BUCKET_CELLS, MAX_CHART_BUCKETS, ProjectId, RunId,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -47,7 +51,7 @@ pub enum StorageError {
     InvalidSegment(String),
     #[error("invalid blob: {0}")]
     InvalidBlob(String),
-    #[error("metric compaction was cancelled")]
+    #[error("storage operation was cancelled")]
     Cancelled,
 }
 
@@ -472,6 +476,278 @@ impl MinMaxHistorySampler {
             .unwrap_or(self.buckets.len() - 1)
             .min(self.buckets.len() - 1);
         self.buckets[bucket_index].observe(sequence, step, timestamp_ms, values);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChartStepExtent {
+    pub minimum: u64,
+    pub maximum: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChartScanStatistics {
+    pub decoded_rows: u64,
+    pub row_groups_read: u64,
+    pub row_groups_pruned: u64,
+}
+
+#[derive(Debug)]
+pub struct ChartStepExtentScanner {
+    keys: Vec<String>,
+    first_sequence: u64,
+    last_sequence: u64,
+    extent: Option<ChartStepExtent>,
+}
+
+impl ChartStepExtentScanner {
+    pub fn new(
+        keys: &[String],
+        first_sequence: u64,
+        last_sequence: u64,
+    ) -> Result<Self, StorageError> {
+        if keys.is_empty() || first_sequence > last_sequence {
+            return Err(StorageError::InvalidSegment(
+                "chart step extent requires metric keys and an ordered sequence range".to_owned(),
+            ));
+        }
+        Ok(Self {
+            keys: keys.to_vec(),
+            first_sequence,
+            last_sequence,
+            extent: None,
+        })
+    }
+
+    pub fn read_segments(
+        &mut self,
+        store: &MetricStore,
+        segments: &[SegmentSource],
+        cancelled: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        for segment in segments {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(StorageError::Cancelled);
+            }
+            let path = store.resolve_segment(&segment.relative_path)?;
+            read_segment_chart_extent(&path, self, cancelled)?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn finish(self) -> Option<ChartStepExtent> {
+        self.extent
+    }
+
+    fn observe(&mut self, sequence: u64, step: u64, values: &[Option<f64>]) {
+        if sequence < self.first_sequence || sequence > self.last_sequence {
+            return;
+        }
+        if !values.iter().any(Option::is_some) {
+            return;
+        }
+        match &mut self.extent {
+            Some(extent) => {
+                extent.minimum = extent.minimum.min(step);
+                extent.maximum = extent.maximum.max(step);
+            }
+            None => {
+                self.extent = Some(ChartStepExtent {
+                    minimum: step,
+                    maximum: step,
+                });
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChartBucket {
+    minimum: f64,
+    maximum: f64,
+    last_sequence: u64,
+    last_step: u64,
+    last_timestamp_ms: i64,
+    last: f64,
+}
+
+impl ChartBucket {
+    fn new(sequence: u64, step: u64, timestamp_ms: i64, value: f64) -> Self {
+        Self {
+            minimum: value,
+            maximum: value,
+            last_sequence: sequence,
+            last_step: step,
+            last_timestamp_ms: timestamp_ms,
+            last: value,
+        }
+    }
+
+    fn observe(&mut self, sequence: u64, step: u64, timestamp_ms: i64, value: f64) {
+        self.minimum = self.minimum.min(value);
+        self.maximum = self.maximum.max(value);
+        if sequence >= self.last_sequence {
+            self.last_sequence = sequence;
+            self.last_step = step;
+            self.last_timestamp_ms = timestamp_ms;
+            self.last = value;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ChartHistorySampler {
+    run_id: RunId,
+    keys: Vec<String>,
+    first_sequence: u64,
+    last_sequence: u64,
+    step_min: u64,
+    step_max: u64,
+    bucket_count: usize,
+    source_points: u64,
+    metric_source_points: Vec<u64>,
+    buckets: Vec<Vec<Option<ChartBucket>>>,
+    scan_statistics: ChartScanStatistics,
+}
+
+impl ChartHistorySampler {
+    pub fn new(
+        run_id: RunId,
+        keys: &[String],
+        first_sequence: u64,
+        last_sequence: u64,
+        step_min: u64,
+        step_max: u64,
+        max_buckets: usize,
+    ) -> Result<Self, StorageError> {
+        if keys.is_empty() || first_sequence > last_sequence || step_min > step_max {
+            return Err(StorageError::InvalidSegment(
+                "chart history requires metric keys and ordered sequence and step ranges"
+                    .to_owned(),
+            ));
+        }
+        if max_buckets == 0 || max_buckets > MAX_CHART_BUCKETS {
+            return Err(StorageError::InvalidSegment(format!(
+                "chart history max_buckets must be between 1 and {MAX_CHART_BUCKETS}"
+            )));
+        }
+        let bucket_cells = max_buckets.checked_mul(keys.len()).ok_or_else(|| {
+            StorageError::InvalidSegment("chart history bucket budget overflow".to_owned())
+        })?;
+        if bucket_cells > MAX_CHART_BUCKET_CELLS {
+            return Err(StorageError::InvalidSegment(format!(
+                "chart history exceeds the {MAX_CHART_BUCKET_CELLS} metric-bucket cell limit"
+            )));
+        }
+        let step_span = u128::from(step_max - step_min) + 1;
+        let bucket_count = usize::try_from(step_span.min(max_buckets as u128))
+            .map_err(|_| StorageError::InvalidSegment("chart bucket count overflow".to_owned()))?;
+        Ok(Self {
+            run_id,
+            keys: keys.to_vec(),
+            first_sequence,
+            last_sequence,
+            step_min,
+            step_max,
+            bucket_count,
+            source_points: 0,
+            metric_source_points: vec![0; keys.len()],
+            buckets: (0..keys.len()).map(|_| vec![None; bucket_count]).collect(),
+            scan_statistics: ChartScanStatistics::default(),
+        })
+    }
+
+    #[must_use]
+    pub fn scan_statistics(&self) -> ChartScanStatistics {
+        self.scan_statistics
+    }
+
+    pub fn read_segments(
+        &mut self,
+        store: &MetricStore,
+        segments: &[SegmentSource],
+        cancelled: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        for segment in segments {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(StorageError::Cancelled);
+            }
+            let path = store.resolve_segment(&segment.relative_path)?;
+            read_segment_chart_history(&path, self, cancelled)?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn finish(self) -> ChartHistoryResponse {
+        let metrics = self
+            .keys
+            .into_iter()
+            .enumerate()
+            .map(|(metric_index, key)| {
+                let mut series = ChartMetricHistory {
+                    source_points: self.metric_source_points[metric_index],
+                    ..ChartMetricHistory::default()
+                };
+                for (bucket_index, bucket) in self.buckets[metric_index].iter().enumerate() {
+                    let Some(bucket) = bucket else {
+                        continue;
+                    };
+                    series.bucket.push(
+                        u32::try_from(bucket_index)
+                            .expect("chart bucket count is bounded below u32::MAX"),
+                    );
+                    series.last_step.push(bucket.last_step);
+                    series.last_timestamp_ms.push(bucket.last_timestamp_ms);
+                    series.minimum.push(bucket.minimum);
+                    series.maximum.push(bucket.maximum);
+                    series.last.push(bucket.last);
+                }
+                (key, series)
+            })
+            .collect();
+        ChartHistoryResponse {
+            run_id: self.run_id,
+            step_min: Some(self.step_min),
+            step_max: Some(self.step_max),
+            bucket_count: self.bucket_count,
+            source_points: self.source_points,
+            source_last_sequence: None,
+            metrics,
+        }
+    }
+
+    fn observe(&mut self, sequence: u64, step: u64, timestamp_ms: i64, values: &[Option<f64>]) {
+        if sequence < self.first_sequence || sequence > self.last_sequence {
+            return;
+        }
+        if step < self.step_min || step > self.step_max {
+            return;
+        }
+        let mut observed_row = false;
+        let span = u128::from(self.step_max - self.step_min) + 1;
+        let offset = u128::from(step - self.step_min);
+        let bucket_index = usize::try_from((offset * self.bucket_count as u128) / span)
+            .unwrap_or(self.bucket_count - 1)
+            .min(self.bucket_count - 1);
+        for (metric_index, value) in values.iter().copied().enumerate() {
+            let Some(value) = value else {
+                continue;
+            };
+            observed_row = true;
+            self.metric_source_points[metric_index] =
+                self.metric_source_points[metric_index].saturating_add(1);
+            match &mut self.buckets[metric_index][bucket_index] {
+                Some(bucket) => bucket.observe(sequence, step, timestamp_ms, value),
+                slot @ None => {
+                    *slot = Some(ChartBucket::new(sequence, step, timestamp_ms, value));
+                }
+            }
+        }
+        if observed_row {
+            self.source_points = self.source_points.saturating_add(1);
+        }
     }
 }
 
@@ -1056,6 +1332,198 @@ fn read_segment_sampled(
     Ok(())
 }
 
+fn read_segment_chart_extent(
+    path: &Path,
+    scanner: &mut ChartStepExtentScanner,
+    cancelled: &AtomicBool,
+) -> Result<(), StorageError> {
+    let reader = projected_reader(path, &scanner.keys, PARQUET_BATCH_SIZE)?;
+
+    for batch in reader {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(StorageError::Cancelled);
+        }
+        let batch = batch?;
+        let sequence = required_array::<UInt64Array>(&batch, SEQUENCE_COLUMN)?;
+        let step = required_array::<UInt64Array>(&batch, STEP_COLUMN)?;
+        let metric_columns = scanner
+            .keys
+            .iter()
+            .map(|key| {
+                batch
+                    .column_by_name(&metric_column(key))
+                    .and_then(|column| column.as_any().downcast_ref::<Float64Array>())
+            })
+            .collect::<Vec<_>>();
+        let mut values = Vec::with_capacity(scanner.keys.len());
+        for row_index in 0..batch.num_rows() {
+            values.clear();
+            values.extend(metric_columns.iter().map(|column| {
+                column.and_then(|column| {
+                    (!column.is_null(row_index)).then(|| column.value(row_index))
+                })
+            }));
+            scanner.observe(sequence.value(row_index), step.value(row_index), &values);
+        }
+    }
+    Ok(())
+}
+
+fn read_segment_chart_history(
+    path: &Path,
+    sampler: &mut ChartHistorySampler,
+    cancelled: &AtomicBool,
+) -> Result<(), StorageError> {
+    let (reader, row_groups_read, row_groups_pruned) = projected_chart_reader(
+        path,
+        &sampler.keys,
+        sampler.step_min,
+        sampler.step_max,
+        PARQUET_BATCH_SIZE,
+    )?;
+    sampler.scan_statistics.row_groups_read = sampler
+        .scan_statistics
+        .row_groups_read
+        .saturating_add(row_groups_read);
+    sampler.scan_statistics.row_groups_pruned = sampler
+        .scan_statistics
+        .row_groups_pruned
+        .saturating_add(row_groups_pruned);
+
+    for batch in reader {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(StorageError::Cancelled);
+        }
+        let batch = batch?;
+        sampler.scan_statistics.decoded_rows = sampler
+            .scan_statistics
+            .decoded_rows
+            .saturating_add(batch.num_rows() as u64);
+        let sequence = required_array::<UInt64Array>(&batch, SEQUENCE_COLUMN)?;
+        let step = required_array::<UInt64Array>(&batch, STEP_COLUMN)?;
+        let timestamp = required_array::<Int64Array>(&batch, TIMESTAMP_COLUMN)?;
+        let metric_columns = sampler
+            .keys
+            .iter()
+            .map(|key| {
+                batch
+                    .column_by_name(&metric_column(key))
+                    .and_then(|column| column.as_any().downcast_ref::<Float64Array>())
+            })
+            .collect::<Vec<_>>();
+        let mut values = Vec::with_capacity(sampler.keys.len());
+        for row_index in 0..batch.num_rows() {
+            values.clear();
+            values.extend(metric_columns.iter().map(|column| {
+                column.and_then(|column| {
+                    (!column.is_null(row_index)).then(|| column.value(row_index))
+                })
+            }));
+            sampler.observe(
+                sequence.value(row_index),
+                step.value(row_index),
+                timestamp.value(row_index),
+                &values,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn projected_chart_reader(
+    path: &Path,
+    keys: &[String],
+    step_min: u64,
+    step_max: u64,
+    batch_size: usize,
+) -> Result<(ParquetRecordBatchReader, u64, u64), StorageError> {
+    let file = File::open(path).map_err(|source| StorageError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema = builder.schema();
+    let step_arrow_index = schema.index_of(STEP_COLUMN)?;
+    if schema.field(step_arrow_index).data_type() != &DataType::UInt64 {
+        return Err(StorageError::InvalidSegment(format!(
+            "segment has an invalid {STEP_COLUMN} column type"
+        )));
+    }
+    let step_parquet_index = builder
+        .parquet_schema()
+        .columns()
+        .iter()
+        .position(|column| column.path().parts() == [STEP_COLUMN])
+        .ok_or_else(|| {
+            StorageError::InvalidSegment(format!("segment is missing column {STEP_COLUMN}"))
+        })?;
+    let row_group_count = builder.metadata().num_row_groups();
+    let selected_row_groups = builder
+        .metadata()
+        .row_groups()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row_group)| {
+            row_group_may_overlap_step_range(
+                row_group.column(step_parquet_index).statistics(),
+                step_min,
+                step_max,
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let row_groups_read = selected_row_groups.len() as u64;
+    let row_groups_pruned = row_group_count.saturating_sub(selected_row_groups.len()) as u64;
+    let mut projection_indices = vec![
+        schema.index_of(SEQUENCE_COLUMN)?,
+        step_arrow_index,
+        schema.index_of(TIMESTAMP_COLUMN)?,
+    ];
+    projection_indices.extend(
+        keys.iter()
+            .filter_map(|key| schema.index_of(&metric_column(key)).ok()),
+    );
+    projection_indices.sort_unstable();
+    projection_indices.dedup();
+    let projection = ProjectionMask::roots(builder.parquet_schema(), projection_indices);
+    Ok((
+        builder
+            .with_projection(projection)
+            .with_row_groups(selected_row_groups)
+            .with_batch_size(batch_size)
+            .build()?,
+        row_groups_read,
+        row_groups_pruned,
+    ))
+}
+
+fn row_group_may_overlap_step_range(
+    statistics: Option<&Statistics>,
+    step_min: u64,
+    step_max: u64,
+) -> bool {
+    let Some(statistics) = statistics else {
+        return true;
+    };
+    if statistics.is_min_max_deprecated() {
+        return true;
+    }
+    let Statistics::Int64(statistics) = statistics else {
+        return true;
+    };
+    if !statistics.min_is_exact() || !statistics.max_is_exact() {
+        return true;
+    }
+    let (Some(minimum), Some(maximum)) = (statistics.min_opt(), statistics.max_opt()) else {
+        return true;
+    };
+    let (minimum, maximum) = (*minimum as u64, *maximum as u64);
+    if minimum > maximum {
+        return true;
+    }
+    maximum >= step_min && minimum <= step_max
+}
+
 fn projected_reader(
     path: &Path,
     keys: &[String],
@@ -1153,13 +1621,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicBool;
 
+    use parquet::file::statistics::{Statistics, ValueStatistics};
     use runloom_protocol::{IngestBatchRequest, MetricPoint, ProjectId, RunId};
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     use super::{
-        BlobStore, CompactionSource, MetricStore, MinMaxHistorySampler, SegmentSource,
-        StorageLayout,
+        BlobStore, ChartHistorySampler, ChartStepExtent, ChartStepExtentScanner, CompactionSource,
+        MetricStore, MinMaxHistorySampler, SegmentSource, StorageLayout,
+        row_group_may_overlap_step_range,
     };
 
     #[test]
@@ -1490,6 +1960,159 @@ mod tests {
             history.metrics["b"],
             vec![Some(4.0), Some(100.0), Some(-100.0)]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn chart_viewport_prunes_only_provably_disjoint_row_groups()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let store = MetricStore::new(directory.path());
+        let project_id = ProjectId::new();
+        let run_id = RunId::new();
+        let mut written = Vec::new();
+        for batch_sequence in 0..16_u64 {
+            let first_step = batch_sequence * 1_024;
+            let request = IngestBatchRequest {
+                batch_sequence,
+                points: (0..1_024_u64)
+                    .map(|offset| {
+                        let step = first_step + offset;
+                        MetricPoint {
+                            sequence: step + 1,
+                            step,
+                            timestamp_ms: step as i64,
+                            metrics: BTreeMap::from([("loss".to_owned(), step as f64)]),
+                        }
+                    })
+                    .collect(),
+            };
+            written.push(store.write_batch(
+                project_id,
+                run_id,
+                &format!("{batch_sequence:064x}"),
+                &request,
+            )?);
+        }
+        let sources = written
+            .iter()
+            .map(|segment| CompactionSource {
+                relative_path: segment.relative_path.clone(),
+                first_sequence: segment.first_sequence,
+                last_sequence: segment.last_sequence,
+                row_count: segment.row_count,
+            })
+            .collect::<Vec<_>>();
+        let compacted = store.compact_segments(
+            project_id,
+            run_id,
+            &written[0].signature,
+            &sources,
+            &AtomicBool::new(false),
+        )?;
+        let mut sampler =
+            ChartHistorySampler::new(run_id, &["loss".to_owned()], 1, 16_384, 9_000, 9_005, 6)?;
+        sampler.read_segments(
+            &store,
+            &[SegmentSource {
+                relative_path: compacted.relative_path,
+            }],
+            &AtomicBool::new(false),
+        )?;
+
+        assert_eq!(
+            sampler.scan_statistics(),
+            super::ChartScanStatistics {
+                decoded_rows: 8_192,
+                row_groups_read: 1,
+                row_groups_pruned: 1,
+            }
+        );
+        let response = sampler.finish();
+        assert_eq!(response.source_points, 6);
+        let expected = (9_000..=9_005)
+            .map(|value| value as f64)
+            .collect::<Vec<_>>();
+        assert_eq!(response.metrics["loss"].minimum, expected);
+        assert_eq!(response.metrics["loss"].maximum, expected);
+        assert_eq!(response.metrics["loss"].last, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn chart_row_group_pruning_falls_back_for_untrusted_statistics() {
+        let exact = Statistics::int64(Some(0), Some(99), None, Some(0), false);
+        assert!(!row_group_may_overlap_step_range(Some(&exact), 100, 200));
+        assert!(row_group_may_overlap_step_range(Some(&exact), 99, 200));
+        assert!(row_group_may_overlap_step_range(None, 100, 200));
+
+        let wrong_type = Statistics::double(Some(0.0), Some(99.0), None, Some(0), false);
+        assert!(row_group_may_overlap_step_range(
+            Some(&wrong_type),
+            100,
+            200
+        ));
+        let deprecated = Statistics::int64(Some(0), Some(99), None, Some(0), true);
+        assert!(row_group_may_overlap_step_range(
+            Some(&deprecated),
+            100,
+            200
+        ));
+        let inexact = Statistics::from(
+            ValueStatistics::<i64>::new(Some(0), Some(99), None, Some(0), false)
+                .with_max_is_exact(false),
+        );
+        assert!(row_group_may_overlap_step_range(Some(&inexact), 100, 200));
+        let reversed = Statistics::int64(Some(99), Some(0), None, Some(0), false);
+        assert!(row_group_may_overlap_step_range(Some(&reversed), 100, 200));
+    }
+
+    #[test]
+    fn chart_sampling_keeps_exact_sparse_buckets_and_last_sequence_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = RunId::new();
+        let keys = ["a".to_owned(), "b".to_owned()];
+        let mut extent = ChartStepExtentScanner::new(&keys, 1, 7)?;
+        let mut sampler = ChartHistorySampler::new(run_id, &keys, 1, 7, 0, 9, 2)?;
+        for (sequence, step, a, b) in [
+            (1, 4, Some(10.0), None),
+            (2, 1, Some(-5.0), Some(100.0)),
+            (3, 4, Some(7.0), None),
+            (4, 0, None, Some(50.0)),
+            (5, 8, Some(20.0), None),
+            (6, 6, None, Some(-1.0)),
+            (7, 5, Some(15.0), Some(2.0)),
+            (8, 9, Some(999.0), Some(999.0)),
+        ] {
+            let values = [a, b];
+            extent.observe(sequence, step, &values);
+            sampler.observe(sequence, step, sequence as i64 * 10, &values);
+        }
+
+        assert_eq!(
+            extent.finish(),
+            Some(ChartStepExtent {
+                minimum: 0,
+                maximum: 8
+            })
+        );
+        let response = sampler.finish();
+        assert_eq!(response.bucket_count, 2);
+        assert_eq!(response.source_points, 7);
+        assert_eq!(response.metrics["a"].source_points, 5);
+        assert_eq!(response.metrics["a"].bucket, vec![0, 1]);
+        assert_eq!(response.metrics["a"].last_step, vec![4, 5]);
+        assert_eq!(response.metrics["a"].last_timestamp_ms, vec![30, 70]);
+        assert_eq!(response.metrics["a"].minimum, vec![-5.0, 15.0]);
+        assert_eq!(response.metrics["a"].maximum, vec![10.0, 20.0]);
+        assert_eq!(response.metrics["a"].last, vec![7.0, 15.0]);
+        assert_eq!(response.metrics["b"].source_points, 4);
+        assert_eq!(response.metrics["b"].bucket, vec![0, 1]);
+        assert_eq!(response.metrics["b"].last_step, vec![0, 5]);
+        assert_eq!(response.metrics["b"].last_timestamp_ms, vec![40, 70]);
+        assert_eq!(response.metrics["b"].minimum, vec![50.0, -1.0]);
+        assert_eq!(response.metrics["b"].maximum, vec![100.0, 2.0]);
+        assert_eq!(response.metrics["b"].last, vec![50.0, 2.0]);
         Ok(())
     }
 }

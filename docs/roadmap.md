@@ -32,8 +32,12 @@ not a reduction in the final parity goal.
 - [x] Project and run navigation.
 - [x] Lazy, virtualized Canvas metric charts.
 - [x] Server-side min/max downsampling.
-- [x] Per-run revision caches and realtime deltas.
+- [x] Per-run revision caches and bounded aggregate refreshes.
 - [x] System metrics and alerts.
+- [x] Full-width tabbed run workspace and expandable config/summary trees.
+- [x] Searchable charts with hover inspection, pan, zoom, region selection,
+      viewport re-sampling, configurable axes, smoothing, and exact line/band
+      display.
 
 ## Milestone 3: rich data and artifacts
 
@@ -41,6 +45,8 @@ not a reduction in the final parity goal.
 - [x] Content-addressed blobs and range delivery.
 - [x] Artifact versions, aliases, downloads, and lineage.
 - [x] Structured traces, messages, payloads, and full-text search.
+- [x] Key-grouped media timelines with step navigation and native playback.
+- [x] Artifact tab/file browser and bounded whole-artifact ZIP streaming.
 
 ## Milestone 4: APIs and automation
 

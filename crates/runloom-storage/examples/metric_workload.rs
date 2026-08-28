@@ -3,7 +3,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use runloom_protocol::{IngestBatchRequest, MetricPoint, ProjectId, RunId};
-use runloom_storage::{CompactionSource, MetricStore, SegmentSource};
+use runloom_storage::{
+    ChartHistorySampler, ChartStepExtentScanner, CompactionSource, MetricStore, SegmentSource,
+};
 use tempfile::tempdir;
 
 const BATCH_SIZE: usize = 1_024;
@@ -98,6 +100,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         5_000,
     )?;
     let query_elapsed = query_started.elapsed();
+
+    let chart_keys = ["metric_0".to_owned()];
+    let cancelled = AtomicBool::new(false);
+    let chart_extent_started = Instant::now();
+    let mut chart_extent = ChartStepExtentScanner::new(&chart_keys, 1, rows as u64)?;
+    chart_extent.read_segments(&store, &segments, &cancelled)?;
+    let chart_extent = chart_extent
+        .finish()
+        .ok_or("chart benchmark produced no requested metric values")?;
+    let chart_extent_elapsed = chart_extent_started.elapsed();
+    let chart_aggregate_started = Instant::now();
+    let mut chart_sampler = ChartHistorySampler::new(
+        run_id,
+        &chart_keys,
+        1,
+        rows as u64,
+        chart_extent.minimum,
+        chart_extent.maximum,
+        2_000,
+    )?;
+    chart_sampler.read_segments(&store, &segments, &cancelled)?;
+    let chart = chart_sampler.finish();
+    let chart_aggregate_elapsed = chart_aggregate_started.elapsed();
+    let chart_series = &chart.metrics["metric_0"];
+    if chart.source_points != rows as u64
+        || chart_series.source_points != rows as u64
+        || chart_series.bucket.len() > 2_000
+        || chart_series
+            .minimum
+            .iter()
+            .zip(&chart_series.last)
+            .zip(&chart_series.maximum)
+            .any(|((minimum, last), maximum)| minimum > last || last > maximum)
+    {
+        return Err("chart benchmark aggregate violated its bounded exactness contract".into());
+    }
+
+    let viewport_width = rows.min(512) as u64;
+    let viewport_min = (rows as u64 - viewport_width) / 2;
+    let viewport_max = viewport_min + viewport_width - 1;
+    let viewport_started = Instant::now();
+    let mut viewport_sampler = ChartHistorySampler::new(
+        run_id,
+        &chart_keys,
+        1,
+        rows as u64,
+        viewport_min,
+        viewport_max,
+        viewport_width.min(2_000) as usize,
+    )?;
+    viewport_sampler.read_segments(&store, &segments, &cancelled)?;
+    let viewport_scan = viewport_sampler.scan_statistics();
+    let viewport_chart = viewport_sampler.finish();
+    let viewport_elapsed = viewport_started.elapsed();
+    if viewport_chart.source_points != viewport_width
+        || viewport_chart.metrics["metric_0"].source_points != viewport_width
+        || viewport_scan.decoded_rows > rows as u64
+        || (rows > 16_384
+            && (viewport_scan.row_groups_pruned == 0 || viewport_scan.decoded_rows >= rows as u64))
+    {
+        return Err("chart viewport benchmark did not prune its disjoint row groups".into());
+    }
     let resume_started = Instant::now();
     let latest_segment = segments
         .last()
@@ -128,6 +192,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         query_elapsed.as_secs_f64(),
         history.source_points.unwrap_or_default(),
         history.sequence.len()
+    );
+    println!(
+        "chart_history_seconds={:.3} extent_seconds={:.3} aggregate_seconds={:.3} source_points={} returned_buckets={}",
+        (chart_extent_elapsed + chart_aggregate_elapsed).as_secs_f64(),
+        chart_extent_elapsed.as_secs_f64(),
+        chart_aggregate_elapsed.as_secs_f64(),
+        chart.source_points,
+        chart_series.bucket.len()
+    );
+    println!(
+        "chart_viewport_seconds={:.3} source_points={} decoded_rows={} row_groups_read={} row_groups_pruned={}",
+        viewport_elapsed.as_secs_f64(),
+        viewport_chart.source_points,
+        viewport_scan.decoded_rows,
+        viewport_scan.row_groups_read,
+        viewport_scan.row_groups_pruned,
     );
     println!(
         "resume_tail_seconds={:.3} sequence={} step={}",

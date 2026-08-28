@@ -122,7 +122,13 @@ Rich log values use `Image`, `Audio`, `Video`, `Table`, and `Histogram`.
 Runloom copies their bytes into the durable local spool, streams uploads without
 buffering complete files, and deduplicates server content by SHA-256. Put
 `RUNLOOM_BLOBS_DIR` on HDD/ZFS while leaving the catalog and metric roots on SSD.
-The dashboard renders each type natively and video delivery supports byte ranges.
+The full-width dashboard renders each type natively, groups repeated media keys
+into step timelines, and supports byte-range video playback. Summary,
+configuration, metrics, media, traces, and artifacts have separate tabs;
+configuration documents are expandable trees. Metric charts are searchable and
+support hover values, pan, zoom, region selection, axis ranges and log scales,
+multiple smoothing modes, and line or exact min/max band display. Wheel and
+region selection zoom without a separate zoom mode.
 
 Version checkpoints and datasets independently from run media:
 
@@ -136,8 +142,9 @@ downstream.use_artifact(artifact)  # explicit input lineage
 ```
 
 Artifact versions and aliases are catalog transactions; file entries reuse the
-CAS, downloads stream with byte ranges, and input/output relationships appear in
-the dashboard.
+CAS, individual downloads stream with byte ranges, whole-artifact ZIPs stream
+with bounded memory, and input/output relationships appear in the dashboard's
+tabbed file browser.
 
 Log LLM, tool, chain, or agent execution as structured spans:
 
@@ -239,8 +246,8 @@ api.close()
 ```
 
 Reports persist only bounded layout definitions. Their metric panels issue the
-same lazy, sampled, column-projected queries as ordinary run charts, so opening
-a report does not duplicate or scan complete histories.
+same lazy, exact-bucket, column-projected queries as ordinary run charts, so
+opening a report does not duplicate or return complete histories.
 
 Import a W&B project with four run workers and a durable checkpoint:
 

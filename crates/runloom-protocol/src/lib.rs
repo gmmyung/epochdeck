@@ -13,6 +13,8 @@ pub const MAX_BATCH_POINTS: usize = 1_024;
 pub const MAX_METRICS_PER_POINT: usize = 256;
 pub const MAX_HISTORY_KEYS: usize = 32;
 pub const MAX_HISTORY_POINTS: usize = 5_000;
+pub const MAX_CHART_BUCKETS: usize = 2_000;
+pub const MAX_CHART_BUCKET_CELLS: usize = 5_000;
 pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
 pub const MAX_SUMMARY_BYTES: usize = 256 * 1024;
 pub const MAX_ALERT_TITLE_BYTES: usize = 256;
@@ -1028,6 +1030,28 @@ pub struct HistoryResponse {
     pub sampled: bool,
     pub source_points: Option<u64>,
     pub source_last_sequence: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ChartMetricHistory {
+    pub source_points: u64,
+    pub bucket: Vec<u32>,
+    pub last_step: Vec<u64>,
+    pub last_timestamp_ms: Vec<i64>,
+    pub minimum: Vec<f64>,
+    pub maximum: Vec<f64>,
+    pub last: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChartHistoryResponse {
+    pub run_id: RunId,
+    pub step_min: Option<u64>,
+    pub step_max: Option<u64>,
+    pub bucket_count: usize,
+    pub source_points: u64,
+    pub source_last_sequence: Option<u64>,
+    pub metrics: BTreeMap<String, ChartMetricHistory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
