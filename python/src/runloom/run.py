@@ -6,7 +6,8 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
@@ -18,10 +19,102 @@ Resume = Literal["never", "allow", "must"]
 _DEFAULT_BATCH_SIZE = 64
 _DEFAULT_FLUSH_INTERVAL = 0.25
 _DEFAULT_FINISH_TIMEOUT = 30.0
+_MAX_DOCUMENT_BYTES = 256 * 1024
 
 
 class DeliveryError(RuntimeError):
     pass
+
+
+class _RunDocument(Mapping[str, Any]):
+    def __init__(self, initial: Mapping[str, Any], lock: threading.RLock) -> None:
+        self._data = deepcopy(dict(initial))
+        self._lock = lock
+
+    def __getitem__(self, key: str) -> Any:
+        with self._lock:
+            return deepcopy(self._data[key])
+
+    def __iter__(self) -> Iterator[str]:
+        with self._lock:
+            return iter(tuple(self._data))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+    def __repr__(self) -> str:
+        return repr(self.to_dict())
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+    def to_dict(self) -> dict[str, Any]:
+        with self._lock:
+            return deepcopy(self._data)
+
+    def _replace(self, values: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._data.clear()
+            self._data.update(deepcopy(dict(values)))
+
+    def _merge_local(self, values: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._data.update(deepcopy(dict(values)))
+
+
+class RunConfig(_RunDocument):
+    def __init__(
+        self,
+        initial: Mapping[str, Any],
+        lock: threading.RLock,
+        updater: Callable[[dict[str, Any], bool], None],
+    ) -> None:
+        super().__init__(initial, lock)
+        self._updater = updater
+
+    def update(
+        self,
+        values: Mapping[str, Any] | None = None,
+        *,
+        allow_val_change: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        updates = _collect_document_updates(values, kwargs, "config")
+        if updates:
+            self._updater(updates, allow_val_change)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.update({key: value})
+
+
+class RunSummary(_RunDocument, MutableMapping[str, Any]):
+    def __init__(
+        self,
+        initial: Mapping[str, Any],
+        lock: threading.RLock,
+        updater: Callable[[dict[str, Any]], None],
+    ) -> None:
+        super().__init__(initial, lock)
+        self._updater = updater
+
+    def update(
+        self,
+        values: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        updates = _collect_document_updates(values, kwargs, "summary")
+        if updates:
+            self._updater(updates)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.update({key: value})
+
+    def __delitem__(self, key: str) -> None:
+        raise TypeError(f"summary key deletion is not supported: {key}")
 
 
 class _Spool:
@@ -35,7 +128,14 @@ class _Spool:
         self.events_path.touch(exist_ok=True)
 
     def write_metadata(self, metadata: dict[str, Any]) -> None:
-        _atomic_json_write(self.metadata_path, metadata)
+        with self._lock:
+            _atomic_json_write(self.metadata_path, metadata)
+
+    def update_metadata(self, updates: Mapping[str, Any]) -> None:
+        with self._lock:
+            metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            metadata.update(deepcopy(dict(updates)))
+            _atomic_json_write(self.metadata_path, metadata)
 
     def append(self, point: dict[str, Any]) -> None:
         encoded = json.dumps(point, separators=(",", ":"), sort_keys=True, allow_nan=False)
@@ -179,10 +279,10 @@ class Run:
             raise ValueError("batch_size must be between 1 and 1024")
         if flush_interval < 0:
             raise ValueError("flush_interval cannot be negative")
+        initial_config = _normalize_document(config, "config")
         self.project = project
         self.id = run_id
         self.name = name
-        self.config = dict(config)
         self.mode = mode
         self.resume = resume
         self.server_url = server_url
@@ -191,9 +291,20 @@ class Run:
         self._finished = False
         self._finishing = False
         self._log_lock = threading.Lock()
+        self._document_lock = threading.RLock()
         self._client: RunloomClient | None = None
         self._worker: _DeliveryWorker | None = None
         self._spool: _Spool | None = None
+        self.config = RunConfig(
+            initial_config,
+            self._document_lock,
+            self._update_config,
+        )
+        self.summary = RunSummary(
+            {},
+            self._document_lock,
+            self._update_summary,
+        )
 
         if mode == "disabled":
             self._next_sequence = 1
@@ -208,7 +319,8 @@ class Run:
             "project": project,
             "id": run_id,
             "name": name,
-            "config": self.config,
+            "config": self.config.to_dict(),
+            "summary": self.summary.to_dict(),
             "resume": resume,
             "server_url": server_url,
             "batch_size": batch_size,
@@ -225,7 +337,7 @@ class Run:
                 project=project,
                 run_id=run_id,
                 name=name,
-                config=self.config,
+                config=self.config.to_dict(),
                 resume=resume,
             )
         except Exception:
@@ -233,6 +345,19 @@ class Run:
             raise
         server_run = response["run"]
         self.name = str(server_run["name"])
+        self.config._replace(
+            _normalize_document(server_run.get("config", self.config.to_dict()), "config")
+        )
+        self.summary._replace(
+            _normalize_document(server_run.get("summary", self.summary.to_dict()), "summary")
+        )
+        self._spool.update_metadata(
+            {
+                "name": self.name,
+                "config": self.config.to_dict(),
+                "summary": self.summary.to_dict(),
+            }
+        )
         self._worker = _DeliveryWorker(
             client=self._client,
             run_id=run_id,
@@ -254,6 +379,60 @@ class Run:
     def finished(self) -> bool:
         return self._finished
 
+    def _update_config(self, updates: dict[str, Any], allow_val_change: bool) -> None:
+        with self._log_lock:
+            self._ensure_documents_mutable()
+            current = self.config.to_dict()
+            if not allow_val_change:
+                for key, value in updates.items():
+                    if key in current and current[key] != value:
+                        raise ValueError(
+                            f"config key '{key}' already exists; "
+                            "pass allow_val_change=True to replace it"
+                        )
+            merged = _normalize_document({**current, **updates}, "config")
+            authoritative = merged
+            if self.mode == "online":
+                assert self._client is not None
+                response = self._client.update_config(
+                    self.id,
+                    updates,
+                    allow_val_change=allow_val_change,
+                )
+                authoritative = _normalize_document(
+                    response["run"].get("config", merged),
+                    "config",
+                )
+            self.config._replace(authoritative)
+            if self._spool is not None:
+                self._spool.update_metadata({"config": authoritative})
+
+    def _update_summary(self, updates: dict[str, Any]) -> None:
+        with self._log_lock:
+            self._ensure_documents_mutable()
+            merged = _normalize_document({**self.summary.to_dict(), **updates}, "summary")
+            authoritative = merged
+            if self.mode == "online":
+                assert self._client is not None
+                response = self._client.update_summary(self.id, updates)
+                server_summary = _normalize_document(
+                    response["run"].get("summary", merged),
+                    "summary",
+                )
+                authoritative = _normalize_document(
+                    {**server_summary, **merged},
+                    "summary",
+                )
+            self.summary._replace(authoritative)
+            if self._spool is not None:
+                self._spool.update_metadata({"summary": authoritative})
+
+    def _ensure_documents_mutable(self) -> None:
+        if self._finished or self._finishing:
+            raise RuntimeError(
+                "cannot update config or summary while a run is finishing or finished"
+            )
+
     def log(self, data: Mapping[str, Any], *, step: int | None = None) -> None:
         with self._log_lock:
             if self._finished or self._finishing:
@@ -272,6 +451,7 @@ class Run:
             }
             if self._spool is not None:
                 self._spool.append(point)
+            self.summary._merge_local(metrics)
             self._next_sequence += 1
             self._next_step = selected_step + 1
         if self._worker is not None:
@@ -288,17 +468,21 @@ class Run:
                 return
             if timeout <= 0:
                 raise ValueError("finish timeout must be positive")
+            explicit_summary = _normalize_document(summary or {}, "summary")
+            final_summary = _normalize_document(
+                {**self.summary.to_dict(), **explicit_summary},
+                "summary",
+            )
             self._finishing = True
         if self.mode == "disabled":
+            self.summary._replace(final_summary)
             self._finished = True
             self._finishing = False
             return
         assert self._spool is not None
         if self.mode == "offline":
-            metadata = json.loads(self._spool.metadata_path.read_text(encoding="utf-8"))
-            metadata["finished"] = True
-            metadata["summary"] = dict(summary or {})
-            self._spool.write_metadata(metadata)
+            self.summary._replace(final_summary)
+            self._spool.update_metadata({"finished": True, "summary": final_summary})
             self._finished = True
             self._finishing = False
             return
@@ -313,7 +497,13 @@ class Run:
             if error is not None:
                 message = f"{message}: {error}"
             raise DeliveryError(message)
-        self._client.finish_run(self.id, dict(summary or {}))
+        response = self._client.finish_run(self.id, final_summary)
+        authoritative_summary = _normalize_document(
+            response["run"].get("summary", final_summary),
+            "summary",
+        )
+        self.summary._replace(authoritative_summary)
+        self._spool.update_metadata({"finished": True, "summary": authoritative_summary})
         self._client.close()
         self._finished = True
         self._finishing = False
@@ -383,7 +573,7 @@ def sync_spool(
             project=str(metadata["project"]),
             run_id=run_id,
             name=metadata.get("name"),
-            config=dict(metadata.get("config", {})),
+            config=_normalize_document(metadata.get("config", {}), "config"),
             resume="allow",
         )
         worker = _DeliveryWorker(
@@ -404,7 +594,10 @@ def sync_spool(
                 message = f"{message}: {worker.last_error}"
             raise DeliveryError(message)
         if bool(metadata.get("finished")):
-            client.finish_run(run_id, dict(metadata.get("summary", {})))
+            client.finish_run(
+                run_id,
+                _normalize_document(metadata.get("summary", {}), "summary"),
+            )
     finally:
         client.close()
     return run_id
@@ -429,6 +622,61 @@ def _flatten_metrics(data: Mapping[str, Any], prefix: str = "") -> dict[str, flo
                 "rich values are not implemented yet"
             )
     return flattened
+
+
+def _collect_document_updates(
+    values: Mapping[str, Any] | None,
+    kwargs: Mapping[str, Any],
+    name: str,
+) -> dict[str, Any]:
+    if values is not None and not isinstance(values, Mapping):
+        raise TypeError(f"{name} updates must be a mapping")
+    combined = dict(values or {})
+    combined.update(kwargs)
+    return _normalize_document(combined, name)
+
+
+def _normalize_document(values: Mapping[str, Any], name: str) -> dict[str, Any]:
+    if not isinstance(values, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    normalized: dict[str, Any] = {}
+    for key, value in values.items():
+        if not isinstance(key, str):
+            raise TypeError(f"{name} keys must be strings, got {type(key).__name__}")
+        normalized[key] = _normalize_json_value(value, f"{name}.{key}")
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(encoded) > _MAX_DOCUMENT_BYTES:
+        raise ValueError(f"serialized {name} exceeds {_MAX_DOCUMENT_BYTES} bytes")
+    return normalized
+
+
+def _normalize_json_value(value: Any, path: str) -> Any:
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        if value < -(2**63) or value > 2**64 - 1:
+            raise ValueError(f"{path} integer is outside the JSON server range")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must be finite")
+        return value
+    if isinstance(value, Mapping):
+        normalized: dict[str, Any] = {}
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"{path} keys must be strings, got {type(key).__name__}")
+            normalized[key] = _normalize_json_value(nested, f"{path}.{key}")
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [_normalize_json_value(item, f"{path}[{index}]") for index, item in enumerate(value)]
+    raise TypeError(f"{path} has unsupported JSON type {type(value).__name__}")
 
 
 def _atomic_json_write(path: Path, value: dict[str, Any]) -> None:

@@ -6,16 +6,18 @@ use std::sync::Arc;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use runloom_catalog::{
     BatchRegistration, BatchStatus, Catalog, CatalogError, MAX_SEGMENTS_PER_QUERY, SegmentManifest,
 };
 use runloom_protocol::{
-    ApiError, CreateRunRequest, CreateRunResponse, FinishRunRequest, FinishRunResponse,
-    HealthResponse, HistoryResponse, IngestBatchRequest, IngestBatchResponse, MAX_BATCH_POINTS,
-    MAX_HISTORY_KEYS, MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MetricKeyListResponse,
-    ProjectListResponse, ResumePolicy, RunId, RunListResponse, RunRecord, RunState,
+    ApiError, ConfigUpdateRequest, CreateRunRequest, CreateRunResponse, FinishRunRequest,
+    FinishRunResponse, HealthResponse, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
+    MAX_BATCH_POINTS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS, MAX_HISTORY_POINTS,
+    MAX_METRICS_PER_POINT, MAX_SUMMARY_BYTES, MetricKeyListResponse, ProjectListResponse,
+    ResumePolicy, RunId, RunListResponse, RunRecord, RunState, RunUpdateResponse,
+    SummaryUpdateRequest,
 };
 use runloom_storage::{MetricStore, MinMaxHistorySampler, SegmentSource, StorageError};
 use serde::Deserialize;
@@ -28,7 +30,6 @@ const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROJECT_NAME_BYTES: usize = 128;
 const MAX_RUN_NAME_BYTES: usize = 256;
 const MAX_METRIC_KEY_BYTES: usize = 256;
-const MAX_CONFIG_BYTES: usize = 256 * 1024;
 const INGEST_WORKERS: usize = 2;
 const QUERY_WORKERS: usize = 4;
 const MAX_LIST_ITEMS: usize = 200;
@@ -50,6 +51,8 @@ pub fn app(catalog: Catalog, metrics: MetricStore) -> Router {
             post(create_run).get(list_runs),
         )
         .route("/api/v1/runs/{run_id}", get(get_run))
+        .route("/api/v1/runs/{run_id}/config", patch(update_config))
+        .route("/api/v1/runs/{run_id}/summary", patch(update_summary))
         .route("/api/v1/runs/{run_id}/metrics", get(metric_keys))
         .route("/api/v1/runs/{run_id}/batches", post(ingest_batch))
         .route("/api/v1/runs/{run_id}/finish", post(finish_run))
@@ -129,6 +132,32 @@ async fn get_run(
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, HttpError> {
     Ok(Json(state.catalog.get_run(run_id).await?))
+}
+
+async fn update_config(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    Json(request): Json<ConfigUpdateRequest>,
+) -> Result<Json<RunUpdateResponse>, HttpError> {
+    validate_document_updates(&request.updates, "config", MAX_CONFIG_BYTES)?;
+    let run = state
+        .catalog
+        .update_config(run_id, &request.updates, request.allow_val_change)
+        .await?;
+    Ok(Json(RunUpdateResponse { run }))
+}
+
+async fn update_summary(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    Json(request): Json<SummaryUpdateRequest>,
+) -> Result<Json<RunUpdateResponse>, HttpError> {
+    validate_document_updates(&request.updates, "summary", MAX_SUMMARY_BYTES)?;
+    let run = state
+        .catalog
+        .update_summary(run_id, &request.updates)
+        .await?;
+    Ok(Json(RunUpdateResponse { run }))
 }
 
 async fn metric_keys(
@@ -229,6 +258,7 @@ async fn finish_run(
     Path(run_id): Path<RunId>,
     Json(request): Json<FinishRunRequest>,
 ) -> Result<Json<FinishRunResponse>, HttpError> {
+    validate_document_size(&request.summary, "summary", MAX_SUMMARY_BYTES)?;
     let run = state.catalog.finish_run(run_id, &request.summary).await?;
     Ok(Json(FinishRunResponse { run }))
 }
@@ -383,12 +413,34 @@ fn validate_create_run(request: &CreateRunRequest) -> Result<(), HttpError> {
             "run name must contain 1 to {MAX_RUN_NAME_BYTES} bytes"
         )));
     }
-    let config_size = serde_json::to_vec(&request.config)
-        .map_err(|error| HttpError::invalid(format!("config is not serializable: {error}")))?
-        .len();
-    if config_size > MAX_CONFIG_BYTES {
+    validate_document_size(&request.config, "config", MAX_CONFIG_BYTES)?;
+    Ok(())
+}
+
+fn validate_document_updates(
+    updates: &BTreeMap<String, serde_json::Value>,
+    name: &str,
+    max_bytes: usize,
+) -> Result<(), HttpError> {
+    if updates.is_empty() {
         return Err(HttpError::invalid(format!(
-            "serialized config exceeds {MAX_CONFIG_BYTES} bytes"
+            "{name} updates cannot be empty"
+        )));
+    }
+    validate_document_size(updates, name, max_bytes)
+}
+
+fn validate_document_size(
+    document: &BTreeMap<String, serde_json::Value>,
+    name: &str,
+    max_bytes: usize,
+) -> Result<(), HttpError> {
+    let size = serde_json::to_vec(document)
+        .map_err(|error| HttpError::invalid(format!("{name} is not serializable: {error}")))?
+        .len();
+    if size > max_bytes {
+        return Err(HttpError::invalid(format!(
+            "serialized {name} exceeds {max_bytes} bytes"
         )));
     }
     Ok(())
@@ -539,6 +591,7 @@ impl From<CatalogError> for HttpError {
                 status: StatusCode::CONFLICT,
                 body: ApiError::new("conflict", error.to_string()),
             },
+            CatalogError::Limit(_) => Self::invalid(error.to_string()),
             CatalogError::CreateDirectory { .. }
             | CatalogError::Database(_)
             | CatalogError::InvalidData(_) => Self::internal(error.to_string()),
@@ -560,9 +613,10 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use runloom_catalog::Catalog;
     use runloom_protocol::{
-        CreateRunRequest, CreateRunResponse, FinishRunRequest, HealthResponse, HealthStatus,
-        HistoryResponse, IngestBatchRequest, IngestBatchResponse, MetricKeyListResponse,
-        MetricPoint, ProjectListResponse, ResumePolicy, RunListResponse,
+        ConfigUpdateRequest, CreateRunRequest, CreateRunResponse, FinishRunRequest,
+        FinishRunResponse, HealthResponse, HealthStatus, HistoryResponse, IngestBatchRequest,
+        IngestBatchResponse, MetricKeyListResponse, MetricPoint, ProjectListResponse, ResumePolicy,
+        RunListResponse, RunUpdateResponse, SummaryUpdateRequest,
     };
     use runloom_storage::MetricStore;
     use tempfile::tempdir;
@@ -607,6 +661,82 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::CREATED);
         let created: CreateRunResponse = response_json(response).await?;
+
+        let config_path = format!("/api/v1/runs/{}/config", created.run.id);
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &config_path,
+                &ConfigUpdateRequest {
+                    updates: BTreeMap::from([("optimizer".to_owned(), "adam".into())]),
+                    allow_val_change: false,
+                },
+            )?)
+            .await?;
+        let updated: RunUpdateResponse = response_json(response).await?;
+        assert_eq!(updated.run.config["optimizer"], "adam");
+
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &config_path,
+                &ConfigUpdateRequest {
+                    updates: BTreeMap::from([("seed".to_owned(), 7.into())]),
+                    allow_val_change: false,
+                },
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &config_path,
+                &ConfigUpdateRequest {
+                    updates: BTreeMap::from([("seed".to_owned(), 7.into())]),
+                    allow_val_change: true,
+                },
+            )?)
+            .await?;
+        let updated: RunUpdateResponse = response_json(response).await?;
+        assert_eq!(updated.run.config["seed"], 7);
+
+        let summary_path = format!("/api/v1/runs/{}/summary", created.run.id);
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &summary_path,
+                &SummaryUpdateRequest {
+                    updates: BTreeMap::from([
+                        ("status".to_owned(), "running".into()),
+                        ("tags".to_owned(), serde_json::json!(["fast", null])),
+                    ]),
+                },
+            )?)
+            .await?;
+        let updated: RunUpdateResponse = response_json(response).await?;
+        assert_eq!(updated.run.summary["status"], "running");
+        assert_eq!(
+            updated.run.summary["tags"],
+            serde_json::json!(["fast", null])
+        );
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &summary_path,
+                &SummaryUpdateRequest {
+                    updates: BTreeMap::from([(
+                        "oversized".to_owned(),
+                        "x".repeat(256 * 1024).into(),
+                    )]),
+                },
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         let batch = IngestBatchRequest {
             batch_sequence: 1,
@@ -690,6 +820,8 @@ mod tests {
             .await?;
         let runs: RunListResponse = response_json(response).await?;
         assert_eq!(runs.runs[0].summary["loss"], 1.0);
+        assert_eq!(runs.runs[0].summary["status"], "running");
+        assert_eq!(runs.runs[0].config["seed"], 7);
         let response = router
             .clone()
             .oneshot(
@@ -707,11 +839,17 @@ mod tests {
                 "POST",
                 &finish_path,
                 &FinishRunRequest {
-                    summary: BTreeMap::new(),
+                    summary: BTreeMap::from([("status".to_owned(), "complete".into())]),
                 },
             )?)
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
+        let finished: FinishRunResponse = response_json(response).await?;
+        assert_eq!(finished.run.summary["status"], "complete");
+        assert_eq!(
+            finished.run.summary["tags"],
+            serde_json::json!(["fast", null])
+        );
         let rejected_batch = IngestBatchRequest {
             batch_sequence: 2,
             points: vec![MetricPoint {
@@ -722,7 +860,18 @@ mod tests {
             }],
         };
         let response = router
+            .clone()
             .oneshot(json_request("POST", &batch_path, &rejected_batch)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = router
+            .oneshot(json_request(
+                "PATCH",
+                &summary_path,
+                &SummaryUpdateRequest {
+                    updates: BTreeMap::from([("status".to_owned(), "late".into())]),
+                },
+            )?)
             .await?;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         Ok(())

@@ -5,6 +5,7 @@ import threading
 import time
 
 import httpx
+import pytest
 
 from runloom.run import create_run, sync_spool
 
@@ -78,12 +79,18 @@ def test_offline_run_keeps_a_durable_journal(tmp_path) -> None:
     run = create_run(
         project="robotics",
         run_id="019c1234-5678-7000-8000-000000000002",
+        config={"seed": 7},
         mode="offline",
         resume="never",
         spool_root=tmp_path,
     )
+    run.config.update({"optimizer": "adam"})
+    with pytest.raises(ValueError, match="allow_val_change"):
+        run.config.update({"seed": 8})
+    run.config.update({"seed": 8}, allow_val_change=True)
+    run.summary["status"] = "offline"
     run.log({"loss": 1.5}, step=7)
-    run.finish(summary={"best": 1.5})
+    run.finish(summary={"best": {"score": 1.5, "tags": ["stable", None]}})
 
     run_directory = tmp_path / run.id
     event = json.loads((run_directory / "events.jsonl").read_text().strip())
@@ -91,7 +98,12 @@ def test_offline_run_keeps_a_durable_journal(tmp_path) -> None:
     assert event["step"] == 7
     assert event["metrics"] == {"loss": 1.5}
     assert metadata["finished"] is True
-    assert metadata["summary"] == {"best": 1.5}
+    assert metadata["config"] == {"optimizer": "adam", "seed": 8}
+    assert metadata["summary"] == {
+        "best": {"score": 1.5, "tags": ["stable", None]},
+        "loss": 1.5,
+        "status": "offline",
+    }
 
     requests: list[str] = []
 
@@ -137,4 +149,73 @@ def test_disabled_run_does_not_touch_the_spool(tmp_path) -> None:
     run.log({"loss": 1.0})
     run.finish()
     assert run.finished
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_online_documents_use_authoritative_server_state(tmp_path) -> None:
+    server_config: dict = {"seed": 1}
+    server_summary: dict = {"status": "resumed"}
+    requests: list[str] = []
+
+    def response_run() -> dict:
+        return {
+            "name": "resumed-run",
+            "config": dict(server_config),
+            "summary": dict(server_summary),
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(f"{request.method} {request.url.path}")
+        body = json.loads(request.content) if request.content else {}
+        if request.url.path.endswith("/runs"):
+            return httpx.Response(200, json={"run": response_run(), "resumed": True})
+        if request.url.path.endswith("/config"):
+            server_config.update(body["updates"])
+            return httpx.Response(200, json={"run": response_run()})
+        if request.url.path.endswith("/summary"):
+            server_summary.update(body["updates"])
+            return httpx.Response(200, json={"run": response_run()})
+        if request.url.path.endswith("/finish"):
+            server_summary.update(body["summary"])
+            return httpx.Response(200, json={"run": response_run()})
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    run = create_run(
+        project="robotics",
+        run_id="019c1234-5678-7000-8000-000000000003",
+        config={"seed": 999},
+        mode="online",
+        resume="allow",
+        spool_root=tmp_path,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert run.config.seed == 1
+    assert run.summary["status"] == "resumed"
+    run.config.update({"optimizer": "adam"})
+    with pytest.raises(ValueError, match="allow_val_change"):
+        run.config["seed"] = 2
+    run.config.update({"seed": 2}, allow_val_change=True)
+    run.summary.update({"result": "running", "metadata": {"tags": ["a", None]}})
+    run.finish(summary={"result": "complete"})
+
+    assert run.config.to_dict() == {"optimizer": "adam", "seed": 2}
+    assert run.summary["result"] == "complete"
+    assert requests == [
+        "POST /api/v1/projects/robotics/runs",
+        f"PATCH /api/v1/runs/{run.id}/config",
+        f"PATCH /api/v1/runs/{run.id}/config",
+        f"PATCH /api/v1/runs/{run.id}/summary",
+        f"POST /api/v1/runs/{run.id}/finish",
+    ]
+
+
+def test_documents_reject_non_json_values_before_writing(tmp_path) -> None:
+    with pytest.raises(TypeError, match="unsupported JSON type"):
+        create_run(
+            project="robotics",
+            config={"bad": object()},
+            mode="offline",
+            spool_root=tmp_path,
+        )
     assert list(tmp_path.iterdir()) == []

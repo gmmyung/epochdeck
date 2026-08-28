@@ -94,7 +94,8 @@ none of these paths participate in scalar metric queries.
 The Python package provides native Runloom types, a W&B-compatible public API,
 offline and online modes, a CLI, and importers. Calls enqueue bounded batches,
 and durable offline spooling prevents transient server failures from affecting
-training.
+training. Config updates and summary values share the durable run metadata,
+while the server applies their bounded JSON merges transactionally in SQLite.
 
 Compatibility is explicit and versioned. Unsupported semantics produce clear
 errors or warnings rather than inert arguments.

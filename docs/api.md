@@ -7,10 +7,15 @@ The pre-alpha API is versioned under `/api/v1`. Request bodies are capped at
 
 - `POST /projects/{project}/runs` creates or resumes a run.
 - `GET /runs/{run_id}` returns config, summary, state, and revisions.
+- `PATCH /runs/{run_id}/config` merges `updates`; replacing an existing value
+  requires `allow_val_change=true`.
+- `PATCH /runs/{run_id}/summary` merges JSON `updates` while the run is active.
 - `POST /runs/{run_id}/finish` atomically marks a run finished.
 
 Create bodies accept `id`, `name`, `config`, and `resume`. Resume is one of
-`never`, `allow`, or `must`. A finished run cannot accept new metrics.
+`never`, `allow`, or `must`. Config and summary documents accept JSON scalars,
+arrays, and objects up to 256 KiB after merging. Mutation is shallow by top-level
+key. A finished run cannot accept new metrics or document updates.
 
 ## Metrics
 

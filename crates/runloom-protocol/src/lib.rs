@@ -13,6 +13,8 @@ pub const MAX_BATCH_POINTS: usize = 1_024;
 pub const MAX_METRICS_PER_POINT: usize = 256;
 pub const MAX_HISTORY_KEYS: usize = 32;
 pub const MAX_HISTORY_POINTS: usize = 5_000;
+pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
+pub const MAX_SUMMARY_BYTES: usize = 256 * 1024;
 
 macro_rules! uuid_identifier {
     ($name:ident) => {
@@ -174,6 +176,25 @@ pub struct CreateRunRequest {
 pub struct CreateRunResponse {
     pub run: RunRecord,
     pub resumed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigUpdateRequest {
+    #[serde(default)]
+    pub updates: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub allow_val_change: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummaryUpdateRequest {
+    #[serde(default)]
+    pub updates: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunUpdateResponse {
+    pub run: RunRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

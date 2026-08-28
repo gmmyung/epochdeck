@@ -72,6 +72,26 @@ class RunloomClient:
     def ingest_batch(self, run_id: str, batch: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", f"/api/v1/runs/{run_id}/batches", json=batch)
 
+    def update_config(
+        self,
+        run_id: str,
+        updates: dict[str, Any],
+        *,
+        allow_val_change: bool = False,
+    ) -> dict[str, Any]:
+        return self._request(
+            "PATCH",
+            f"/api/v1/runs/{run_id}/config",
+            json={"updates": updates, "allow_val_change": allow_val_change},
+        )
+
+    def update_summary(self, run_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "PATCH",
+            f"/api/v1/runs/{run_id}/summary",
+            json={"updates": updates},
+        )
+
     def finish_run(self, run_id: str, summary: dict[str, Any]) -> dict[str, Any]:
         return self._request(
             "POST",

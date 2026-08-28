@@ -8,9 +8,9 @@ The immediate compatibility milestone is Trackio feature parity. The long-term
 contract is practical W&B feature parity across logging, run management, rich
 media, artifacts, querying, and the dashboard.
 
-Runloom is pre-alpha. Scalar run tracking is usable end to end; rich media,
-artifacts, authentication, downsampling, sweeps, and the wider compatibility
-surface remain under active development.
+Runloom is pre-alpha. Scalar run tracking and bounded dashboard sampling are
+usable end to end; rich media, artifacts, authentication, sweeps, and the wider
+compatibility surface remain under active development.
 
 ## Non-negotiable properties
 
@@ -79,7 +79,9 @@ run = wandb.init(
 )
 for step in range(1_000):
     run.log({"train": {"loss": 1 / (step + 1)}, "reward": step * 0.1})
-run.finish()
+run.config.update({"optimizer": "adam"})
+run.summary["result"] = "complete"
+run.finish(summary={"tags": ["baseline", "mujoco"]})
 ```
 
 `log` fsyncs to a local journal and returns without waiting for HTTP. A bounded
@@ -90,8 +92,10 @@ Use `mode="offline"`, then upload later with:
 runloom sync ~/.local/share/runloom/spool/<run-id>
 ```
 
-The current scalar API accepts finite numbers and booleans. Unsupported rich
-values fail explicitly until their native implementations land.
+Metric history accepts finite numbers and booleans. Config and summary documents
+accept bounded JSON values, including strings, booleans, nulls, arrays, and
+nested objects. Unsupported rich metric values fail explicitly until their
+native implementations land.
 
 ## Repository layout
 

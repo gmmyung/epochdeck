@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use runloom_protocol::{
-    CreateRunRequest, ProjectId, ProjectSummary, ResumePolicy, RunId, RunRecord, RunState,
+    CreateRunRequest, MAX_CONFIG_BYTES, MAX_SUMMARY_BYTES, ProjectId, ProjectSummary, ResumePolicy,
+    RunId, RunRecord, RunState,
 };
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
@@ -89,6 +90,8 @@ pub enum CatalogError {
     NotFound { resource: String },
     #[error("catalog conflict: {0}")]
     Conflict(String),
+    #[error("catalog limit exceeded: {0}")]
+    Limit(String),
     #[error("invalid catalog data: {0}")]
     InvalidData(String),
 }
@@ -284,8 +287,7 @@ impl Catalog {
             let short_id: String = run_id.to_string().chars().take(8).collect();
             format!("run-{short_id}")
         });
-        let config_json = serde_json::to_string(&request.config)
-            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        let config_json = serialize_document(&request.config, "config", MAX_CONFIG_BYTES)?;
 
         query(
             "INSERT INTO runs (id, project_id, name, state, created_at, updated_at) \
@@ -327,6 +329,51 @@ impl Catalog {
                 .ok_or_else(|| CatalogError::NotFound {
                     resource: format!("run {run_id}"),
                 })?;
+        transaction.commit().await?;
+        Ok(run)
+    }
+
+    pub async fn update_config(
+        &self,
+        run_id: RunId,
+        updates: &BTreeMap<String, Value>,
+        allow_val_change: bool,
+    ) -> Result<RunRecord, CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        ensure_running(&mut transaction, run_id).await?;
+        let mut config = load_document(&mut transaction, run_id, "config_json", "config").await?;
+        if !allow_val_change {
+            for (key, value) in updates {
+                if config.get(key).is_some_and(|existing| existing != value) {
+                    return Err(CatalogError::Conflict(format!(
+                        "config key '{key}' already exists; pass allow_val_change=true to replace it"
+                    )));
+                }
+            }
+        }
+        config.extend(updates.clone());
+        let encoded = serialize_document(&config, "config", MAX_CONFIG_BYTES)?;
+        query("UPDATE run_documents SET config_json = ? WHERE run_id = ?")
+            .bind(encoded)
+            .bind(run_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        touch_run(&mut transaction, run_id).await?;
+        let run = load_required_run(&mut transaction, run_id).await?;
+        transaction.commit().await?;
+        Ok(run)
+    }
+
+    pub async fn update_summary(
+        &self,
+        run_id: RunId,
+        updates: &BTreeMap<String, Value>,
+    ) -> Result<RunRecord, CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        ensure_running(&mut transaction, run_id).await?;
+        merge_summary_document(&mut transaction, run_id, updates).await?;
+        touch_run(&mut transaction, run_id).await?;
+        let run = load_required_run(&mut transaction, run_id).await?;
         transaction.commit().await?;
         Ok(run)
     }
@@ -469,10 +516,7 @@ impl Catalog {
             .bind(run_id.to_string())
             .execute(&mut *transaction)
             .await?;
-        query("UPDATE runs SET updated_at = current_timestamp WHERE id = ?")
-            .bind(run_id.to_string())
-            .execute(&mut *transaction)
-            .await?;
+        touch_run(&mut transaction, run_id).await?;
 
         let revision = metric_revision_in(&mut transaction, run_id).await?;
         transaction.commit().await?;
@@ -487,11 +531,7 @@ impl Catalog {
         summary_values: &BTreeMap<String, Value>,
     ) -> Result<RunRecord, CatalogError> {
         let mut transaction = self.pool.begin().await?;
-        load_run(&mut transaction, run_id)
-            .await?
-            .ok_or_else(|| CatalogError::NotFound {
-                resource: format!("run {run_id}"),
-            })?;
+        load_required_run(&mut transaction, run_id).await?;
         merge_summary_document(&mut transaction, run_id, summary_values).await?;
         query("UPDATE runs SET state = 'finished', updated_at = current_timestamp WHERE id = ?")
             .bind(run_id.to_string())
@@ -504,12 +544,7 @@ impl Catalog {
         .bind(run_id.to_string())
         .execute(&mut *transaction)
         .await?;
-        let run =
-            load_run(&mut transaction, run_id)
-                .await?
-                .ok_or_else(|| CatalogError::NotFound {
-                    resource: format!("run {run_id}"),
-                })?;
+        let run = load_required_run(&mut transaction, run_id).await?;
         transaction.commit().await?;
         Ok(run)
     }
@@ -627,6 +662,56 @@ async fn load_run(
     row.map(run_from_row).transpose()
 }
 
+async fn load_required_run(
+    transaction: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<RunRecord, CatalogError> {
+    load_run(transaction, run_id)
+        .await?
+        .ok_or_else(|| CatalogError::NotFound {
+            resource: format!("run {run_id}"),
+        })
+}
+
+async fn load_document(
+    transaction: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    column: &str,
+    name: &str,
+) -> Result<BTreeMap<String, Value>, CatalogError> {
+    let row = query("SELECT config_json, summary_json FROM run_documents WHERE run_id = ?")
+        .bind(run_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| CatalogError::NotFound {
+            resource: format!("run document for {run_id}"),
+        })?;
+    parse_document(row.get::<String, _>(column), name)
+}
+
+async fn ensure_running(
+    transaction: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<(), CatalogError> {
+    if run_location_in(transaction, run_id).await?.state != RunState::Running {
+        return Err(CatalogError::Conflict(
+            "finished run documents cannot be changed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn touch_run(
+    transaction: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<(), CatalogError> {
+    query("UPDATE runs SET updated_at = current_timestamp WHERE id = ?")
+        .bind(run_id.to_string())
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
 fn run_from_row(row: SqliteRow) -> Result<RunRecord, CatalogError> {
     Ok(RunRecord {
         id: parse_id(row.get::<String, _>("id"), "run ID")?,
@@ -701,17 +786,9 @@ async fn merge_summary_document(
     run_id: RunId,
     values: &BTreeMap<String, Value>,
 ) -> Result<(), CatalogError> {
-    let row = query("SELECT summary_json FROM run_documents WHERE run_id = ?")
-        .bind(run_id.to_string())
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or_else(|| CatalogError::NotFound {
-            resource: format!("run document for {run_id}"),
-        })?;
-    let mut summary = parse_document(row.get::<String, _>("summary_json"), "summary")?;
+    let mut summary = load_document(transaction, run_id, "summary_json", "summary").await?;
     summary.extend(values.clone());
-    let summary_json = serde_json::to_string(&summary)
-        .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+    let summary_json = serialize_document(&summary, "summary", MAX_SUMMARY_BYTES)?;
     query("UPDATE run_documents SET summary_json = ? WHERE run_id = ?")
         .bind(summary_json)
         .bind(run_id.to_string())
@@ -723,6 +800,21 @@ async fn merge_summary_document(
 fn parse_document(document: String, name: &str) -> Result<BTreeMap<String, Value>, CatalogError> {
     serde_json::from_str(&document)
         .map_err(|error| CatalogError::InvalidData(format!("invalid {name} JSON: {error}")))
+}
+
+fn serialize_document(
+    document: &BTreeMap<String, Value>,
+    name: &str,
+    max_bytes: usize,
+) -> Result<String, CatalogError> {
+    let encoded = serde_json::to_string(document)
+        .map_err(|error| CatalogError::InvalidData(format!("invalid {name}: {error}")))?;
+    if encoded.len() > max_bytes {
+        return Err(CatalogError::Limit(format!(
+            "serialized {name} exceeds {max_bytes} bytes"
+        )));
+    }
+    Ok(encoded)
 }
 
 fn parse_id<T>(value: String, name: &str) -> Result<T, CatalogError>
@@ -781,6 +873,41 @@ mod tests {
         let (_, resumed) = catalog.create_or_resume_run("robotics", &resume).await?;
         assert!(resumed);
 
+        let updated = catalog
+            .update_config(
+                created.id,
+                &BTreeMap::from([("optimizer".to_owned(), "adam".into())]),
+                false,
+            )
+            .await?;
+        assert_eq!(updated.config["optimizer"], "adam");
+        let conflict = catalog
+            .update_config(
+                created.id,
+                &BTreeMap::from([("seed".to_owned(), 9.into())]),
+                false,
+            )
+            .await;
+        assert!(matches!(conflict, Err(CatalogError::Conflict(_))));
+        let updated = catalog
+            .update_config(
+                created.id,
+                &BTreeMap::from([("seed".to_owned(), 9.into())]),
+                true,
+            )
+            .await?;
+        assert_eq!(updated.config["seed"], 9);
+        let updated = catalog
+            .update_summary(
+                created.id,
+                &BTreeMap::from([
+                    ("status".to_owned(), "running".into()),
+                    ("tags".to_owned(), serde_json::json!(["fast", null])),
+                ]),
+            )
+            .await?;
+        assert_eq!(updated.summary["status"], "running");
+
         catalog
             .register_batch(
                 created.id,
@@ -805,9 +932,23 @@ mod tests {
         );
         assert_eq!(catalog.metric_extent(created.id, Some(10)).await?, None);
 
-        let finished = catalog.finish_run(created.id, &BTreeMap::new()).await?;
+        let finished = catalog
+            .finish_run(
+                created.id,
+                &BTreeMap::from([("status".to_owned(), "complete".into())]),
+            )
+            .await?;
         assert_eq!(finished.state, RunState::Finished);
+        assert_eq!(finished.summary["status"], "complete");
+        assert_eq!(finished.summary["tags"], serde_json::json!(["fast", null]));
         assert!(finished.finished_at.is_some());
+        let late_update = catalog
+            .update_summary(
+                created.id,
+                &BTreeMap::from([("status".to_owned(), "late".into())]),
+            )
+            .await;
+        assert!(matches!(late_update, Err(CatalogError::Conflict(_))));
         Ok(())
     }
 

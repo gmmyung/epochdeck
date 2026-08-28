@@ -11,7 +11,7 @@ use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, UInt64
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use runloom_protocol::{HistoryResponse, IngestBatchRequest, ProjectId, RunId};
@@ -593,28 +593,7 @@ fn read_segment(
     limit: usize,
     response: &mut HistoryResponse,
 ) -> Result<(), StorageError> {
-    let file = File::open(path).map_err(|source| StorageError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let schema = builder.schema();
-    let mut projection_indices = vec![
-        schema.index_of(SEQUENCE_COLUMN)?,
-        schema.index_of(STEP_COLUMN)?,
-        schema.index_of(TIMESTAMP_COLUMN)?,
-    ];
-    projection_indices.extend(
-        keys.iter()
-            .filter_map(|key| schema.index_of(&metric_column(key)).ok()),
-    );
-    projection_indices.sort_unstable();
-    projection_indices.dedup();
-    let projection = ProjectionMask::roots(builder.parquet_schema(), projection_indices);
-    let reader = builder
-        .with_projection(projection)
-        .with_batch_size(PARQUET_BATCH_SIZE.min(limit))
-        .build()?;
+    let reader = projected_reader(path, keys, PARQUET_BATCH_SIZE.min(limit))?;
 
     for batch in reader {
         let batch = batch?;
@@ -658,30 +637,7 @@ fn read_segment_sampled(
     path: &Path,
     sampler: &mut MinMaxHistorySampler,
 ) -> Result<(), StorageError> {
-    let file = File::open(path).map_err(|source| StorageError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let schema = builder.schema();
-    let mut projection_indices = vec![
-        schema.index_of(SEQUENCE_COLUMN)?,
-        schema.index_of(STEP_COLUMN)?,
-        schema.index_of(TIMESTAMP_COLUMN)?,
-    ];
-    projection_indices.extend(
-        sampler
-            .keys
-            .iter()
-            .filter_map(|key| schema.index_of(&metric_column(key)).ok()),
-    );
-    projection_indices.sort_unstable();
-    projection_indices.dedup();
-    let projection = ProjectionMask::roots(builder.parquet_schema(), projection_indices);
-    let reader = builder
-        .with_projection(projection)
-        .with_batch_size(PARQUET_BATCH_SIZE)
-        .build()?;
+    let reader = projected_reader(path, &sampler.keys, PARQUET_BATCH_SIZE)?;
 
     for batch in reader {
         let batch = batch?;
@@ -714,6 +670,35 @@ fn read_segment_sampled(
         }
     }
     Ok(())
+}
+
+fn projected_reader(
+    path: &Path,
+    keys: &[String],
+    batch_size: usize,
+) -> Result<ParquetRecordBatchReader, StorageError> {
+    let file = File::open(path).map_err(|source| StorageError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema = builder.schema();
+    let mut projection_indices = vec![
+        schema.index_of(SEQUENCE_COLUMN)?,
+        schema.index_of(STEP_COLUMN)?,
+        schema.index_of(TIMESTAMP_COLUMN)?,
+    ];
+    projection_indices.extend(
+        keys.iter()
+            .filter_map(|key| schema.index_of(&metric_column(key)).ok()),
+    );
+    projection_indices.sort_unstable();
+    projection_indices.dedup();
+    let projection = ProjectionMask::roots(builder.parquet_schema(), projection_indices);
+    Ok(builder
+        .with_projection(projection)
+        .with_batch_size(batch_size)
+        .build()?)
 }
 
 fn required_array<'a, T: 'static>(
