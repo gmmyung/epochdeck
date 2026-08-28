@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
 
   import {
+    artifactFileUrl,
     blobUrl,
     getAlerts,
     getHealth,
@@ -11,6 +12,7 @@
     getRun,
     getRuns,
     getRichValues,
+    getRunArtifacts,
     getSampledHistory,
     type Alert,
     type Health,
@@ -18,6 +20,7 @@
     type Project,
     type RichValue,
     type Run,
+    type RunArtifact,
   } from "./lib/api";
   import {
     CHART_POINT_BUDGET,
@@ -40,6 +43,7 @@
   let metricKeys: string[] = [];
   let alerts: Alert[] = [];
   let richValues: RichValue[] = [];
+  let artifacts: RunArtifact[] = [];
   let histories: Record<string, History> = {};
   let historyRevisions: Record<string, number> = {};
   let loadingMetrics = new Set<string>();
@@ -96,10 +100,11 @@
     selectedRun = run;
     error = null;
     try {
-      [metricKeys, alerts, richValues] = await Promise.all([
+      [metricKeys, alerts, richValues, artifacts] = await Promise.all([
         getMetricKeys(run.id, controller.signal),
         getAlerts(run.id, controller.signal),
         getRichValues(run.id, controller.signal),
+        getRunArtifacts(run.id, controller.signal),
       ]);
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
@@ -112,6 +117,7 @@
     metricKeys = [];
     alerts = [];
     richValues = [];
+    artifacts = [];
     resetChartState();
   }
 
@@ -209,9 +215,10 @@
       const revisionChanged = latest.metric_revision !== selectedRun.metric_revision;
       selectedRun = latest;
       runs = runs.map((candidate) => (candidate.id === latest.id ? latest : candidate));
-      [alerts, richValues] = await Promise.all([
+      [alerts, richValues, artifacts] = await Promise.all([
         getAlerts(latest.id, controller.signal),
         getRichValues(latest.id, controller.signal),
+        getRunArtifacts(latest.id, controller.signal),
       ]);
       if (revisionChanged) {
         metricKeys = await getMetricKeys(latest.id, controller.signal);
@@ -264,6 +271,18 @@
     return Array.isArray(preview)
       ? preview.filter((item): item is unknown[] => Array.isArray(item))
       : [];
+  }
+
+  function formatBytes(value: number): string {
+    if (value < 1024) return `${value} B`;
+    const units = ["KiB", "MiB", "GiB", "TiB"];
+    let size = value;
+    let unit = -1;
+    do {
+      size /= 1024;
+      unit += 1;
+    } while (size >= 1024 && unit < units.length - 1);
+    return `${size.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unit]}`;
   }
 </script>
 
@@ -441,6 +460,45 @@
                     {#if metadataString(value, "caption")}<p class="media-caption">
                         {metadataString(value, "caption")}
                       </p>{/if}
+                  </article>
+                {/each}
+              </div>
+            {/if}
+
+            {#if artifacts.length > 0}
+              <div class="metrics-heading">
+                <div>
+                  <p class="eyebrow">Versioned inputs and outputs</p>
+                  <h2>Artifacts</h2>
+                </div>
+                <span>{artifacts.length} lineage links</span>
+              </div>
+              <div class="artifact-list">
+                {#each artifacts as linked (`${linked.artifact.id}:${linked.relation}`)}
+                  <article class="artifact-card">
+                    <div class="artifact-title">
+                      <span class:artifact-input={linked.relation === "input"}
+                        >{linked.relation}</span
+                      >
+                      <strong>{linked.artifact.name}:v{linked.artifact.version}</strong>
+                      <small>{linked.artifact.type}</small>
+                    </div>
+                    {#if linked.artifact.aliases.length > 0}
+                      <div class="artifact-aliases">
+                        {#each linked.artifact.aliases as alias}<span>{alias}</span>{/each}
+                      </div>
+                    {/if}
+                    {#if linked.artifact.description}<p>{linked.artifact.description}</p>{/if}
+                    <div class="artifact-files">
+                      {#each linked.artifact.entries as entry}
+                        <a
+                          href={artifactFileUrl(linked.artifact.id, entry.path)}
+                          download={entry.blob.file_name ?? entry.path}
+                        >
+                          <span>{entry.path}</span><small>{formatBytes(entry.blob.size)}</small>
+                        </a>
+                      {/each}
+                    </div>
                   </article>
                 {/each}
               </div>

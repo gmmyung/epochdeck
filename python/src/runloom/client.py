@@ -162,6 +162,33 @@ class RunloomClient:
             params=params,
         )
 
+    def create_artifact(self, run_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/runs/{quote(run_id, safe='')}/artifacts",
+            json=artifact,
+        )
+
+    def use_artifact(self, run_id: str, artifact_id: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/runs/{quote(run_id, safe='')}/artifacts/use",
+            json={"artifact_id": artifact_id},
+        )
+
+    def resolve_artifact(self, project: str, name: str, alias: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/v1/projects/{quote(project, safe='')}/artifacts/"
+            f"{quote(name, safe='')}/aliases/{quote(alias, safe='')}",
+        )
+
+    def run_artifacts(self, run_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/v1/runs/{quote(run_id, safe='')}/artifacts",
+        )
+
     def history(
         self,
         run_id: str,

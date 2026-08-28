@@ -56,3 +56,18 @@ Media and tables are serialized into a local SHA-256 spool using bounded copy
 buffers before upload. Table iterables are consumed once and store a bounded
 dashboard preview; histogram iterables spill to a temporary file while exact
 bins are computed, so neither requires retaining a complete generator in memory.
+
+Artifacts reuse the same durable blob spool:
+
+```python
+artifact = wandb.Artifact("policy", type="model", metadata={"step": 100_000})
+artifact.add_file("checkpoint.bin", name="weights/checkpoint.bin")
+run.log_artifact(artifact, aliases=["latest", "best"])
+
+downstream = wandb.init(project="demo")
+downstream.use_artifact(artifact)
+```
+
+`add_dir` walks deterministically without following symlinked directories and
+manifests accept up to 4,096 unique POSIX paths. Offline use requires a concrete
+artifact object or ID; online runs may also resolve `name:alias`.

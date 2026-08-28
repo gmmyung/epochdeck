@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use runloom_protocol::{
-    AlertId, AlertLevel, AlertRecord, BlobRef, CreateAlertRequest, CreateRichValueRequest,
-    CreateRunRequest, MAX_CONFIG_BYTES, MAX_SUMMARY_BYTES, ProjectId, ProjectSummary, ResumePolicy,
-    RichValueId, RichValueKind, RichValueRecord, RunId, RunRecord, RunState,
+    AlertId, AlertLevel, AlertRecord, ArtifactEntry, ArtifactId, ArtifactRecord, ArtifactRelation,
+    BlobRef, CreateAlertRequest, CreateArtifactRequest, CreateRichValueRequest, CreateRunRequest,
+    MAX_CONFIG_BYTES, MAX_SUMMARY_BYTES, ProjectId, ProjectSummary, ResumePolicy, RichValueId,
+    RichValueKind, RichValueRecord, RunArtifactRecord, RunId, RunRecord, RunState,
 };
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
@@ -110,6 +111,47 @@ CREATE TABLE IF NOT EXISTS run_rich_values (
 
 CREATE INDEX IF NOT EXISTS idx_run_rich_values_run_id
     ON run_rich_values(run_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS artifact_versions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    artifact_type TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    description TEXT,
+    metadata_json TEXT NOT NULL,
+    entries_json TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    created_by_run TEXT NOT NULL REFERENCES runs(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(project_id, name, artifact_type, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_versions_project_id
+    ON artifact_versions(project_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS artifact_aliases (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    artifact_type TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    artifact_id TEXT NOT NULL REFERENCES artifact_versions(id),
+    PRIMARY KEY(project_id, name, artifact_type, alias)
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_aliases_artifact_id
+    ON artifact_aliases(artifact_id, alias);
+
+CREATE TABLE IF NOT EXISTS artifact_lineage (
+    artifact_id TEXT NOT NULL REFERENCES artifact_versions(id),
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    relation TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(artifact_id, run_id, relation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_lineage_run_id
+    ON artifact_lineage(run_id, created_at DESC);
 "#;
 
 #[derive(Debug, Error)]
@@ -170,6 +212,22 @@ pub struct CompactionCandidate {
 pub struct MetricExtent {
     pub first_sequence: u64,
     pub last_sequence: u64,
+}
+
+#[derive(Debug)]
+struct ArtifactBase {
+    id: ArtifactId,
+    project_id: ProjectId,
+    project: String,
+    name: String,
+    artifact_type: String,
+    version: u64,
+    description: Option<String>,
+    metadata: BTreeMap<String, Value>,
+    entries: Vec<ArtifactEntry>,
+    request_json: String,
+    created_by_run: RunId,
+    created_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,6 +514,247 @@ impl Catalog {
                 .checked_add(1)
                 .ok_or_else(|| CatalogError::InvalidData("run step overflow".to_owned()))
         })
+    }
+
+    pub async fn create_artifact(
+        &self,
+        run_id: RunId,
+        request: &CreateArtifactRequest,
+    ) -> Result<(ArtifactRecord, bool), CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        ensure_running(&mut transaction, run_id).await?;
+        let location = run_location_in(&mut transaction, run_id).await?;
+        let request_json = serde_json::to_string(request)
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        if let Some(artifact_id) = request.id
+            && let Some(existing) = load_artifact_base(&mut transaction, artifact_id).await?
+        {
+            if existing.request_json != request_json || existing.created_by_run != run_id {
+                return Err(CatalogError::Conflict(
+                    "artifact ID was reused with different contents".to_owned(),
+                ));
+            }
+            let artifact = finish_artifact(&mut transaction, existing).await?;
+            transaction.commit().await?;
+            return Ok((artifact, true));
+        }
+        let existing_type: Option<String> = query(
+            "SELECT artifact_type FROM artifact_versions WHERE project_id = ? AND name = ? LIMIT 1",
+        )
+        .bind(location.project_id.to_string())
+        .bind(&request.name)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|row| row.get("artifact_type"));
+        if existing_type.is_some_and(|value| value != request.artifact_type) {
+            return Err(CatalogError::Conflict(
+                "an artifact collection name cannot change type".to_owned(),
+            ));
+        }
+        let previous_version: Option<i64> = query(
+            "SELECT MAX(version) AS version FROM artifact_versions \
+             WHERE project_id = ? AND name = ? AND artifact_type = ?",
+        )
+        .bind(location.project_id.to_string())
+        .bind(&request.name)
+        .bind(&request.artifact_type)
+        .fetch_one(&mut *transaction)
+        .await?
+        .get("version");
+        let version = previous_version.map_or(Ok(0), |value| {
+            from_i64(value, "artifact version")?
+                .checked_add(1)
+                .ok_or_else(|| CatalogError::InvalidData("artifact version overflow".to_owned()))
+        })?;
+        let artifact_id = request.id.unwrap_or_default();
+        let metadata_json = serde_json::to_string(&request.metadata)
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        let entries_json = serde_json::to_string(&request.entries)
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        query(
+            "INSERT INTO artifact_versions \
+             (id, project_id, name, artifact_type, version, description, metadata_json, \
+              entries_json, request_json, created_by_run, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)",
+        )
+        .bind(artifact_id.to_string())
+        .bind(location.project_id.to_string())
+        .bind(&request.name)
+        .bind(&request.artifact_type)
+        .bind(to_i64(version, "artifact version")?)
+        .bind(&request.description)
+        .bind(metadata_json)
+        .bind(entries_json)
+        .bind(request_json)
+        .bind(run_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        for alias in &request.aliases {
+            query(
+                "INSERT INTO artifact_aliases \
+                 (project_id, name, artifact_type, alias, artifact_id) VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(project_id, name, artifact_type, alias) \
+                 DO UPDATE SET artifact_id = excluded.artifact_id",
+            )
+            .bind(location.project_id.to_string())
+            .bind(&request.name)
+            .bind(&request.artifact_type)
+            .bind(alias)
+            .bind(artifact_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        insert_artifact_lineage(
+            &mut transaction,
+            artifact_id,
+            run_id,
+            ArtifactRelation::Output,
+        )
+        .await?;
+        touch_run(&mut transaction, run_id).await?;
+        let artifact = load_required_artifact(&mut transaction, artifact_id).await?;
+        transaction.commit().await?;
+        Ok((artifact, false))
+    }
+
+    pub async fn use_artifact(
+        &self,
+        run_id: RunId,
+        artifact_id: ArtifactId,
+    ) -> Result<ArtifactRecord, CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        ensure_running(&mut transaction, run_id).await?;
+        let location = run_location_in(&mut transaction, run_id).await?;
+        let artifact = load_required_artifact(&mut transaction, artifact_id).await?;
+        if artifact.project_id != location.project_id {
+            return Err(CatalogError::Conflict(
+                "artifact and run must belong to the same project".to_owned(),
+            ));
+        }
+        insert_artifact_lineage(
+            &mut transaction,
+            artifact_id,
+            run_id,
+            ArtifactRelation::Input,
+        )
+        .await?;
+        touch_run(&mut transaction, run_id).await?;
+        transaction.commit().await?;
+        Ok(artifact)
+    }
+
+    pub async fn get_artifact(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<ArtifactRecord, CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        let artifact = load_required_artifact(&mut transaction, artifact_id).await?;
+        transaction.commit().await?;
+        Ok(artifact)
+    }
+
+    pub async fn resolve_artifact(
+        &self,
+        project: &str,
+        name: &str,
+        alias: &str,
+    ) -> Result<ArtifactRecord, CatalogError> {
+        let row = query(
+            "SELECT a.artifact_id FROM artifact_aliases a \
+             JOIN projects p ON p.id = a.project_id \
+             WHERE p.name = ? AND a.name = ? AND a.alias = ? LIMIT 1",
+        )
+        .bind(project)
+        .bind(name)
+        .bind(alias)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| CatalogError::NotFound {
+            resource: format!("artifact {project}/{name}:{alias}"),
+        })?;
+        let artifact_id = parse_id(row.get::<String, _>("artifact_id"), "artifact ID")?;
+        self.get_artifact(artifact_id).await
+    }
+
+    pub async fn list_project_artifacts(
+        &self,
+        project: &str,
+        before: Option<ArtifactId>,
+        limit: usize,
+    ) -> Result<Vec<ArtifactRecord>, CatalogError> {
+        let before = before.map(|value| value.to_string());
+        let rows = query(
+            "SELECT v.id, v.project_id, p.name AS project, v.name, v.artifact_type, v.version, \
+                    v.description, v.metadata_json, v.entries_json, v.request_json, \
+                    v.created_by_run, v.created_at \
+             FROM artifact_versions v JOIN projects p ON p.id = v.project_id \
+             WHERE p.name = ? AND (? IS NULL OR v.id < ?) ORDER BY v.id DESC LIMIT ?",
+        )
+        .bind(project)
+        .bind(&before)
+        .bind(&before)
+        .bind(to_i64(limit as u64, "artifact list limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut transaction = self.pool.begin().await?;
+        let mut artifacts = Vec::with_capacity(rows.len());
+        for row in rows {
+            artifacts.push(finish_artifact(&mut transaction, artifact_base_from_row(row)?).await?);
+        }
+        transaction.commit().await?;
+        Ok(artifacts)
+    }
+
+    pub async fn list_run_artifacts(
+        &self,
+        run_id: RunId,
+        limit: usize,
+    ) -> Result<Vec<RunArtifactRecord>, CatalogError> {
+        self.get_run(run_id).await?;
+        let rows = query(
+            "SELECT v.id, v.project_id, p.name AS project, v.name, v.artifact_type, v.version, \
+                    v.description, v.metadata_json, v.entries_json, v.request_json, \
+                    v.created_by_run, v.created_at, l.relation \
+             FROM artifact_lineage l \
+             JOIN artifact_versions v ON v.id = l.artifact_id \
+             JOIN projects p ON p.id = v.project_id \
+             WHERE l.run_id = ? ORDER BY l.created_at DESC, v.id DESC LIMIT ?",
+        )
+        .bind(run_id.to_string())
+        .bind(to_i64(limit as u64, "run artifact list limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut transaction = self.pool.begin().await?;
+        let mut artifacts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let relation = ArtifactRelation::from_str(&row.get::<String, _>("relation"))
+                .map_err(|error| CatalogError::InvalidData(error.to_owned()))?;
+            let artifact = finish_artifact(&mut transaction, artifact_base_from_row(row)?).await?;
+            artifacts.push(RunArtifactRecord { artifact, relation });
+        }
+        transaction.commit().await?;
+        Ok(artifacts)
+    }
+
+    pub async fn artifact_lineage(
+        &self,
+        artifact_id: ArtifactId,
+        relation: ArtifactRelation,
+        limit: usize,
+    ) -> Result<Vec<RunId>, CatalogError> {
+        self.get_artifact(artifact_id).await?;
+        let rows = query(
+            "SELECT run_id FROM artifact_lineage WHERE artifact_id = ? AND relation = ? \
+             ORDER BY created_at DESC, run_id LIMIT ?",
+        )
+        .bind(artifact_id.to_string())
+        .bind(relation.to_string())
+        .bind(to_i64(limit as u64, "artifact lineage limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| parse_id(row.get::<String, _>("run_id"), "run ID"))
+            .collect()
     }
 
     pub async fn create_or_resume_run(
@@ -1140,6 +1439,81 @@ async fn load_required_rich_value(
         })
 }
 
+async fn load_artifact_base(
+    transaction: &mut Transaction<'_, Sqlite>,
+    artifact_id: ArtifactId,
+) -> Result<Option<ArtifactBase>, CatalogError> {
+    let row = query(
+        "SELECT v.id, v.project_id, p.name AS project, v.name, v.artifact_type, v.version, \
+                v.description, v.metadata_json, v.entries_json, v.request_json, \
+                v.created_by_run, v.created_at \
+         FROM artifact_versions v JOIN projects p ON p.id = v.project_id WHERE v.id = ?",
+    )
+    .bind(artifact_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.map(artifact_base_from_row).transpose()
+}
+
+async fn load_required_artifact(
+    transaction: &mut Transaction<'_, Sqlite>,
+    artifact_id: ArtifactId,
+) -> Result<ArtifactRecord, CatalogError> {
+    let base = load_artifact_base(transaction, artifact_id)
+        .await?
+        .ok_or_else(|| CatalogError::NotFound {
+            resource: format!("artifact {artifact_id}"),
+        })?;
+    finish_artifact(transaction, base).await
+}
+
+async fn finish_artifact(
+    transaction: &mut Transaction<'_, Sqlite>,
+    base: ArtifactBase,
+) -> Result<ArtifactRecord, CatalogError> {
+    let aliases =
+        query("SELECT alias FROM artifact_aliases WHERE artifact_id = ? ORDER BY alias LIMIT 256")
+            .bind(base.id.to_string())
+            .fetch_all(&mut **transaction)
+            .await?
+            .into_iter()
+            .map(|row| row.get("alias"))
+            .collect();
+    Ok(ArtifactRecord {
+        id: base.id,
+        project_id: base.project_id,
+        project: base.project,
+        name: base.name,
+        artifact_type: base.artifact_type,
+        version: base.version,
+        description: base.description,
+        metadata: base.metadata,
+        aliases,
+        entries: base.entries,
+        created_by_run: base.created_by_run,
+        created_at: base.created_at,
+    })
+}
+
+async fn insert_artifact_lineage(
+    transaction: &mut Transaction<'_, Sqlite>,
+    artifact_id: ArtifactId,
+    run_id: RunId,
+    relation: ArtifactRelation,
+) -> Result<(), CatalogError> {
+    query(
+        "INSERT INTO artifact_lineage (artifact_id, run_id, relation, created_at) \
+         VALUES (?, ?, ?, current_timestamp) \
+         ON CONFLICT(artifact_id, run_id, relation) DO NOTHING",
+    )
+    .bind(artifact_id.to_string())
+    .bind(run_id.to_string())
+    .bind(relation.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 async fn load_document(
     transaction: &mut Transaction<'_, Sqlite>,
     run_id: RunId,
@@ -1231,6 +1605,24 @@ fn rich_value_from_row(row: SqliteRow) -> Result<RichValueRecord, CatalogError> 
         timestamp_ms: row.get("timestamp_ms"),
         blob,
         metadata: parse_document(row.get::<String, _>("metadata_json"), "rich metadata")?,
+        created_at: row.get("created_at"),
+    })
+}
+
+fn artifact_base_from_row(row: SqliteRow) -> Result<ArtifactBase, CatalogError> {
+    Ok(ArtifactBase {
+        id: parse_id(row.get::<String, _>("id"), "artifact ID")?,
+        project_id: parse_id(row.get::<String, _>("project_id"), "project ID")?,
+        project: row.get("project"),
+        name: row.get("name"),
+        artifact_type: row.get("artifact_type"),
+        version: from_i64(row.get("version"), "artifact version")?,
+        description: row.get("description"),
+        metadata: parse_document(row.get::<String, _>("metadata_json"), "artifact metadata")?,
+        entries: serde_json::from_str(&row.get::<String, _>("entries_json"))
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?,
+        request_json: row.get("request_json"),
+        created_by_run: parse_id(row.get::<String, _>("created_by_run"), "run ID")?,
         created_at: row.get("created_at"),
     })
 }

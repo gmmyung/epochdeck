@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from runloom.artifact import Artifact
 from runloom.run import Mode, Resume, Run, create_run
 
 _current_run: Run | None = None
@@ -59,6 +60,20 @@ def alert(title: str, text: str = "", *, level: str = "info") -> None:
     """Record a durable alert on the active run."""
     run = _require_current_run()
     run.alert(title, text, level=level)
+
+
+def log_artifact(
+    artifact: Artifact,
+    *,
+    aliases: list[str] | tuple[str, ...] | None = None,
+) -> Artifact:
+    """Durably log an output artifact on the active run."""
+    return _require_current_run().log_artifact(artifact, aliases=aliases)
+
+
+def use_artifact(artifact: Artifact | str) -> str:
+    """Record an input-artifact lineage edge on the active run."""
+    return _require_current_run().use_artifact(artifact)
 
 
 def finish(*, summary: Mapping[str, Any] | None = None, timeout: float = 30.0) -> None:

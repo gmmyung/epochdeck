@@ -39,7 +39,7 @@ not a reduction in the final parity goal.
 
 - [x] Images, audio, video, tables, and histograms.
 - [x] Content-addressed blobs and range delivery.
-- Artifact versions, aliases, downloads, and lineage.
+- [x] Artifact versions, aliases, downloads, and lineage.
 - Structured traces and search.
 
 ## Milestone 4: APIs and automation

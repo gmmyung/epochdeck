@@ -67,6 +67,31 @@ export type RichValue = {
   created_at: string;
 };
 
+export type ArtifactEntry = {
+  path: string;
+  blob: BlobRef;
+};
+
+export type Artifact = {
+  id: string;
+  project_id: string;
+  project: string;
+  name: string;
+  type: string;
+  version: number;
+  description: string | null;
+  metadata: Record<string, unknown>;
+  aliases: string[];
+  entries: ArtifactEntry[];
+  created_by_run: string;
+  created_at: string;
+};
+
+export type RunArtifact = {
+  artifact: Artifact;
+  relation: "input" | "output";
+};
+
 export function getHealth(signal?: AbortSignal): Promise<Health> {
   return getJson<Health>("/api/v1/health", signal);
 }
@@ -115,6 +140,19 @@ export async function getRichValues(runId: string, signal?: AbortSignal): Promis
 export function blobUrl(blob: BlobRef): string {
   const query = new URLSearchParams({ mime: blob.mime_type });
   return `/api/v1/blobs/${encodeURIComponent(blob.digest)}?${query}`;
+}
+
+export async function getRunArtifacts(runId: string, signal?: AbortSignal): Promise<RunArtifact[]> {
+  const result = await getJson<{ artifacts: RunArtifact[] }>(
+    `/api/v1/runs/${encodeURIComponent(runId)}/artifacts`,
+    signal,
+  );
+  return result.artifacts;
+}
+
+export function artifactFileUrl(artifactId: string, path: string): string {
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  return `/api/v1/artifacts/${encodeURIComponent(artifactId)}/files/${encodedPath}`;
 }
 
 export function getHistory(

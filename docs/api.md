@@ -77,6 +77,27 @@ Rich manifests contain a stable UUIDv7 ID, key, `image`, `audio`, `video`,
 to 256 KiB of preview metadata. Media and table values require an uploaded blob.
 Exact manifest retries are idempotent.
 
+## Artifacts
+
+- `POST /runs/{run_id}/artifacts` creates the next immutable version and an
+  output lineage edge.
+- `POST /runs/{run_id}/artifacts/use` records an input lineage edge.
+- `GET /runs/{run_id}/artifacts` lists the run's bounded input/output links.
+- `GET /projects/{project}/artifacts?limit=100&before=<artifact_id>` lists
+  project versions newest first.
+- `GET /projects/{project}/artifacts/{name}/aliases/{alias}` resolves a movable
+  alias such as `latest` or `best`.
+- `GET /artifacts/{artifact_id}` returns one immutable manifest.
+- `GET /artifacts/{artifact_id}/lineage` returns bounded input/output run IDs.
+- `GET /artifacts/{artifact_id}/files/{path}` streams one manifest entry with
+  range support.
+
+Artifact collection names have one stable type per project. Each create request
+contains up to 4,096 unique relative POSIX paths and a total 2 MiB manifest
+budget; these are metadata bounds, not file-size or retention quotas. The server
+verifies every referenced SHA-256 object before allocating the version in one
+SQLite transaction. Stable request IDs make a lost create response replay-safe.
+
 ## Discovery
 
 - `GET /projects?limit=100` returns bounded project summaries.

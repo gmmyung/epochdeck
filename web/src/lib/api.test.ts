@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   blobUrl,
+  artifactFileUrl,
   getAlerts,
   getHealth,
   getHistory,
   getRichValues,
+  getRunArtifacts,
   getRun,
   getRuns,
   getSampledHistory,
@@ -135,6 +137,19 @@ describe("getHealth", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/runs/run%2Fid/rich-values?limit=100");
     expect(blobUrl({ digest: "abc", size: 3, mime_type: "video/mp4", file_name: null })).toBe(
       "/api/v1/blobs/abc?mime=video%2Fmp4",
+    );
+  });
+
+  it("loads run artifact lineage and encodes nested file paths", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ artifacts: [] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getRunArtifacts("run/id")).resolves.toEqual([]);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/runs/run%2Fid/artifacts");
+    expect(artifactFileUrl("artifact/id", "checkpoints/best model.bin")).toBe(
+      "/api/v1/artifacts/artifact%2Fid/files/checkpoints/best%20model.bin",
     );
   });
 });

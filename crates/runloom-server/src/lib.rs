@@ -20,15 +20,18 @@ use runloom_catalog::{
     BatchRegistration, BatchStatus, Catalog, CatalogError, MAX_SEGMENTS_PER_QUERY, SegmentManifest,
 };
 use runloom_protocol::{
-    AlertId, AlertListResponse, ApiError, BlobRef, BlobUploadResponse, ConfigUpdateRequest,
-    CreateAlertRequest, CreateAlertResponse, CreateRichValueRequest, CreateRichValueResponse,
-    CreateRunRequest, CreateRunResponse, FinishRunRequest, FinishRunResponse, HealthResponse,
-    HistoryResponse, IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES,
-    MAX_ALERT_TITLE_BYTES, MAX_BATCH_POINTS, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS,
-    MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES,
-    MAX_SUMMARY_BYTES, MetricKeyListResponse, ProjectListResponse, ResumePolicy, RichValueId,
-    RichValueKind, RichValueListResponse, RunId, RunListResponse, RunRecord, RunState,
-    RunUpdateResponse, SummaryUpdateRequest,
+    AlertId, AlertListResponse, ApiError, ArtifactId, ArtifactLineageResponse,
+    ArtifactListResponse, ArtifactRecord, ArtifactRelation, BlobRef, BlobUploadResponse,
+    ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse, CreateArtifactRequest,
+    CreateArtifactResponse, CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest,
+    CreateRunResponse, FinishRunRequest, FinishRunResponse, HealthResponse, HistoryResponse,
+    IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES,
+    MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS, MAX_CONFIG_BYTES,
+    MAX_HISTORY_KEYS, MAX_HISTORY_POINTS, MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES,
+    MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES, MetricKeyListResponse, ProjectListResponse,
+    ResumePolicy, RichValueId, RichValueKind, RichValueListResponse, RunArtifactListResponse,
+    RunId, RunListResponse, RunRecord, RunState, RunUpdateResponse, SummaryUpdateRequest,
+    UseArtifactRequest,
 };
 use runloom_storage::{
     BlobStore, MetricStore, MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
@@ -51,6 +54,11 @@ const QUERY_WORKERS: usize = 4;
 const MAX_LIST_ITEMS: usize = 200;
 const MAX_MIME_TYPE_BYTES: usize = 256;
 const MAX_FILE_NAME_BYTES: usize = 512;
+const MAX_ARTIFACT_NAME_BYTES: usize = 128;
+const MAX_ARTIFACT_TYPE_BYTES: usize = 64;
+const MAX_ARTIFACT_ALIAS_BYTES: usize = 128;
+const MAX_ARTIFACT_PATH_BYTES: usize = 1_024;
+const MAX_ARTIFACT_DESCRIPTION_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 struct AppState {
@@ -109,6 +117,28 @@ pub fn app_with_runtime_and_blobs(
         .route(
             "/api/v1/runs/{run_id}/rich-values",
             post(create_rich_value).get(list_rich_values),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/artifacts",
+            post(create_artifact).get(list_run_artifacts),
+        )
+        .route("/api/v1/runs/{run_id}/artifacts/use", post(use_artifact))
+        .route(
+            "/api/v1/projects/{project}/artifacts",
+            get(list_project_artifacts),
+        )
+        .route(
+            "/api/v1/projects/{project}/artifacts/{name}/aliases/{alias}",
+            get(resolve_artifact),
+        )
+        .route("/api/v1/artifacts/{artifact_id}", get(get_artifact))
+        .route(
+            "/api/v1/artifacts/{artifact_id}/lineage",
+            get(get_artifact_lineage),
+        )
+        .route(
+            "/api/v1/artifacts/{artifact_id}/files/{*artifact_path}",
+            get(get_artifact_file),
         )
         .route("/api/v1/blobs/{digest}", put(upload_blob).get(get_blob))
         .route("/api/v1/runs/{run_id}/history", get(history))
@@ -467,6 +497,150 @@ async fn list_rich_values(
     }))
 }
 
+async fn create_artifact(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    Json(request): Json<CreateArtifactRequest>,
+) -> Result<(StatusCode, Json<CreateArtifactResponse>), HttpError> {
+    validate_artifact(&request)?;
+    let entries = request.entries.clone();
+    let blobs = state.blobs.clone();
+    tokio::task::spawn_blocking(move || verify_artifact_blobs(&blobs, &entries))
+        .await
+        .map_err(|error| {
+            HttpError::internal(format!("artifact verification worker failed: {error}"))
+        })??;
+    let (artifact, duplicate) = state.catalog.create_artifact(run_id, &request).await?;
+    let status = if duplicate {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((
+        status,
+        Json(CreateArtifactResponse {
+            artifact,
+            duplicate,
+        }),
+    ))
+}
+
+async fn use_artifact(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    Json(request): Json<UseArtifactRequest>,
+) -> Result<Json<ArtifactRecord>, HttpError> {
+    Ok(Json(
+        state
+            .catalog
+            .use_artifact(run_id, request.artifact_id)
+            .await?,
+    ))
+}
+
+async fn get_artifact(
+    State(state): State<AppState>,
+    Path(artifact_id): Path<ArtifactId>,
+) -> Result<Json<ArtifactRecord>, HttpError> {
+    Ok(Json(state.catalog.get_artifact(artifact_id).await?))
+}
+
+async fn resolve_artifact(
+    State(state): State<AppState>,
+    Path((project, name, alias)): Path<(String, String, String)>,
+) -> Result<Json<ArtifactRecord>, HttpError> {
+    validate_project_name(&project)?;
+    validate_artifact_component(&name, "artifact name", MAX_ARTIFACT_NAME_BYTES)?;
+    validate_artifact_component(&alias, "artifact alias", MAX_ARTIFACT_ALIAS_BYTES)?;
+    Ok(Json(
+        state
+            .catalog
+            .resolve_artifact(&project, &name, &alias)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactListQuery {
+    before: Option<ArtifactId>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+async fn list_project_artifacts(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    Query(query): Query<ArtifactListQuery>,
+) -> Result<Json<ArtifactListResponse>, HttpError> {
+    validate_project_name(&project)?;
+    validate_list_limit(query.limit)?;
+    let artifacts = state
+        .catalog
+        .list_project_artifacts(&project, query.before, query.limit)
+        .await?;
+    let next_before = if artifacts.len() == query.limit {
+        artifacts.last().map(|artifact| artifact.id)
+    } else {
+        None
+    };
+    Ok(Json(ArtifactListResponse {
+        artifacts,
+        next_before,
+    }))
+}
+
+async fn list_run_artifacts(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+) -> Result<Json<RunArtifactListResponse>, HttpError> {
+    Ok(Json(RunArtifactListResponse {
+        artifacts: state
+            .catalog
+            .list_run_artifacts(run_id, MAX_LIST_ITEMS)
+            .await?,
+    }))
+}
+
+async fn get_artifact_lineage(
+    State(state): State<AppState>,
+    Path(artifact_id): Path<ArtifactId>,
+) -> Result<Json<ArtifactLineageResponse>, HttpError> {
+    let artifact = state.catalog.get_artifact(artifact_id).await?;
+    let (input_runs, output_runs) = tokio::try_join!(
+        state
+            .catalog
+            .artifact_lineage(artifact_id, ArtifactRelation::Input, MAX_LIST_ITEMS),
+        state
+            .catalog
+            .artifact_lineage(artifact_id, ArtifactRelation::Output, MAX_LIST_ITEMS),
+    )?;
+    Ok(Json(ArtifactLineageResponse {
+        artifact,
+        input_runs,
+        output_runs,
+    }))
+}
+
+async fn get_artifact_file(
+    State(state): State<AppState>,
+    Path((artifact_id, artifact_path)): Path<(ArtifactId, String)>,
+    request: Request<Body>,
+) -> Result<Response, HttpError> {
+    let artifact = state.catalog.get_artifact(artifact_id).await?;
+    let entry = artifact
+        .entries
+        .iter()
+        .find(|entry| entry.path == artifact_path)
+        .ok_or_else(|| HttpError::not_found(format!("artifact file {artifact_path}")))?;
+    serve_blob(
+        &state.blobs,
+        &entry.blob.digest,
+        Some(&entry.blob.mime_type),
+        request,
+    )
+    .await
+}
+
 async fn upload_blob(
     State(state): State<AppState>,
     Path(digest): Path<String>,
@@ -557,22 +731,30 @@ async fn get_blob(
     Query(query): Query<BlobQuery>,
     request: Request<Body>,
 ) -> Result<Response, HttpError> {
-    let path = state
-        .blobs
-        .path(&digest)
+    if let Some(mime_type) = &query.mime {
+        validate_mime_type(mime_type)?;
+    }
+    serve_blob(&state.blobs, &digest, query.mime.as_deref(), request).await
+}
+
+async fn serve_blob(
+    blobs: &BlobStore,
+    digest: &str,
+    mime_type: Option<&str>,
+    request: Request<Body>,
+) -> Result<Response, HttpError> {
+    let path = blobs
+        .path(digest)
         .map_err(|error| HttpError::invalid(error.to_string()))?;
     if !path.is_file() {
         return Err(HttpError::not_found(format!("blob {digest}")));
-    }
-    if let Some(mime_type) = &query.mime {
-        validate_mime_type(mime_type)?;
     }
     let response = match ServeFile::new(path).oneshot(request).await {
         Ok(response) => response,
         Err(error) => match error {},
     };
     let mut response = response.map(Body::new);
-    if let Some(mime_type) = query.mime {
+    if let Some(mime_type) = mime_type {
         let value = mime_type
             .parse()
             .map_err(|_| HttpError::invalid("invalid blob MIME type"))?;
@@ -798,6 +980,118 @@ fn validate_rich_value(request: &CreateRichValueRequest) -> Result<(), HttpError
         validate_file_name(blob.file_name.as_deref())?;
     }
     validate_document_size(&request.metadata, "rich metadata", MAX_RICH_METADATA_BYTES)
+}
+
+fn validate_artifact(request: &CreateArtifactRequest) -> Result<(), HttpError> {
+    validate_artifact_component(&request.name, "artifact name", MAX_ARTIFACT_NAME_BYTES)?;
+    validate_artifact_component(
+        &request.artifact_type,
+        "artifact type",
+        MAX_ARTIFACT_TYPE_BYTES,
+    )?;
+    if request
+        .description
+        .as_ref()
+        .is_some_and(|description| description.len() > MAX_ARTIFACT_DESCRIPTION_BYTES)
+    {
+        return Err(HttpError::invalid(format!(
+            "artifact description cannot exceed {MAX_ARTIFACT_DESCRIPTION_BYTES} bytes"
+        )));
+    }
+    if request.aliases.len() > 256 {
+        return Err(HttpError::invalid(
+            "artifact cannot have more than 256 aliases",
+        ));
+    }
+    let mut aliases = BTreeSet::new();
+    for alias in &request.aliases {
+        validate_artifact_component(alias, "artifact alias", MAX_ARTIFACT_ALIAS_BYTES)?;
+        if !aliases.insert(alias) {
+            return Err(HttpError::invalid("artifact aliases must be unique"));
+        }
+    }
+    if request.entries.len() > MAX_ARTIFACT_ENTRIES {
+        return Err(HttpError::invalid(format!(
+            "artifact cannot contain more than {MAX_ARTIFACT_ENTRIES} entries"
+        )));
+    }
+    let mut paths = BTreeSet::new();
+    for entry in &request.entries {
+        validate_artifact_path(&entry.path)?;
+        validate_mime_type(&entry.blob.mime_type)?;
+        validate_file_name(entry.blob.file_name.as_deref())?;
+        if !paths.insert(&entry.path) {
+            return Err(HttpError::invalid("artifact entry paths must be unique"));
+        }
+    }
+    validate_document_size(
+        &request.metadata,
+        "artifact metadata",
+        MAX_RICH_METADATA_BYTES,
+    )?;
+    let manifest_size = serde_json::to_vec(request)
+        .map_err(|error| HttpError::invalid(format!("artifact is not serializable: {error}")))?
+        .len();
+    if manifest_size > MAX_ARTIFACT_MANIFEST_BYTES {
+        return Err(HttpError::invalid(format!(
+            "serialized artifact manifest exceeds {MAX_ARTIFACT_MANIFEST_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_artifact_component(value: &str, name: &str, max_bytes: usize) -> Result<(), HttpError> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value.chars().any(char::is_control)
+        || value.contains('/')
+    {
+        return Err(HttpError::invalid(format!(
+            "{name} must contain 1 to {max_bytes} safe bytes without '/'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_artifact_path(value: &str) -> Result<(), HttpError> {
+    if value.is_empty()
+        || value.len() > MAX_ARTIFACT_PATH_BYTES
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(HttpError::invalid(format!(
+            "artifact paths must be relative POSIX paths up to {MAX_ARTIFACT_PATH_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_artifact_blobs(
+    blobs: &BlobStore,
+    entries: &[runloom_protocol::ArtifactEntry],
+) -> Result<(), HttpError> {
+    for entry in entries {
+        let actual_size = blobs
+            .size(&entry.blob.digest)
+            .map_err(|error| HttpError::invalid(error.to_string()))?
+            .ok_or_else(|| {
+                HttpError::invalid(format!(
+                    "artifact blob for '{}' has not been uploaded",
+                    entry.path
+                ))
+            })?;
+        if actual_size != entry.blob.size {
+            return Err(HttpError::invalid(format!(
+                "artifact blob size for '{}' does not match uploaded content",
+                entry.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_mime_type(value: &str) -> Result<(), HttpError> {
@@ -1059,13 +1353,14 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use runloom_catalog::Catalog;
     use runloom_protocol::{
-        AlertId, AlertLevel, AlertListResponse, BlobRef, BlobUploadResponse, ConfigUpdateRequest,
-        CreateAlertRequest, CreateAlertResponse, CreateRichValueRequest, CreateRichValueResponse,
-        CreateRunRequest, CreateRunResponse, FinishRunRequest, FinishRunResponse, HealthResponse,
-        HealthStatus, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
-        MetricKeyListResponse, MetricPoint, ProjectListResponse, ResumePolicy, RichValueId,
-        RichValueKind, RichValueListResponse, RunListResponse, RunUpdateResponse,
-        SummaryUpdateRequest,
+        AlertId, AlertLevel, AlertListResponse, ArtifactEntry, ArtifactListResponse, BlobRef,
+        BlobUploadResponse, ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse,
+        CreateArtifactRequest, CreateArtifactResponse, CreateRichValueRequest,
+        CreateRichValueResponse, CreateRunRequest, CreateRunResponse, FinishRunRequest,
+        FinishRunResponse, HealthResponse, HealthStatus, HistoryResponse, IngestBatchRequest,
+        IngestBatchResponse, MetricKeyListResponse, MetricPoint, ProjectListResponse, ResumePolicy,
+        RichValueId, RichValueKind, RichValueListResponse, RunArtifactListResponse,
+        RunListResponse, RunUpdateResponse, SummaryUpdateRequest, UseArtifactRequest,
     };
     use runloom_storage::MetricStore;
     use sha2::{Digest, Sha256};
@@ -1322,6 +1617,120 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.headers()["content-type"], "video/mp4");
         assert_eq!(to_bytes(response.into_body(), 64).await?, &video[7..=11]);
+
+        let artifact_path = format!("/api/v1/runs/{}/artifacts", created.run.id);
+        let artifact_request = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            name: "policy".to_owned(),
+            artifact_type: "model".to_owned(),
+            description: Some("trained policy".to_owned()),
+            metadata: BTreeMap::from([("framework".to_owned(), "jax".into())]),
+            aliases: vec!["latest".to_owned()],
+            entries: vec![ArtifactEntry {
+                path: "checkpoint.bin".to_owned(),
+                blob: uploaded.blob.clone(),
+            }],
+        };
+        let response = router
+            .clone()
+            .oneshot(json_request("POST", &artifact_path, &artifact_request)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let version_zero: CreateArtifactResponse = response_json(response).await?;
+        assert_eq!(version_zero.artifact.version, 0);
+        let replay: CreateArtifactResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request("POST", &artifact_path, &artifact_request)?)
+                .await?,
+        )
+        .await?;
+        assert!(replay.duplicate);
+
+        let mut next_request = artifact_request.clone();
+        next_request.id = Some(runloom_protocol::ArtifactId::new());
+        next_request.aliases = vec!["latest".to_owned(), "best".to_owned()];
+        let version_one: CreateArtifactResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request("POST", &artifact_path, &next_request)?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(version_one.artifact.version, 1);
+        let resolved: runloom_protocol::ArtifactRecord = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/projects/robotics/artifacts/policy/aliases/latest")
+                        .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(resolved.id, version_one.artifact.id);
+
+        let used: runloom_protocol::ArtifactRecord = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("{artifact_path}/use"),
+                    &UseArtifactRequest {
+                        artifact_id: version_zero.artifact.id,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(used.id, version_zero.artifact.id);
+        let run_artifacts: RunArtifactListResponse = response_json(
+            router
+                .clone()
+                .oneshot(Request::get(&artifact_path).body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(run_artifacts.artifacts.len(), 3);
+        let project_artifacts: ArtifactListResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/projects/robotics/artifacts?limit=10")
+                        .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(project_artifacts.artifacts.len(), 2);
+        let lineage: runloom_protocol::ArtifactLineageResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/artifacts/{}/lineage",
+                        version_zero.artifact.id
+                    ))
+                    .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(lineage.input_runs, vec![created.run.id]);
+        assert_eq!(lineage.output_runs, vec![created.run.id]);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/artifacts/{}/files/checkpoint.bin",
+                    version_zero.artifact.id
+                ))
+                .header("range", "bytes=0-5")
+                .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(to_bytes(response.into_body(), 64).await?, &video[0..=5]);
 
         let response = router
             .clone()

@@ -10,8 +10,8 @@ media, artifacts, querying, and the dashboard.
 
 Runloom is pre-alpha. Scalar run tracking, native rich media, host telemetry,
 durable alerts, bounded dashboard sampling, and background metric compaction are
-usable end to end; artifacts, authentication, sweeps, and the wider
-compatibility surface remain under active development.
+usable end to end. Versioned artifacts are also usable; authentication, sweeps,
+and the wider compatibility surface remain under active development.
 
 ## Non-negotiable properties
 
@@ -115,6 +115,21 @@ Runloom copies their bytes into the durable local spool, streams uploads without
 buffering complete files, and deduplicates server content by SHA-256. Put
 `RUNLOOM_BLOBS_DIR` on HDD/ZFS while leaving the catalog and metric roots on SSD.
 The dashboard renders each type natively and video delivery supports byte ranges.
+
+Version checkpoints and datasets independently from run media:
+
+```python
+artifact = wandb.Artifact("policy", type="model", metadata={"step": 100_000})
+artifact.add_file("checkpoint.bin", name="weights/checkpoint.bin")
+run.log_artifact(artifact, aliases=["latest", "best"])
+run.finish()
+downstream = wandb.init(project="bello-mujoco")
+downstream.use_artifact(artifact)  # explicit input lineage
+```
+
+Artifact versions and aliases are catalog transactions; file entries reuse the
+CAS, downloads stream with byte ranges, and input/output relationships appear in
+the dashboard.
 
 ## Repository layout
 

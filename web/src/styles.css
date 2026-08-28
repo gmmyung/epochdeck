@@ -490,6 +490,92 @@ canvas {
   font-size: 11px;
 }
 
+.artifact-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 24px;
+}
+
+.artifact-card {
+  padding: 12px;
+}
+
+.artifact-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.artifact-title > span,
+.artifact-aliases span {
+  padding: 2px 5px;
+  background: var(--accent-bg);
+  color: var(--accent-text);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.artifact-title > span.artifact-input {
+  background: var(--panel-alt);
+  color: var(--muted);
+}
+
+.artifact-title strong {
+  font-size: 12px;
+}
+
+.artifact-title small,
+.artifact-card > p {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.artifact-card > p {
+  margin: 8px 0;
+}
+
+.artifact-aliases {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.artifact-files {
+  display: grid;
+  gap: 1px;
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  background: var(--line);
+}
+
+.artifact-files a {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 8px;
+  overflow: hidden;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 10px;
+  text-decoration: none;
+}
+
+.artifact-files a:hover {
+  background: var(--button-hover);
+}
+
+.artifact-files span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-files small {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
 .metric-chart-card {
   min-height: 338px;
   content-visibility: auto;

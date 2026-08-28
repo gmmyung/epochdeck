@@ -12,6 +12,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
+from runloom.artifact import Artifact
 from runloom.client import RunloomApiError, RunloomClient
 from runloom.rich import RichValue
 from runloom.system_metrics import SystemMonitor, SystemSampler
@@ -140,10 +141,14 @@ class _Spool:
         self.rich_ack_path = self.directory / "rich-ack"
         self.rich_delivery_path = self.directory / "rich-delivery.json"
         self.blob_root = self.directory / "blobs"
+        self.artifacts_path = self.directory / "artifacts.jsonl"
+        self.artifact_ack_path = self.directory / "artifact-ack"
+        self.artifact_delivery_path = self.directory / "artifact-delivery.json"
         self._lock = threading.Lock()
         self.events_path.touch(exist_ok=True)
         self.alerts_path.touch(exist_ok=True)
         self.rich_values_path.touch(exist_ok=True)
+        self.artifacts_path.touch(exist_ok=True)
         self.blob_root.mkdir(exist_ok=True)
 
     def read_metadata(self) -> dict[str, Any] | None:
@@ -170,6 +175,9 @@ class _Spool:
 
     def append_rich_value(self, value: dict[str, Any]) -> None:
         self._append_record(self.rich_values_path, value)
+
+    def append_artifact(self, artifact: dict[str, Any]) -> None:
+        self._append_record(self.artifacts_path, artifact)
 
     def _append_record(self, path: Path, record: dict[str, Any]) -> None:
         encoded = json.dumps(record, separators=(",", ":"), sort_keys=True, allow_nan=False)
@@ -204,6 +212,15 @@ class _Spool:
             1,
         )
         return (values[0] if values else None), offset
+
+    def read_artifact(self) -> tuple[dict[str, Any] | None, int]:
+        artifacts, offset = self._read_record_batch(
+            self.artifacts_path,
+            self.artifact_ack_path,
+            self.artifact_delivery_path,
+            1,
+        )
+        return (artifacts[0] if artifacts else None), offset
 
     def _read_record_batch(
         self,
@@ -262,6 +279,9 @@ class _Spool:
     def acknowledge_rich_value(self, offset: int) -> None:
         self._acknowledge(self.rich_ack_path, self.rich_delivery_path, offset)
 
+    def acknowledge_artifact(self, offset: int) -> None:
+        self._acknowledge(self.artifact_ack_path, self.artifact_delivery_path, offset)
+
     def _acknowledge(self, ack_path: Path, delivery_path: Path, offset: int) -> None:
         with self._lock:
             if delivery_path.exists():
@@ -274,7 +294,12 @@ class _Spool:
             delivery_path.unlink(missing_ok=True)
 
     def pending(self) -> bool:
-        return self.pending_metrics() or self.pending_alerts() or self.pending_rich_values()
+        return (
+            self.pending_metrics()
+            or self.pending_alerts()
+            or self.pending_rich_values()
+            or self.pending_artifacts()
+        )
 
     def pending_metrics(self) -> bool:
         return self._pending(self.ack_path, self.events_path)
@@ -284,6 +309,9 @@ class _Spool:
 
     def pending_rich_values(self) -> bool:
         return self._pending(self.rich_ack_path, self.rich_values_path)
+
+    def pending_artifacts(self) -> bool:
+        return self._pending(self.artifact_ack_path, self.artifacts_path)
 
     def _pending(self, ack_path: Path, journal_path: Path) -> bool:
         with self._lock:
@@ -462,6 +490,24 @@ class _DeliveryWorker(threading.Thread):
                         )
                     self._client.create_rich_value(self._run_id, value)
                     self._spool.acknowledge_rich_value(next_offset)
+                elif delivery == "artifact":
+                    artifact, next_offset = self._spool.read_artifact()
+                    if artifact is None:
+                        continue
+                    operation = artifact.pop("operation", None)
+                    if operation == "create":
+                        for entry in artifact["entries"]:
+                            blob = entry["blob"]
+                            self._client.upload_blob(
+                                self._spool.blob_path(str(blob["digest"])),
+                                blob,
+                            )
+                        self._client.create_artifact(self._run_id, artifact)
+                    elif operation == "use":
+                        self._client.use_artifact(self._run_id, str(artifact["artifact_id"]))
+                    else:
+                        raise DeliveryError("artifact journal has an unknown operation")
+                    self._spool.acknowledge_artifact(next_offset)
                 elif delivery == "metrics":
                     points, next_offset = self._spool.read_batch(self._batch_size)
                     if not points:
@@ -486,9 +532,10 @@ class _DeliveryWorker(threading.Thread):
         pending = (
             self._spool.pending_metrics,
             self._spool.pending_rich_values,
+            self._spool.pending_artifacts,
             self._spool.pending_alerts,
         )
-        names = ("metrics", "rich", "alert")
+        names = ("metrics", "rich", "artifact", "alert")
         for offset in range(len(pending)):
             index = (self._delivery_cursor + offset) % len(pending)
             if pending[index]():
@@ -867,6 +914,65 @@ class Run:
             )
         if self._worker is not None:
             self._worker.notify()
+
+    def log_artifact(
+        self,
+        artifact: Artifact,
+        *,
+        aliases: list[str] | tuple[str, ...] | None = None,
+    ) -> Artifact:
+        if not isinstance(artifact, Artifact):
+            raise TypeError("log_artifact expects a runloom.Artifact")
+        if aliases is not None and not isinstance(aliases, (list, tuple)):
+            raise TypeError("artifact aliases must be a list or tuple of strings")
+        with self._log_lock:
+            if self._finished or self._finishing:
+                raise RuntimeError("cannot log an artifact while a run is finishing or finished")
+            if self.mode == "disabled":
+                return artifact
+            assert self._spool is not None
+            record = artifact._prepare(self._spool.blob_root, aliases or ("latest",))
+            record["metadata"] = _normalize_document(record["metadata"], "artifact metadata")
+            self._spool.append_artifact(record)
+        if self._worker is not None:
+            self._worker.notify()
+        return artifact
+
+    def use_artifact(self, artifact: Artifact | str) -> str:
+        with self._log_lock:
+            if self._finished or self._finishing:
+                raise RuntimeError("cannot use an artifact while a run is finishing or finished")
+            if isinstance(artifact, Artifact):
+                artifact_id = artifact.id
+            elif isinstance(artifact, str):
+                if self.mode == "disabled":
+                    return artifact
+                artifact_id = self._resolve_artifact_reference(artifact)
+            else:
+                raise TypeError("use_artifact expects an Artifact, artifact ID, or 'name:alias'")
+            if self.mode == "disabled":
+                return artifact_id
+            assert self._spool is not None
+            self._spool.append_artifact(
+                {"id": _uuid7(), "operation": "use", "artifact_id": artifact_id}
+            )
+        if self._worker is not None:
+            self._worker.notify()
+        return artifact_id
+
+    def _resolve_artifact_reference(self, reference: str) -> str:
+        try:
+            return str(uuid.UUID(reference))
+        except ValueError:
+            pass
+        if self.mode != "online":
+            raise ValueError("offline artifact references must use a concrete artifact ID")
+        name, separator, alias = reference.partition(":")
+        if not separator or not name or not alias:
+            raise ValueError("artifact reference must be an ID or 'name:alias'")
+        assert self._client is not None
+        artifact = self._client.resolve_artifact(self.project, name, alias)
+        return str(artifact["id"])
 
     def _log_system_metrics(self, data: Mapping[str, float]) -> None:
         metrics = _flatten_metrics(data)

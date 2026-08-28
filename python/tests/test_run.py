@@ -8,7 +8,7 @@ import uuid
 import httpx
 import pytest
 
-from runloom import Histogram, Image, Table
+from runloom import Artifact, Histogram, Image, Table
 from runloom.run import DeliveryError, create_run, sync_spool
 
 
@@ -472,4 +472,84 @@ def test_offline_rich_values_stream_blobs_and_sync_idempotently(tmp_path) -> Non
     assert (
         int((directory / "rich-ack").read_text())
         == (directory / "rich-values.jsonl").stat().st_size
+    )
+
+
+def test_artifacts_upload_versions_and_durable_lineage_operations(tmp_path) -> None:
+    checkpoint = tmp_path / "checkpoint.bin"
+    checkpoint.write_bytes(b"checkpoint-content")
+    artifact = Artifact(
+        "policy",
+        type="model",
+        description="trained policy",
+        metadata={"framework": "jax"},
+    ).add_file(checkpoint, name="weights/checkpoint.bin")
+    run = create_run(
+        project="robotics",
+        run_id="019c1234-5678-7000-8000-000000000010",
+        mode="offline",
+        spool_root=tmp_path / "spool",
+        system_monitor_interval=0,
+    )
+    assert run.log_artifact(artifact) is artifact
+    assert run.use_artifact(artifact) == artifact.id
+    run.finish()
+    directory = tmp_path / "spool" / run.id
+    operations: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/runs"):
+            return httpx.Response(
+                201,
+                json={
+                    "run": {"name": "artifact-run"},
+                    "resumed": False,
+                    "next_sequence": 1,
+                    "next_step": 0,
+                },
+            )
+        if "/blobs/" in request.url.path:
+            digest = request.url.path.rsplit("/", 1)[1]
+            content = request.read()
+            operations.append(("blob", {"digest": digest, "content": content}))
+            return httpx.Response(
+                201,
+                json={
+                    "blob": {
+                        "digest": digest,
+                        "size": len(content),
+                        "mime_type": request.headers["content-type"],
+                        "file_name": None,
+                    },
+                    "duplicate": False,
+                },
+            )
+        if request.url.path.endswith("/artifacts/use"):
+            body = json.loads(request.content)
+            operations.append(("use", body))
+            return httpx.Response(200, json={"id": body["artifact_id"]})
+        if request.url.path.endswith("/artifacts"):
+            body = json.loads(request.content)
+            operations.append(("create", body))
+            return httpx.Response(
+                201,
+                json={"artifact": {"id": body["id"], "version": 0}, "duplicate": False},
+            )
+        if request.url.path.endswith("/finish"):
+            return httpx.Response(200, json={"run": {"state": "finished"}})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    sync_spool(directory, transport=httpx.MockTransport(handler), timeout=2)
+
+    assert [operation for operation, _ in operations] == ["blob", "create", "use"]
+    create = operations[1][1]
+    assert create["name"] == "policy"
+    assert create["type"] == "model"
+    assert create["aliases"] == ["latest"]
+    assert create["entries"][0]["path"] == "weights/checkpoint.bin"
+    assert operations[0][1]["content"] == b"checkpoint-content"
+    assert operations[2][1] == {"artifact_id": artifact.id}
+    assert (
+        int((directory / "artifact-ack").read_text())
+        == (directory / "artifacts.jsonl").stat().st_size
     )

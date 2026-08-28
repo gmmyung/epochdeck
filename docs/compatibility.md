@@ -25,7 +25,7 @@ usable and tested, not that the entire feature group is complete.
 | System metrics | CPU, memory, disk, GPU when available | Compatible |
 | Rich values | images, audio, video, tables, histograms | Compatible |
 | Alerts | levels, titles, text, steps, timestamps | Compatible |
-| Artifacts | manifests, versions, aliases, input/output links | Planned |
+| Artifacts | manifests, versions, aliases, input/output links | Compatible |
 | Traces | structured spans, messages, search metadata | Planned |
 | Python API | synchronous public API and background delivery | Partial |
 | Remote server | authenticated ingestion and read APIs | Partial |
@@ -46,7 +46,7 @@ deployment model.
 | Public API | projects, runs, filters, history, files, artifacts | Planned |
 | Media semantics | captions, grouping, sequences, native playback | Partial |
 | Tables | typed columns, incremental data, linked rich values | Partial |
-| Artifacts | collections, versions, aliases, lineage, downloads | Planned |
+| Artifacts | collections, versions, aliases, lineage, downloads | Compatible |
 | Sweeps | definitions, agents, scheduling, early termination | Planned |
 | Reports | persisted dashboard/report definitions | Planned |
 | Groups and jobs | group, job type, tags, notes, ownership metadata | Planned |
@@ -97,3 +97,10 @@ once in the server's SHA-256 blob root. The dashboard uses lazy images,
 metadata-only audio/video loading, HTTP range playback, bounded table previews,
 and Canvas histograms. The wider W&B media row-grouping, array conversion, and
 incremental mutable-table surface remains partial.
+
+Artifacts are immutable project-scoped collections with transactional `v0`,
+`v1`, ... version allocation, movable aliases, bounded manifests, exact retry
+IDs, and explicit input/output run links. File content reuses the rich-data CAS;
+artifact download endpoints stream files with range support. The SDK snapshots
+files into its spool before journaling a create operation and drains creates and
+lineage links fairly with metrics, rich values, and alerts.

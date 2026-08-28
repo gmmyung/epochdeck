@@ -19,6 +19,8 @@ pub const MAX_ALERT_TITLE_BYTES: usize = 256;
 pub const MAX_ALERT_TEXT_BYTES: usize = 4 * 1024;
 pub const MAX_RICH_KEY_BYTES: usize = 256;
 pub const MAX_RICH_METADATA_BYTES: usize = 256 * 1024;
+pub const MAX_ARTIFACT_ENTRIES: usize = 4_096;
+pub const MAX_ARTIFACT_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 
 macro_rules! uuid_identifier {
     ($name:ident) => {
@@ -128,6 +130,34 @@ pub enum RichValueKind {
     Video,
     Table,
     Histogram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactRelation {
+    Input,
+    Output,
+}
+
+impl fmt::Display for ArtifactRelation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input => formatter.write_str("input"),
+            Self::Output => formatter.write_str("output"),
+        }
+    }
+}
+
+impl FromStr for ArtifactRelation {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "input" => Ok(Self::Input),
+            "output" => Ok(Self::Output),
+            _ => Err("unknown artifact relation"),
+        }
+    }
 }
 
 impl fmt::Display for RichValueKind {
@@ -409,6 +439,80 @@ pub struct CreateRichValueResponse {
 pub struct RichValueListResponse {
     pub values: Vec<RichValueRecord>,
     pub next_before: Option<RichValueId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactEntry {
+    pub path: String,
+    pub blob: BlobRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateArtifactRequest {
+    #[serde(default)]
+    pub id: Option<ArtifactId>,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub artifact_type: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    pub entries: Vec<ArtifactEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactRecord {
+    pub id: ArtifactId,
+    pub project_id: ProjectId,
+    pub project: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub artifact_type: String,
+    pub version: u64,
+    pub description: Option<String>,
+    pub metadata: BTreeMap<String, Value>,
+    pub aliases: Vec<String>,
+    pub entries: Vec<ArtifactEntry>,
+    pub created_by_run: RunId,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateArtifactResponse {
+    pub artifact: ArtifactRecord,
+    pub duplicate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactListResponse {
+    pub artifacts: Vec<ArtifactRecord>,
+    pub next_before: Option<ArtifactId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UseArtifactRequest {
+    pub artifact_id: ArtifactId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunArtifactRecord {
+    pub artifact: ArtifactRecord,
+    pub relation: ArtifactRelation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunArtifactListResponse {
+    pub artifacts: Vec<RunArtifactRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactLineageResponse {
+    pub artifact: ArtifactRecord,
+    pub input_runs: Vec<RunId>,
+    pub output_runs: Vec<RunId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
