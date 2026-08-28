@@ -8,9 +8,10 @@ The immediate compatibility milestone is Trackio feature parity. The long-term
 contract is practical W&B feature parity across logging, run management, rich
 media, artifacts, querying, and the dashboard.
 
-Runloom is pre-alpha. Scalar run tracking and bounded dashboard sampling are
-usable end to end; rich media, artifacts, authentication, sweeps, and the wider
-compatibility surface remain under active development.
+Runloom is pre-alpha. Scalar run tracking, bounded dashboard sampling, and
+background metric compaction are usable end to end; rich media, artifacts,
+authentication, sweeps, and the wider compatibility surface remain under active
+development.
 
 ## Non-negotiable properties
 

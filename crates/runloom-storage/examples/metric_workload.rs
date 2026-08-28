@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use runloom_protocol::{IngestBatchRequest, MetricPoint, ProjectId, RunId};
-use runloom_storage::{MetricStore, SegmentSource};
+use runloom_storage::{CompactionSource, MetricStore, SegmentSource};
 use tempfile::tempdir;
 
 const BATCH_SIZE: usize = 1_024;
@@ -19,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let project_id = ProjectId::new();
     let run_id = RunId::new();
     let started = Instant::now();
-    let mut segments = Vec::new();
+    let mut written_segments = Vec::new();
     let mut stored_bytes = 0_u64;
 
     for (batch_sequence, first_row) in (0..rows).step_by(BATCH_SIZE).enumerate() {
@@ -46,11 +47,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let digest = format!("{batch_sequence:064x}");
         let segment = store.write_batch(project_id, run_id, &digest, &request)?;
         stored_bytes += segment.byte_size;
-        segments.push(SegmentSource {
-            relative_path: segment.relative_path,
-        });
+        written_segments.push(segment);
     }
     let write_elapsed = started.elapsed();
+
+    let compaction_started = Instant::now();
+    let mut segments = Vec::new();
+    let mut compacted_bytes = 0_u64;
+    for chunk in written_segments.chunks(16) {
+        if chunk.len() == 1 {
+            compacted_bytes += chunk[0].byte_size;
+            segments.push(SegmentSource {
+                relative_path: chunk[0].relative_path.clone(),
+            });
+            continue;
+        }
+        let sources = chunk
+            .iter()
+            .map(|segment| CompactionSource {
+                relative_path: segment.relative_path.clone(),
+                first_sequence: segment.first_sequence,
+                last_sequence: segment.last_sequence,
+                row_count: segment.row_count,
+            })
+            .collect::<Vec<_>>();
+        let compacted = store.compact_segments(
+            project_id,
+            run_id,
+            &chunk[0].signature,
+            &sources,
+            &AtomicBool::new(false),
+        )?;
+        for source in sources {
+            store.remove_segment(&source.relative_path)?;
+        }
+        compacted_bytes += compacted.byte_size;
+        segments.push(SegmentSource {
+            relative_path: compacted.relative_path,
+        });
+    }
+    let compaction_elapsed = compaction_started.elapsed();
 
     let query_started = Instant::now();
     let history = store.read_sampled_history(
@@ -64,8 +100,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_elapsed = query_started.elapsed();
 
     println!(
-        "rows={rows} metrics={metric_count} segments={}",
-        segments.len()
+        "rows={rows} metrics={metric_count} segments_before={} segments_after={}",
+        written_segments.len(),
+        segments.len(),
+    );
+    println!(
+        "compaction_seconds={:.3} compacted_mib={:.2}",
+        compaction_elapsed.as_secs_f64(),
+        compacted_bytes as f64 / (1024.0 * 1024.0)
     );
     println!(
         "write_seconds={:.3} stored_mib={:.2}",

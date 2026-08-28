@@ -24,7 +24,7 @@ not a reduction in the final parity goal.
 - [x] Server-side, spike-preserving min/max downsampling.
 - [x] Workload-shaped storage benchmark harness.
 - [x] Config mutation and non-numeric summary semantics.
-- [ ] Background compaction.
+- [x] Background compaction.
 - [ ] Full W&B lifecycle contract suite.
 
 ## Milestone 2: dashboard and monitoring

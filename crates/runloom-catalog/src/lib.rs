@@ -70,6 +70,11 @@ CREATE TABLE IF NOT EXISTS metric_segments (
 CREATE INDEX IF NOT EXISTS idx_metric_segments_run_sequence
     ON metric_segments(run_id, first_sequence, last_sequence);
 
+CREATE TABLE IF NOT EXISTS retired_metric_segments (
+    relative_path TEXT PRIMARY KEY,
+    retired_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS run_metric_keys (
     run_id TEXT NOT NULL REFERENCES runs(id),
     key TEXT NOT NULL,
@@ -115,10 +120,20 @@ pub struct SegmentManifest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentRecord {
+    pub id: String,
+    pub signature: String,
     pub relative_path: String,
     pub first_sequence: u64,
     pub last_sequence: u64,
     pub row_count: usize,
+    pub byte_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionCandidate {
+    pub project_id: ProjectId,
+    pub run_id: RunId,
+    pub segments: Vec<SegmentRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -559,7 +574,7 @@ impl Catalog {
             .transpose()?
             .unwrap_or(-1);
         let rows = query(
-            "SELECT relative_path, first_sequence, last_sequence, row_count \
+            "SELECT id, signature, relative_path, first_sequence, last_sequence, row_count, byte_size \
              FROM metric_segments \
              WHERE run_id = ? AND last_sequence > ? \
              ORDER BY first_sequence, id LIMIT ?",
@@ -573,6 +588,187 @@ impl Catalog {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(segment_from_row).collect()
+    }
+
+    pub async fn next_compaction_candidate(
+        &self,
+        target_rows: usize,
+        max_segments: usize,
+    ) -> Result<Option<CompactionCandidate>, CatalogError> {
+        if target_rows == 0 || max_segments < 2 {
+            return Err(CatalogError::InvalidData(
+                "compaction requires a positive row target and at least two input segments"
+                    .to_owned(),
+            ));
+        }
+        let target_rows_i64 = to_i64(target_rows as u64, "compaction row target")?;
+        let seed = query(
+            "WITH ordered AS ( \
+                 SELECT s.run_id, r.project_id, s.signature, s.first_sequence, \
+                        s.last_sequence, s.row_count, \
+                        LEAD(s.signature) OVER ( \
+                            PARTITION BY s.run_id ORDER BY s.first_sequence, s.id \
+                        ) AS next_signature, \
+                        LEAD(s.first_sequence) OVER ( \
+                            PARTITION BY s.run_id ORDER BY s.first_sequence, s.id \
+                        ) AS next_first_sequence, \
+                        LEAD(s.row_count) OVER ( \
+                            PARTITION BY s.run_id ORDER BY s.first_sequence, s.id \
+                        ) AS next_row_count \
+                 FROM metric_segments s \
+                 JOIN runs r ON r.id = s.run_id \
+                 WHERE s.row_count < ? \
+             ) \
+             SELECT run_id, project_id, first_sequence \
+             FROM ordered \
+             WHERE signature = next_signature \
+               AND last_sequence + 1 = next_first_sequence \
+               AND row_count + next_row_count <= ? \
+             ORDER BY first_sequence, run_id LIMIT 1",
+        )
+        .bind(target_rows_i64)
+        .bind(target_rows_i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(seed) = seed else {
+            return Ok(None);
+        };
+        let run_id: RunId = parse_id(seed.get::<String, _>("run_id"), "run ID")?;
+        let project_id: ProjectId = parse_id(seed.get::<String, _>("project_id"), "project ID")?;
+        let first_sequence = seed.get::<i64, _>("first_sequence");
+        let rows = query(
+            "SELECT id, signature, relative_path, first_sequence, last_sequence, row_count, byte_size \
+             FROM metric_segments \
+             WHERE run_id = ? AND first_sequence >= ? \
+             ORDER BY first_sequence, id LIMIT ?",
+        )
+        .bind(run_id.to_string())
+        .bind(first_sequence)
+        .bind(to_i64(max_segments as u64, "compaction segment limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut segments = Vec::with_capacity(rows.len());
+        let mut total_rows = 0usize;
+        for row in rows {
+            let segment = segment_from_row(row)?;
+            let compatible = segments.last().is_none_or(|previous: &SegmentRecord| {
+                previous.signature == segment.signature
+                    && previous.last_sequence.checked_add(1) == Some(segment.first_sequence)
+            });
+            let Some(next_total) = total_rows.checked_add(segment.row_count) else {
+                break;
+            };
+            if !compatible || next_total > target_rows {
+                break;
+            }
+            total_rows = next_total;
+            segments.push(segment);
+        }
+        if segments.len() < 2 {
+            return Err(CatalogError::InvalidData(
+                "compaction seed did not resolve to adjacent compatible segments".to_owned(),
+            ));
+        }
+        Ok(Some(CompactionCandidate {
+            project_id,
+            run_id,
+            segments,
+        }))
+    }
+
+    pub async fn replace_compacted_segments(
+        &self,
+        run_id: RunId,
+        sources: &[SegmentRecord],
+        replacement: &SegmentManifest,
+    ) -> Result<Vec<String>, CatalogError> {
+        validate_compaction_replacement(sources, replacement)?;
+        let mut transaction = self.pool.begin().await?;
+        for source in sources {
+            let row = query(
+                "SELECT id, signature, relative_path, first_sequence, last_sequence, row_count, byte_size \
+                 FROM metric_segments WHERE id = ? AND run_id = ?",
+            )
+            .bind(&source.id)
+            .bind(run_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| {
+                CatalogError::Conflict(format!(
+                    "compaction source {} is no longer active",
+                    source.id
+                ))
+            })?;
+            if segment_from_row(row)? != *source {
+                return Err(CatalogError::Conflict(format!(
+                    "compaction source {} changed before replacement",
+                    source.id
+                )));
+            }
+        }
+        for source in sources {
+            query(
+                "INSERT INTO retired_metric_segments (relative_path, retired_at) \
+                 VALUES (?, current_timestamp) ON CONFLICT(relative_path) DO NOTHING",
+            )
+            .bind(&source.relative_path)
+            .execute(&mut *transaction)
+            .await?;
+            query("DELETE FROM metric_segments WHERE id = ? AND run_id = ?")
+                .bind(&source.id)
+                .bind(run_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+        }
+        query(
+            "INSERT INTO metric_segments \
+             (id, run_id, signature, relative_path, first_sequence, last_sequence, row_count, byte_size, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)",
+        )
+        .bind(&replacement.id)
+        .bind(run_id.to_string())
+        .bind(&replacement.signature)
+        .bind(&replacement.relative_path)
+        .bind(to_i64(replacement.first_sequence, "first sequence")?)
+        .bind(to_i64(replacement.last_sequence, "last sequence")?)
+        .bind(to_i64(replacement.row_count as u64, "row count")?)
+        .bind(to_i64(replacement.byte_size, "byte size")?)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(sources
+            .iter()
+            .map(|source| source.relative_path.clone())
+            .collect())
+    }
+
+    pub async fn retired_segments(&self, limit: usize) -> Result<Vec<String>, CatalogError> {
+        let rows = query(
+            "SELECT relative_path FROM retired_metric_segments \
+             ORDER BY retired_at, relative_path LIMIT ?",
+        )
+        .bind(to_i64(limit as u64, "retired segment limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get("relative_path"))
+            .collect())
+    }
+
+    pub async fn acknowledge_retired_segments(
+        &self,
+        relative_paths: &[String],
+    ) -> Result<(), CatalogError> {
+        let mut transaction = self.pool.begin().await?;
+        for relative_path in relative_paths {
+            query("DELETE FROM retired_metric_segments WHERE relative_path = ?")
+                .bind(relative_path)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub async fn metric_extent(
@@ -730,12 +926,54 @@ fn run_from_row(row: SqliteRow) -> Result<RunRecord, CatalogError> {
 
 fn segment_from_row(row: SqliteRow) -> Result<SegmentRecord, CatalogError> {
     Ok(SegmentRecord {
+        id: row.get("id"),
+        signature: row.get("signature"),
         relative_path: row.get("relative_path"),
         first_sequence: from_i64(row.get("first_sequence"), "first sequence")?,
         last_sequence: from_i64(row.get("last_sequence"), "last sequence")?,
         row_count: usize::try_from(row.get::<i64, _>("row_count"))
             .map_err(|_| CatalogError::InvalidData("row count is out of range".to_owned()))?,
+        byte_size: from_i64(row.get("byte_size"), "byte size")?,
     })
+}
+
+fn validate_compaction_replacement(
+    sources: &[SegmentRecord],
+    replacement: &SegmentManifest,
+) -> Result<(), CatalogError> {
+    if sources.len() < 2 {
+        return Err(CatalogError::InvalidData(
+            "compaction requires at least two source segments".to_owned(),
+        ));
+    }
+    let first = &sources[0];
+    let last = &sources[sources.len() - 1];
+    let mut expected_sequence = first.first_sequence;
+    let mut row_count = 0usize;
+    for source in sources {
+        if source.signature != first.signature || source.first_sequence != expected_sequence {
+            return Err(CatalogError::InvalidData(
+                "compaction sources must be adjacent and schema-compatible".to_owned(),
+            ));
+        }
+        expected_sequence = source
+            .last_sequence
+            .checked_add(1)
+            .ok_or_else(|| CatalogError::InvalidData("run sequence overflow".to_owned()))?;
+        row_count = row_count
+            .checked_add(source.row_count)
+            .ok_or_else(|| CatalogError::InvalidData("compaction row count overflow".to_owned()))?;
+    }
+    if replacement.signature != first.signature
+        || replacement.first_sequence != first.first_sequence
+        || replacement.last_sequence != last.last_sequence
+        || replacement.row_count != row_count
+    {
+        return Err(CatalogError::InvalidData(
+            "compaction replacement does not cover its source segments exactly".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn run_location_in(
@@ -964,6 +1202,79 @@ mod tests {
         };
         let result = catalog.create_or_resume_run("robotics", &request).await;
         assert!(matches!(result, Err(CatalogError::NotFound { .. })));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compaction_replaces_manifests_and_tracks_retirement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog_path = directory.path().join("catalog.sqlite3");
+        let catalog = Catalog::open(&catalog_path).await?;
+        let (run, _) = catalog
+            .create_or_resume_run(
+                "robotics",
+                &CreateRunRequest {
+                    id: None,
+                    name: None,
+                    config: BTreeMap::new(),
+                    resume: ResumePolicy::Never,
+                },
+            )
+            .await?;
+        for batch in 0..3u64 {
+            catalog
+                .register_batch(
+                    run.id,
+                    batch,
+                    &format!("digest-{batch}"),
+                    &SegmentManifest {
+                        id: format!("segment-{batch}"),
+                        signature: "shared-schema".to_owned(),
+                        relative_path: format!("segment-{batch}.parquet"),
+                        first_sequence: batch * 2 + 1,
+                        last_sequence: batch * 2 + 2,
+                        row_count: 2,
+                        byte_size: 100,
+                    },
+                    &BTreeMap::new(),
+                )
+                .await?;
+        }
+        let revision_before = catalog.get_run(run.id).await?.metric_revision;
+        let candidate = catalog
+            .next_compaction_candidate(16, 16)
+            .await?
+            .ok_or("missing compaction candidate")?;
+        assert_eq!(candidate.run_id, run.id);
+        assert_eq!(candidate.segments.len(), 3);
+        let replacement = SegmentManifest {
+            id: "compacted".to_owned(),
+            signature: "shared-schema".to_owned(),
+            relative_path: "compacted.parquet".to_owned(),
+            first_sequence: 1,
+            last_sequence: 6,
+            row_count: 6,
+            byte_size: 180,
+        };
+        let retired = catalog
+            .replace_compacted_segments(run.id, &candidate.segments, &replacement)
+            .await?;
+
+        assert_eq!(retired.len(), 3);
+        let active = catalog.list_segments(run.id, None).await?;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "compacted");
+        assert_eq!(
+            catalog.get_run(run.id).await?.metric_revision,
+            revision_before
+        );
+        assert_eq!(catalog.retired_segments(16).await?, retired);
+        drop(catalog);
+        let catalog = Catalog::open(catalog_path).await?;
+        assert_eq!(catalog.retired_segments(16).await?, retired);
+        catalog.acknowledge_retired_segments(&retired).await?;
+        assert!(catalog.retired_segments(16).await?.is_empty());
         Ok(())
     }
 }

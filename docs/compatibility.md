@@ -68,7 +68,9 @@ nested dictionaries flattened with `/`, explicit or automatic steps, durable
 local spooling, resumable batch delivery, Parquet persistence, and bounded
 column-projected history. Dashboard queries scan only requested columns and use
 a bounded min/max representation that preserves local spikes without deleting
-raw samples. Config supports controlled shallow updates, and summaries support
+raw samples. Background compaction transparently reduces immutable segment
+counts without changing logical revisions or history results. Config supports
+controlled shallow updates, and summaries support
 bounded JSON strings, booleans, nulls, arrays, nested objects, and explicit
 overrides. Strings in metric history, media, tables, and histograms remain
 unsupported and fail explicitly.

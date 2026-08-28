@@ -2,9 +2,10 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use runloom_catalog::Catalog;
-use runloom_server::app;
+use runloom_server::{CompactionConfig, MetricRuntime, app_with_runtime, run_compaction_worker};
 use runloom_storage::{MetricStore, StorageLayout};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -28,12 +29,29 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind Runloom server to {address}"))?;
 
+    let metrics = MetricRuntime::new(MetricStore::new(layout.metrics_dir()));
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let compaction_task = tokio::spawn(run_compaction_worker(
+        catalog.clone(),
+        metrics.clone(),
+        shutdown_receiver,
+        CompactionConfig::default(),
+    ));
+    let signal_sender = shutdown_sender.clone();
+
     info!(%address, "Runloom server listening");
-    let metric_store = MetricStore::new(layout.metrics_dir());
-    axum::serve(listener, app(catalog, metric_store))
-        .with_graceful_shutdown(shutdown_signal())
+    let serve_result = axum::serve(listener, app_with_runtime(catalog, metrics))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = signal_sender.send(true);
+        })
         .await
-        .context("Runloom server failed")?;
+        .context("Runloom server failed");
+    let _ = shutdown_sender.send(true);
+    compaction_task
+        .await
+        .context("metric compaction task failed")?;
+    serve_result?;
     Ok(())
 }
 

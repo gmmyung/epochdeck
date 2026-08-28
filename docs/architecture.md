@@ -61,8 +61,17 @@ acknowledgement.
 
 Parquet provides typed values, compression, column projection, row-group
 statistics, immutable snapshot-friendly files, and one metric name per column
-rather than per row. Small segments are compacted in the background under
-strict I/O and CPU budgets.
+rather than per row. One background worker compacts adjacent, schema-compatible
+segments in bounded streaming passes. The default pass merges at most 16 files
+and 16,384 rows; hard limits prevent configuration from making a pass unbounded.
+
+Compaction installs a new immutable file before atomically swapping catalog
+manifests. History queries hold a shared snapshot guard from manifest lookup
+through file reads, while only the short swap and retirement phase takes the
+exclusive guard. Replaced paths remain in a durable SQLite retirement table
+until filesystem deletion succeeds, so cleanup resumes safely after a crash.
+Logical metric revisions do not change because compaction preserves every raw
+sample. See [ADR 0002](adr/0002-bounded-metric-compaction.md).
 
 ### Query engine
 

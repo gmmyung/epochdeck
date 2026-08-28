@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -43,6 +43,8 @@ pub enum StorageError {
     Parquet(#[from] parquet::errors::ParquetError),
     #[error("invalid metric segment: {0}")]
     InvalidSegment(String),
+    #[error("metric compaction was cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +136,14 @@ pub struct WrittenSegment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentSource {
     pub relative_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionSource {
+    pub relative_path: String,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub row_count: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -387,16 +397,11 @@ impl MetricStore {
             .flat_map(|point| point.metrics.keys().cloned())
             .collect();
         let signature = schema_signature(&metric_keys);
-        let relative_path = PathBuf::from("projects")
-            .join(project_id.to_string())
-            .join("runs")
-            .join(run_id.to_string())
-            .join("segments")
-            .join(format!(
-                "{:020}-{}.parquet",
-                request.batch_sequence,
-                &digest[..16]
-            ));
+        let relative_path = segment_directory(project_id, run_id).join(format!(
+            "{:020}-{}.parquet",
+            request.batch_sequence,
+            &digest[..16]
+        ));
         let final_path = self.root.join(&relative_path);
         let parent = final_path
             .parent()
@@ -408,16 +413,8 @@ impl MetricStore {
 
         if !final_path.exists() {
             let temporary_path = temporary_path(&final_path)?;
-            let result = write_parquet(&temporary_path, request, &metric_keys).and_then(|()| {
-                match std::fs::rename(&temporary_path, &final_path) {
-                    Ok(()) => Ok(()),
-                    Err(_) if final_path.exists() => Ok(()),
-                    Err(source) => Err(StorageError::Io {
-                        path: final_path.clone(),
-                        source,
-                    }),
-                }
-            });
+            let result = write_parquet(&temporary_path, request, &metric_keys)
+                .and_then(|()| install_file(&temporary_path, &final_path));
             let _ = std::fs::remove_file(&temporary_path);
             result?;
         }
@@ -493,6 +490,82 @@ impl MetricStore {
         Ok(sampler.finish())
     }
 
+    pub fn compact_segments(
+        &self,
+        project_id: ProjectId,
+        run_id: RunId,
+        signature: &str,
+        sources: &[CompactionSource],
+        cancelled: &AtomicBool,
+    ) -> Result<WrittenSegment, StorageError> {
+        validate_compaction_sources(sources)?;
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(StorageError::Cancelled);
+        }
+        let first_sequence = sources[0].first_sequence;
+        let last_sequence = sources[sources.len() - 1].last_sequence;
+        let row_count = sources.iter().try_fold(0usize, |total, source| {
+            total.checked_add(source.row_count).ok_or_else(|| {
+                StorageError::InvalidSegment("compaction row count overflow".to_owned())
+            })
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(signature.as_bytes());
+        for source in sources {
+            hasher.update(source.relative_path.as_bytes());
+            hasher.update([0]);
+        }
+        let digest = hex_digest(hasher.finalize().as_slice());
+        let relative_path = segment_directory(project_id, run_id).join(format!(
+            "compact-{first_sequence:020}-{last_sequence:020}-{}.parquet",
+            &digest[..16]
+        ));
+        let final_path = self.root.join(&relative_path);
+        let parent = final_path
+            .parent()
+            .ok_or_else(|| StorageError::InvalidSegment("segment path has no parent".to_owned()))?;
+        std::fs::create_dir_all(parent).map_err(|source| StorageError::CreateDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+
+        if !final_path.exists() {
+            let temporary_path = temporary_path(&final_path)?;
+            let result = write_compacted_parquet(
+                self,
+                &temporary_path,
+                sources,
+                first_sequence,
+                last_sequence,
+                row_count,
+                cancelled,
+            )
+            .and_then(|()| install_file(&temporary_path, &final_path));
+            let _ = std::fs::remove_file(&temporary_path);
+            result?;
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(StorageError::Cancelled);
+        }
+        sync_path(&final_path)?;
+        sync_path(parent)?;
+        let byte_size = std::fs::metadata(&final_path)
+            .map_err(|source| StorageError::Io {
+                path: final_path.clone(),
+                source,
+            })?
+            .len();
+        Ok(WrittenSegment {
+            id: format!("{run_id}:compact:{first_sequence}:{last_sequence}:{digest}"),
+            signature: signature.to_owned(),
+            relative_path: relative_path.to_string_lossy().into_owned(),
+            first_sequence,
+            last_sequence,
+            row_count,
+            byte_size,
+        })
+    }
+
     pub fn remove_segment(&self, relative_path: &str) -> Result<(), StorageError> {
         let path = self.resolve_segment(relative_path)?;
         match std::fs::remove_file(&path) {
@@ -555,9 +628,7 @@ fn write_parquet(
         )) as ArrayRef
     }));
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
-    let properties = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .build();
+    let properties = writer_properties();
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -575,6 +646,138 @@ fn write_parquet(
             path: path.to_path_buf(),
             source,
         })
+}
+
+fn write_compacted_parquet(
+    store: &MetricStore,
+    path: &Path,
+    sources: &[CompactionSource],
+    first_sequence: u64,
+    last_sequence: u64,
+    expected_rows: usize,
+    cancelled: &AtomicBool,
+) -> Result<(), StorageError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| StorageError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut writer: Option<ArrowWriter<File>> = None;
+    let mut expected_schema: Option<Arc<Schema>> = None;
+    let mut observed_rows = 0usize;
+    let mut previous_sequence = None;
+    for source in sources {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(StorageError::Cancelled);
+        }
+        let source_path = store.resolve_segment(&source.relative_path)?;
+        let source_file = File::open(&source_path).map_err(|source| StorageError::Io {
+            path: source_path.clone(),
+            source,
+        })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(source_file)?;
+        let schema = Arc::clone(builder.schema());
+        if let Some(expected) = &expected_schema {
+            if expected.as_ref() != schema.as_ref() {
+                return Err(StorageError::InvalidSegment(
+                    "compaction sources have different Arrow schemas".to_owned(),
+                ));
+            }
+        } else {
+            writer = Some(ArrowWriter::try_new(
+                file.try_clone().map_err(|source| StorageError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?,
+                Arc::clone(&schema),
+                Some(writer_properties()),
+            )?);
+            expected_schema = Some(Arc::clone(&schema));
+        }
+        let reader = builder.with_batch_size(PARQUET_BATCH_SIZE).build()?;
+        for batch in reader {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(StorageError::Cancelled);
+            }
+            let batch = batch?;
+            let sequence = required_array::<UInt64Array>(&batch, SEQUENCE_COLUMN)?;
+            for row_index in 0..batch.num_rows() {
+                let current = sequence.value(row_index);
+                let expected = previous_sequence
+                    .and_then(|previous: u64| previous.checked_add(1))
+                    .unwrap_or(first_sequence);
+                if current != expected {
+                    return Err(StorageError::InvalidSegment(format!(
+                        "compaction sequence {current} followed {previous_sequence:?}"
+                    )));
+                }
+                previous_sequence = Some(current);
+            }
+            observed_rows = observed_rows.checked_add(batch.num_rows()).ok_or_else(|| {
+                StorageError::InvalidSegment("compaction row count overflow".to_owned())
+            })?;
+            writer
+                .as_mut()
+                .ok_or_else(|| {
+                    StorageError::InvalidSegment("compaction has no output writer".to_owned())
+                })?
+                .write(&batch)?;
+        }
+    }
+    if observed_rows != expected_rows || previous_sequence != Some(last_sequence) {
+        return Err(StorageError::InvalidSegment(format!(
+            "compaction observed {observed_rows} rows ending at {previous_sequence:?}; expected {expected_rows} rows ending at {last_sequence}"
+        )));
+    }
+    writer
+        .ok_or_else(|| StorageError::InvalidSegment("compaction has no sources".to_owned()))?
+        .close()?;
+    file.sync_all().map_err(|source| StorageError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn validate_compaction_sources(sources: &[CompactionSource]) -> Result<(), StorageError> {
+    if sources.len() < 2 {
+        return Err(StorageError::InvalidSegment(
+            "compaction requires at least two source segments".to_owned(),
+        ));
+    }
+    let mut next_sequence = sources[0].first_sequence;
+    for source in sources {
+        if source.row_count == 0 || source.first_sequence != next_sequence {
+            return Err(StorageError::InvalidSegment(
+                "compaction sources must be non-empty and adjacent".to_owned(),
+            ));
+        }
+        next_sequence = source
+            .last_sequence
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidSegment("run sequence overflow".to_owned()))?;
+    }
+    Ok(())
+}
+
+fn writer_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_max_row_group_row_count(Some(8 * PARQUET_BATCH_SIZE))
+        .build()
+}
+
+fn install_file(temporary_path: &Path, final_path: &Path) -> Result<(), StorageError> {
+    match std::fs::rename(temporary_path, final_path) {
+        Ok(()) => Ok(()),
+        Err(_) if final_path.exists() => Ok(()),
+        Err(source) => Err(StorageError::Io {
+            path: final_path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn sync_path(path: &Path) -> Result<(), StorageError> {
@@ -722,6 +925,14 @@ fn schema_signature(metric_keys: &BTreeSet<String>) -> String {
     hex_digest(hasher.finalize().as_slice())
 }
 
+fn segment_directory(project_id: ProjectId, run_id: RunId) -> PathBuf {
+    PathBuf::from("projects")
+        .join(project_id.to_string())
+        .join("runs")
+        .join(run_id.to_string())
+        .join("segments")
+}
+
 fn metric_column(key: &str) -> String {
     format!("{METRIC_PREFIX}{key}")
 }
@@ -759,11 +970,14 @@ fn environment_path(name: &str, default: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicBool;
 
     use runloom_protocol::{IngestBatchRequest, MetricPoint, ProjectId, RunId};
     use tempfile::tempdir;
 
-    use super::{MetricStore, MinMaxHistorySampler, SegmentSource, StorageLayout};
+    use super::{
+        CompactionSource, MetricStore, MinMaxHistorySampler, SegmentSource, StorageLayout,
+    };
 
     #[test]
     fn creates_independent_storage_roots() -> Result<(), Box<dyn std::error::Error>> {
@@ -878,6 +1092,103 @@ mod tests {
         assert_eq!(history.source_points, Some(12));
         assert!(history.sampled);
         assert_eq!(history.next_after, None);
+        Ok(())
+    }
+
+    #[test]
+    fn compacts_adjacent_segments_without_changing_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let store = MetricStore::new(directory.path());
+        let project_id = ProjectId::new();
+        let run_id = RunId::new();
+        let mut written = Vec::new();
+        for batch_sequence in 0..3u64 {
+            let first_sequence = batch_sequence * 2 + 1;
+            let request = IngestBatchRequest {
+                batch_sequence,
+                points: (0..2)
+                    .map(|offset| {
+                        let sequence = first_sequence + offset;
+                        MetricPoint {
+                            sequence,
+                            step: sequence - 1,
+                            timestamp_ms: sequence as i64 * 10,
+                            metrics: BTreeMap::from([
+                                ("loss".to_owned(), 10.0 - sequence as f64),
+                                ("reward".to_owned(), sequence as f64),
+                            ]),
+                        }
+                    })
+                    .collect(),
+            };
+            written.push(store.write_batch(
+                project_id,
+                run_id,
+                &format!("{batch_sequence:064x}"),
+                &request,
+            )?);
+        }
+        let sources = written
+            .iter()
+            .map(|segment| CompactionSource {
+                relative_path: segment.relative_path.clone(),
+                first_sequence: segment.first_sequence,
+                last_sequence: segment.last_sequence,
+                row_count: segment.row_count,
+            })
+            .collect::<Vec<_>>();
+        let compacted = store.compact_segments(
+            project_id,
+            run_id,
+            &written[0].signature,
+            &sources,
+            &AtomicBool::new(false),
+        )?;
+        let replayed = store.compact_segments(
+            project_id,
+            run_id,
+            &written[0].signature,
+            &sources,
+            &AtomicBool::new(false),
+        )?;
+        let history = store.read_history(
+            run_id,
+            &[SegmentSource {
+                relative_path: compacted.relative_path.clone(),
+            }],
+            &["loss".to_owned(), "reward".to_owned()],
+            None,
+            10,
+        )?;
+        let page = store.read_history(
+            run_id,
+            &[SegmentSource {
+                relative_path: compacted.relative_path.clone(),
+            }],
+            &["loss".to_owned()],
+            Some(3),
+            2,
+        )?;
+
+        assert_eq!(compacted.first_sequence, 1);
+        assert_eq!(compacted.last_sequence, 6);
+        assert_eq!(compacted.row_count, 6);
+        assert_eq!(replayed, compacted);
+        assert_eq!(history.sequence, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(page.sequence, vec![4, 5]);
+        assert_eq!(page.next_after, Some(5));
+        assert_eq!(
+            history.metrics["reward"],
+            vec![
+                Some(1.0),
+                Some(2.0),
+                Some(3.0),
+                Some(4.0),
+                Some(5.0),
+                Some(6.0)
+            ]
+        );
         Ok(())
     }
 

@@ -1,5 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod compaction;
+
+pub use compaction::{CompactionConfig, MetricRuntime, run_compaction_worker};
+#[cfg(test)]
+use compaction::{CompactionOutcome, compact_once};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -37,12 +43,16 @@ const MAX_LIST_ITEMS: usize = 200;
 #[derive(Debug, Clone)]
 struct AppState {
     catalog: Catalog,
-    metrics: MetricStore,
+    metrics: MetricRuntime,
     ingest_permits: Arc<Semaphore>,
     query_permits: Arc<Semaphore>,
 }
 
 pub fn app(catalog: Catalog, metrics: MetricStore) -> Router {
+    app_with_runtime(catalog, MetricRuntime::new(metrics))
+}
+
+pub fn app_with_runtime(catalog: Catalog, metrics: MetricRuntime) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/projects", get(list_projects))
@@ -202,7 +212,7 @@ async fn ingest_batch(
     let summary = latest_metrics(&request);
     let batch_sequence = request.batch_sequence;
     let accepted_points = request.points.len();
-    let metrics = state.metrics.clone();
+    let metrics = state.metrics.store().clone();
     let digest_for_write = digest.clone();
     let _permit = Arc::clone(&state.ingest_permits)
         .acquire_owned()
@@ -235,7 +245,11 @@ async fn ingest_batch(
             (StatusCode::OK, true, metric_revision)
         }
         Err(error) => {
-            if let Err(cleanup_error) = state.metrics.remove_segment(&manifest.relative_path) {
+            if let Err(cleanup_error) = state
+                .metrics
+                .store()
+                .remove_segment(&manifest.relative_path)
+            {
                 tracing::error!(%cleanup_error, "failed to clean up unregistered metric segment");
             }
             return Err(error.into());
@@ -295,6 +309,7 @@ async fn history(
             "history limit must be between 1 and {MAX_HISTORY_POINTS}"
         )));
     }
+    let _snapshot = state.metrics.read_snapshot().await;
     let segments = state
         .catalog
         .list_segments(run_id, query.after)
@@ -305,7 +320,7 @@ async fn history(
         })
         .collect::<Vec<_>>();
     let segment_page_full = segments.len() == MAX_SEGMENTS_PER_QUERY;
-    let metrics = state.metrics.clone();
+    let metrics = state.metrics.store().clone();
     let after = query.after;
     let _permit = Arc::clone(&state.query_permits)
         .acquire_owned()
@@ -329,6 +344,7 @@ async fn sampled_history(
     after: Option<u64>,
     max_points: usize,
 ) -> Result<HistoryResponse, HttpError> {
+    let _snapshot = state.metrics.read_snapshot().await;
     let Some(extent) = state.catalog.metric_extent(run_id, after).await? else {
         return Ok(HistoryResponse {
             run_id,
@@ -365,7 +381,7 @@ async fn sampled_history(
                 relative_path: segment.relative_path,
             })
             .collect::<Vec<_>>();
-        let metrics = state.metrics.clone();
+        let metrics = state.metrics.store().clone();
         sampler =
             tokio::task::spawn_blocking(move || -> Result<MinMaxHistorySampler, StorageError> {
                 sampler.read_segments(&metrics, &segments)?;
@@ -608,6 +624,9 @@ impl From<StorageError> for HttpError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -622,7 +641,9 @@ mod tests {
     use tempfile::tempdir;
     use tower::ServiceExt;
 
-    use super::app;
+    use super::{
+        CompactionConfig, CompactionOutcome, MetricRuntime, app, app_with_runtime, compact_once,
+    };
 
     #[tokio::test]
     async fn health_checks_the_catalog() -> Result<(), Box<dyn std::error::Error>> {
@@ -874,6 +895,108 @@ mod tests {
             )?)
             .await?;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn background_compaction_preserves_http_history() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let metrics_root = directory.path().join("metrics");
+        let metrics = MetricRuntime::new(MetricStore::new(&metrics_root));
+        let router = app_with_runtime(catalog.clone(), metrics.clone());
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/v1/projects/robotics/runs",
+                &CreateRunRequest {
+                    id: None,
+                    name: Some("compact-me".to_owned()),
+                    config: BTreeMap::new(),
+                    resume: ResumePolicy::Never,
+                },
+            )?)
+            .await?;
+        let created: CreateRunResponse = response_json(response).await?;
+        let batch_path = format!("/api/v1/runs/{}/batches", created.run.id);
+        for batch_index in 0..3u64 {
+            let first_sequence = batch_index * 2 + 1;
+            let batch = IngestBatchRequest {
+                batch_sequence: first_sequence,
+                points: (0..2)
+                    .map(|offset| {
+                        let sequence = first_sequence + offset;
+                        MetricPoint {
+                            sequence,
+                            step: sequence - 1,
+                            timestamp_ms: sequence as i64 * 10,
+                            metrics: BTreeMap::from([("loss".to_owned(), sequence as f64)]),
+                        }
+                    })
+                    .collect(),
+            };
+            let response = router
+                .clone()
+                .oneshot(json_request("POST", &batch_path, &batch)?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+        let history_path = format!("/api/v1/runs/{}/history?keys=loss&limit=10", created.run.id);
+        let before: HistoryResponse = response_json(
+            router
+                .clone()
+                .oneshot(Request::get(&history_path).body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+        let sources = catalog.list_segments(created.run.id, None).await?;
+        let snapshot = metrics.read_snapshot().await;
+        let task_catalog = catalog.clone();
+        let task_metrics = metrics.clone();
+        let mut compaction = tokio::spawn(async move {
+            compact_once(
+                &task_catalog,
+                &task_metrics,
+                CompactionConfig {
+                    interval: Duration::from_secs(1),
+                    target_rows: 16,
+                    max_input_segments: 16,
+                    retirement_batch: 16,
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut compaction)
+                .await
+                .is_err(),
+            "manifest replacement must wait for active history snapshots"
+        );
+        assert_eq!(catalog.list_segments(created.run.id, None).await?.len(), 3);
+        drop(snapshot);
+        let outcome = compaction.await??;
+        let after: HistoryResponse = response_json(
+            router
+                .oneshot(Request::get(&history_path).body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+
+        assert_eq!(
+            outcome,
+            CompactionOutcome::SegmentsCompacted { inputs: 3, rows: 6 }
+        );
+        assert_eq!(after, before);
+        assert_eq!(catalog.list_segments(created.run.id, None).await?.len(), 1);
+        assert!(catalog.retired_segments(16).await?.is_empty());
+        assert!(
+            sources
+                .iter()
+                .all(|source| !metrics_root.join(&source.relative_path).exists())
+        );
         Ok(())
     }
 
