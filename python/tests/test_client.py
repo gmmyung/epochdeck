@@ -143,3 +143,24 @@ def test_traces_use_create_and_search_contracts() -> None:
         "q": "assistant reward",
         "before": span["id"],
     }
+
+
+def test_public_run_query_uses_a_structured_filter_body() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"runs": [], "next_before": None})
+
+    query = {
+        "project": "robotics",
+        "state": "finished",
+        "config_equals": {"seed": 7},
+        "summary_equals": {"result": "complete"},
+        "limit": 50,
+    }
+    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+        client.query_runs(query)
+
+    assert requests[0].url.path == "/api/v1/query/runs"
+    assert json.loads(requests[0].read()) == query

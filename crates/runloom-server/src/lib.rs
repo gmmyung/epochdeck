@@ -31,8 +31,8 @@ use runloom_protocol::{
     MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES,
     MAX_TRACE_METADATA_BYTES, MetricKeyListResponse, ProjectListResponse, ResumePolicy,
     RichValueId, RichValueKind, RichValueListResponse, RunArtifactListResponse, RunId,
-    RunListResponse, RunRecord, RunState, RunUpdateResponse, SummaryUpdateRequest, TraceSpanId,
-    TraceSpanListResponse, UseArtifactRequest,
+    RunListResponse, RunQueryRequest, RunQueryResponse, RunRecord, RunState, RunUpdateResponse,
+    SummaryUpdateRequest, TraceSpanId, TraceSpanListResponse, UseArtifactRequest,
 };
 use runloom_storage::{
     BlobStore, MetricStore, MinMaxHistorySampler, SegmentSource, SegmentTail, StorageError,
@@ -104,6 +104,7 @@ pub fn app_with_runtime_and_blobs(
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/projects", get(list_projects))
+        .route("/api/v1/query/runs", post(query_runs))
         .route(
             "/api/v1/projects/{project}/runs",
             post(create_run).get(list_runs),
@@ -187,6 +188,20 @@ async fn list_runs(
     validate_list_limit(query.limit)?;
     let runs = state.catalog.list_runs(&project, query.limit).await?;
     Ok(Json(RunListResponse { runs }))
+}
+
+async fn query_runs(
+    State(state): State<AppState>,
+    Json(request): Json<RunQueryRequest>,
+) -> Result<Json<RunQueryResponse>, HttpError> {
+    validate_run_query(&request)?;
+    let runs = state.catalog.query_runs(&request).await?;
+    let next_before = if runs.len() == request.limit {
+        runs.last().map(|run| run.id)
+    } else {
+        None
+    };
+    Ok(Json(RunQueryResponse { runs, next_before }))
 }
 
 async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
@@ -1367,6 +1382,52 @@ fn validate_list_limit(limit: usize) -> Result<(), HttpError> {
     Ok(())
 }
 
+fn validate_run_query(request: &RunQueryRequest) -> Result<(), HttpError> {
+    validate_list_limit(request.limit)?;
+    if let Some(project) = &request.project {
+        validate_project_name(project)?;
+    }
+    for (value, name, maximum) in [
+        (request.name.as_deref(), "run name", MAX_RUN_NAME_BYTES),
+        (
+            request.name_contains.as_deref(),
+            "run name search",
+            MAX_RUN_NAME_BYTES,
+        ),
+    ] {
+        if value.is_some_and(|value| {
+            value.is_empty() || value.len() > maximum || value.chars().any(char::is_control)
+        }) {
+            return Err(HttpError::invalid(format!(
+                "{name} must contain 1 to {maximum} non-control bytes"
+            )));
+        }
+    }
+    if request.config_equals.len() > 32 || request.summary_equals.len() > 32 {
+        return Err(HttpError::invalid(
+            "run queries cannot contain more than 32 config or summary filters",
+        ));
+    }
+    for key in request
+        .config_equals
+        .keys()
+        .chain(request.summary_equals.keys())
+    {
+        if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
+            return Err(HttpError::invalid(
+                "run query document keys must contain 1 to 256 non-control bytes",
+            ));
+        }
+    }
+    validate_document_size(&request.config_equals, "config filters", MAX_CONFIG_BYTES)?;
+    validate_document_size(
+        &request.summary_equals,
+        "summary filters",
+        MAX_SUMMARY_BYTES,
+    )?;
+    Ok(())
+}
+
 fn batch_digest(request: &IngestBatchRequest) -> Result<String, HttpError> {
     let encoded = serde_json::to_vec(request)
         .map_err(|error| HttpError::invalid(format!("batch is not serializable: {error}")))?;
@@ -1474,9 +1535,9 @@ mod tests {
         CreateTraceSpanResponse, FinishRunRequest, FinishRunResponse, HealthResponse, HealthStatus,
         HistoryResponse, IngestBatchRequest, IngestBatchResponse, MetricKeyListResponse,
         MetricPoint, ProjectListResponse, ResumePolicy, RichValueId, RichValueKind,
-        RichValueListResponse, RunArtifactListResponse, RunListResponse, RunUpdateResponse,
-        SummaryUpdateRequest, TraceKind, TraceSpanId, TraceSpanListResponse, TraceSpanRecord,
-        TraceStatus, UseArtifactRequest,
+        RichValueListResponse, RunArtifactListResponse, RunListResponse, RunQueryRequest,
+        RunQueryResponse, RunState, RunUpdateResponse, SummaryUpdateRequest, TraceKind,
+        TraceSpanId, TraceSpanListResponse, TraceSpanRecord, TraceStatus, UseArtifactRequest,
     };
     use runloom_storage::MetricStore;
     use sha2::{Digest, Sha256};
@@ -1499,6 +1560,115 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await?;
         let health: HealthResponse = serde_json::from_slice(&body)?;
         assert_eq!(health.status, HealthStatus::Healthy);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_run_query_filters_documents_and_paginates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let mut created_ids = Vec::new();
+        for (name, seed) in [("alpha", 1), ("beta", 2), ("beta-eval", 2)] {
+            let created: CreateRunResponse = response_json(
+                router
+                    .clone()
+                    .oneshot(json_request(
+                        "POST",
+                        "/api/v1/projects/query-demo/runs",
+                        &CreateRunRequest {
+                            id: None,
+                            name: Some(name.to_owned()),
+                            config: BTreeMap::from([
+                                ("seed".to_owned(), seed.into()),
+                                ("nullable".to_owned(), serde_json::Value::Null),
+                            ]),
+                            resume: ResumePolicy::Never,
+                        },
+                    )?)
+                    .await?,
+            )
+            .await?;
+            created_ids.push(created.run.id);
+        }
+
+        let filtered: RunQueryResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/query/runs",
+                    &RunQueryRequest {
+                        project: Some("query-demo".to_owned()),
+                        state: Some(RunState::Running),
+                        name: None,
+                        name_contains: Some("beta".to_owned()),
+                        config_equals: BTreeMap::from([
+                            ("seed".to_owned(), 2.into()),
+                            ("nullable".to_owned(), serde_json::Value::Null),
+                        ]),
+                        summary_equals: BTreeMap::new(),
+                        before: None,
+                        limit: 10,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(filtered.runs.len(), 2);
+        assert!(filtered.runs.iter().all(|run| run.name.contains("beta")));
+
+        let first_page: RunQueryResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/query/runs",
+                    &RunQueryRequest {
+                        project: Some("query-demo".to_owned()),
+                        state: None,
+                        name: None,
+                        name_contains: None,
+                        config_equals: BTreeMap::new(),
+                        summary_equals: BTreeMap::new(),
+                        before: None,
+                        limit: 2,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(first_page.runs.len(), 2);
+        let cursor = first_page.next_before.expect("a full page has a cursor");
+        let second_page: RunQueryResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/query/runs",
+                    &RunQueryRequest {
+                        project: Some("query-demo".to_owned()),
+                        state: None,
+                        name: None,
+                        name_contains: None,
+                        config_equals: BTreeMap::new(),
+                        summary_equals: BTreeMap::new(),
+                        before: Some(cursor),
+                        limit: 2,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(second_page.runs.len(), 1);
+        assert!(
+            first_page
+                .runs
+                .iter()
+                .all(|run| !second_page.runs.iter().any(|other| other.id == run.id))
+        );
+        assert_eq!(created_ids.len(), 3);
         Ok(())
     }
 

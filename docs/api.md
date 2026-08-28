@@ -119,7 +119,15 @@ are idempotent, and reusing an ID with different contents returns a conflict.
 
 - `GET /projects?limit=100` returns bounded project summaries.
 - `GET /projects/{project}/runs?limit=100` returns bounded run records.
+- `POST /query/runs` returns a bounded, cursor-paginated run query.
 - `GET /health` checks the service and SQLite catalog.
+
+Run query bodies accept optional `project`, `state`, exact `name`, literal
+`name_contains`, top-level `config_equals` and `summary_equals` JSON maps,
+`before`, and `limit`. Document values use typed JSON equality, including null;
+they are not stringified comparisons. Responses return `next_before` when a
+full page may have a continuation. The current pre-alpha query contract rejects
+unimplemented comparison operators and alternate sort orders explicitly.
 
 Authentication and stable external deployment guarantees are not implemented
 yet. Keep the current server on a trusted interface or Tailnet.

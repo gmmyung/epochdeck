@@ -88,3 +88,22 @@ Kinds are `span`, `llm`, `tool`, `chain`, and `agent`. A context manager marks a
 successful span `ok` or captures an escaping exception as `error`. Inputs,
 outputs, and messages must be JSON-compatible; complete payloads are stored in
 the blob spool while bounded previews remain searchable.
+
+The public read API performs server-side filtering and lazy cursor pagination:
+
+```python
+with wandb.Api() as api:
+    runs = api.runs(
+        "demo",
+        filters={"state": "finished", "config.seed": 7},
+        per_page=100,
+    )
+    for stored_run in runs:
+        rows = stored_run.scan_history(keys=["loss"], page_size=1_000)
+        for row in rows:
+            print(row)
+```
+
+Supported filters are project, state, exact name, literal name substring, and
+typed equality on top-level `config.*` or `summary.*` keys. Unsupported
+operators and sort orders fail explicitly.

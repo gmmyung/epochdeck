@@ -3,6 +3,7 @@ from typing import Any
 from runloom.api import alert, current_run, finish, init, log, log_artifact, trace, use_artifact
 from runloom.artifact import Artifact
 from runloom.client import Health, RunloomApiError, RunloomClient
+from runloom.public_api import Api
 from runloom.rich import Audio, Histogram, Image, Table, Video
 from runloom.run import DeliveryError, Run, RunConfig, RunSummary, sync_spool
 from runloom.trace import Trace
@@ -10,6 +11,7 @@ from runloom.trace import Trace
 run: Run | None = current_run()
 
 __all__ = [
+    "Api",
     "Artifact",
     "Audio",
     "DeliveryError",

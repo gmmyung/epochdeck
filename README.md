@@ -149,6 +149,24 @@ Trace IDs and parent span IDs preserve call trees. Complete JSON inputs,
 outputs, and messages use content-addressed blob storage; SQLite indexes only
 bounded metadata and previews for responsive dashboard search.
 
+Query runs without loading an entire project:
+
+```python
+api = wandb.Api(server_url="http://127.0.0.1:8787")
+runs = api.runs(
+    "bello-mujoco",
+    filters={"state": "finished", "config.seed": 42, "summary.result": "complete"},
+    per_page=100,
+)
+for stored_run in runs:  # cursor pages are fetched lazily
+    for row in stored_run.scan_history(keys=["train/loss"], page_size=1_000):
+        consume(row)
+api.close()
+```
+
+The matching CLI commands are `runloom projects`, `runloom runs`, `runloom get`,
+and `runloom history`. All list and history operations require bounded pages.
+
 ## Repository layout
 
 ```text

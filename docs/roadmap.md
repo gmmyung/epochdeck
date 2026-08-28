@@ -44,7 +44,7 @@ not a reduction in the final parity goal.
 
 ## Milestone 4: APIs and automation
 
-- Public query API and filtering.
+- [x] Public query API and filtering.
 - Sweeps, agents, scheduling, and early termination.
 - Persisted reports and dashboard layouts.
 - Resumable W&B importer and lossless Runloom export.

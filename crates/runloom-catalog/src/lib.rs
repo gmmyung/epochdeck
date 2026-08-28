@@ -8,12 +8,12 @@ use runloom_protocol::{
     AlertId, AlertLevel, AlertRecord, ArtifactEntry, ArtifactId, ArtifactRecord, ArtifactRelation,
     BlobRef, CreateAlertRequest, CreateArtifactRequest, CreateRichValueRequest, CreateRunRequest,
     CreateTraceSpanRequest, MAX_CONFIG_BYTES, MAX_SUMMARY_BYTES, ProjectId, ProjectSummary,
-    ResumePolicy, RichValueId, RichValueKind, RichValueRecord, RunArtifactRecord, RunId, RunRecord,
-    RunState, TraceKind, TraceSpanId, TraceSpanRecord, TraceStatus,
+    ResumePolicy, RichValueId, RichValueKind, RichValueRecord, RunArtifactRecord, RunId,
+    RunQueryRequest, RunRecord, RunState, TraceKind, TraceSpanId, TraceSpanRecord, TraceStatus,
 };
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
-use sqlx::{Row, Sqlite, SqlitePool, Transaction, query};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction, query};
 use thiserror::Error;
 
 pub const MAX_SEGMENTS_PER_QUERY: usize = 256;
@@ -366,6 +366,72 @@ impl Catalog {
         .bind(to_i64(limit as u64, "run limit")?)
         .fetch_all(&self.pool)
         .await?;
+        rows.into_iter().map(run_from_row).collect()
+    }
+
+    pub async fn query_runs(
+        &self,
+        request: &RunQueryRequest,
+    ) -> Result<Vec<RunRecord>, CatalogError> {
+        let cursor = if let Some(before) = request.before {
+            Some(
+                query("SELECT created_at, id FROM runs WHERE id = ?")
+                    .bind(before.to_string())
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound {
+                        resource: format!("run query cursor {before}"),
+                    })?,
+            )
+        } else {
+            None
+        };
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT r.id, r.project_id, p.name AS project, r.name, r.state, \
+                    r.created_at, r.updated_at, d.config_json, d.summary_json, d.finished_at, \
+                    v.metric_revision \
+             FROM runs r \
+             JOIN projects p ON p.id = r.project_id \
+             JOIN run_documents d ON d.run_id = r.id \
+             JOIN run_revisions v ON v.run_id = r.id WHERE 1 = 1",
+        );
+        if let Some(project) = &request.project {
+            query.push(" AND p.name = ").push_bind(project);
+        }
+        if let Some(state) = request.state {
+            query.push(" AND r.state = ").push_bind(state.to_string());
+        }
+        if let Some(name) = &request.name {
+            query.push(" AND r.name = ").push_bind(name);
+        }
+        if let Some(name) = &request.name_contains {
+            query
+                .push(" AND instr(r.name, ")
+                .push_bind(name)
+                .push(") > 0");
+        }
+        for (key, value) in &request.config_equals {
+            push_json_equality(&mut query, "d.config_json", key, value)?;
+        }
+        for (key, value) in &request.summary_equals {
+            push_json_equality(&mut query, "d.summary_json", key, value)?;
+        }
+        if let Some(cursor) = cursor {
+            let created_at: String = cursor.get("created_at");
+            let id: String = cursor.get("id");
+            query
+                .push(" AND (r.created_at < ")
+                .push_bind(created_at.clone())
+                .push(" OR (r.created_at = ")
+                .push_bind(created_at)
+                .push(" AND r.id < ")
+                .push_bind(id)
+                .push("))");
+        }
+        query
+            .push(" ORDER BY r.created_at DESC, r.id DESC LIMIT ")
+            .push_bind(to_i64(request.limit as u64, "run query limit")?);
+        let rows = query.build().fetch_all(&self.pool).await?;
         rows.into_iter().map(run_from_row).collect()
     }
 
@@ -1879,6 +1945,26 @@ fn trace_match_query(value: &str) -> String {
         .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" AND ")
+}
+
+fn push_json_equality<'args>(
+    query: &mut QueryBuilder<'args, Sqlite>,
+    column: &str,
+    key: &str,
+    value: &Value,
+) -> Result<(), CatalogError> {
+    let path = format!("$.\"{}\"", key.replace('"', "\\\""));
+    let encoded = serde_json::to_string(value)
+        .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+    query
+        .push(" AND json_extract(")
+        .push(column)
+        .push(", ")
+        .push_bind(path)
+        .push(") IS json_extract(")
+        .push_bind(encoded)
+        .push(", '$')");
+    Ok(())
 }
 
 fn segment_from_row(row: SqliteRow) -> Result<SegmentRecord, CatalogError> {

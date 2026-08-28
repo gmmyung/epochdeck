@@ -379,6 +379,36 @@ pub struct RunListResponse {
     pub runs: Vec<RunRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunQueryRequest {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub state: Option<RunState>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub name_contains: Option<String>,
+    #[serde(default)]
+    pub config_equals: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub summary_equals: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub before: Option<RunId>,
+    #[serde(default = "default_query_limit")]
+    pub limit: usize,
+}
+
+fn default_query_limit() -> usize {
+    100
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunQueryResponse {
+    pub runs: Vec<RunRecord>,
+    pub next_before: Option<RunId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetricKeyListResponse {
     pub run_id: RunId,

@@ -43,7 +43,7 @@ deployment model.
 |---|---|---|
 | Drop-in workflow | `import runloom as wandb` for common training code | Partial |
 | Run modes | online, offline, disabled, resume policies | Compatible |
-| Public API | projects, runs, filters, history, files, artifacts | Planned |
+| Public API | projects, runs, filters, history, files, artifacts | Partial |
 | Media semantics | captions, grouping, sequences, native playback | Partial |
 | Tables | typed columns, incremental data, linked rich values | Partial |
 | Artifacts | collections, versions, aliases, lineage, downloads | Compatible |
@@ -112,3 +112,9 @@ status, kind, and the current user step. The SDK journals each finished span and
 payload before background delivery; exact request IDs make response-loss retries
 idempotent. Search uses SQLite FTS over bounded previews, so query cost and
 catalog growth do not depend on complete prompt or response payload size.
+
+`runloom.Api` exposes bounded project discovery, lazy server-filtered run pages,
+single-run lookup, full-resolution history scans, artifacts, and traces. Filters
+currently support state, name, and typed top-level config/summary equality. The
+wider W&B filter language, general run-file surface, and alternate ordering are
+not yet implemented and fail explicitly.

@@ -1194,7 +1194,7 @@ def create_run(
         raise ValueError("resume='must' requires an explicit run_id")
     if mode == "disabled" and resume != "never":
         raise ValueError("disabled mode does not support resume policies")
-    selected_id = run_id or str(uuid.uuid4())
+    selected_id = run_id or uuid7()
     selected_spool_root = Path(
         spool_root
         or os.environ.get("RUNLOOM_SPOOL_DIR")

@@ -76,6 +76,12 @@ class RunloomClient:
     def get_run(self, run_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/runs/{run_id}")
 
+    def projects(self, *, limit: int = 100) -> dict[str, Any]:
+        return self._request("GET", "/api/v1/projects", params={"limit": limit})
+
+    def query_runs(self, query: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/api/v1/query/runs", json=query)
+
     def update_config(
         self,
         run_id: str,
