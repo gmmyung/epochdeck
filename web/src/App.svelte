@@ -317,24 +317,6 @@
     syncComparisonUrl("push");
   }
 
-  async function isolateRun(run: Run): Promise<void> {
-    selectedRunIds = [run.id];
-    selectionNotice = null;
-    await loadMetricKeysForRuns([run.id], projectController?.signal);
-    if (selectedRun?.id !== run.id) await activatePrimaryRun(run.id, true);
-    resetChartState(false);
-    queueVisibleMetrics();
-    syncComparisonUrl("push");
-  }
-
-  async function clearRunSelection(): Promise<void> {
-    selectedRunIds = [];
-    selectionNotice = null;
-    await activatePrimaryRun(null, false);
-    resetChartState();
-    syncComparisonUrl("push");
-  }
-
   async function loadMetricKeysForRuns(
     runIds: readonly string[],
     signal?: AbortSignal,
@@ -1296,48 +1278,6 @@
                 <Icon name={selectedRun.state === "running" ? "activity" : "check"} size={14} />
                 {selectedRun.state}
               </span>
-            </div>
-
-            <div class="comparison-bar" aria-label="Compared runs">
-              <div class="comparison-chips">
-                {#each comparisonRuns as run (run.id)}
-                  {@const style = runStyle(run.id)}
-                  <div
-                    class="run-chip"
-                    class:primary={selectedRun.id === run.id}
-                    style={`--run-color: ${style.color}`}
-                  >
-                    <span class={`run-swatch pattern-${style.pattern}`} aria-hidden="true"></span>
-                    <button
-                      class="chip-name"
-                      type="button"
-                      aria-label={`Use ${run.name} as primary run`}
-                      onclick={() => void chooseRun(run)}>{run.name}</button
-                    >
-                    <button
-                      class="chip-action"
-                      type="button"
-                      aria-label={`Show only ${run.name}`}
-                      title={`Show only ${run.name}`}
-                      onclick={() => void isolateRun(run)}>◎</button
-                    >
-                    <button
-                      class="chip-action"
-                      type="button"
-                      aria-label={`Remove ${run.name} from comparison`}
-                      title={`Remove ${run.name} from comparison`}
-                      onclick={() => void toggleRun(run, false)}>×</button
-                    >
-                  </div>
-                {/each}
-              </div>
-              <button
-                class="clear-comparison"
-                type="button"
-                onclick={() => void clearRunSelection()}
-              >
-                Clear
-              </button>
             </div>
 
             <div class="run-tabs" role="tablist" aria-label="Run data">

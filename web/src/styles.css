@@ -427,110 +427,6 @@ select:hover {
   overflow-wrap: anywhere;
 }
 
-.comparison-bar {
-  min-width: 0;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 10px;
-  padding-bottom: 10px;
-  border-bottom: 1px solid var(--line);
-}
-
-.comparison-chips {
-  min-width: 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-}
-
-.run-chip {
-  --chip-background: color-mix(in srgb, var(--run-color) 8%, var(--surface));
-  min-width: 0;
-  max-width: min(360px, 44vw);
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  min-height: 30px;
-  padding: 3px 3px 3px 8px;
-  border-left: 3px solid var(--run-color);
-  background: var(--chip-background);
-}
-
-.run-chip.primary {
-  --chip-background: color-mix(in srgb, var(--run-color) 15%, var(--surface));
-}
-
-.run-chip .run-swatch {
-  width: 16px;
-}
-
-.chip-name,
-.chip-action,
-.clear-comparison {
-  border: 0;
-  background: transparent;
-  color: var(--muted);
-  font-size: 10px;
-}
-
-.chip-name {
-  min-width: 0;
-  padding: 3px 2px;
-  overflow: hidden;
-  color: var(--text);
-  font-weight: 600;
-  text-align: left;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.chip-action {
-  position: relative;
-  width: 24px;
-  height: 24px;
-  flex: 0 0 auto;
-  padding: 0;
-}
-
-.chip-action:hover,
-.chip-name:hover,
-.clear-comparison:hover {
-  background: var(--button-hover);
-  color: var(--text);
-}
-
-.chip-action[aria-label]::after {
-  content: attr(aria-label);
-  position: absolute;
-  z-index: 45;
-  top: calc(100% + 6px);
-  right: 0;
-  width: max-content;
-  max-width: 220px;
-  padding: 5px 7px;
-  border: 1px solid var(--line-strong);
-  background: var(--panel);
-  box-shadow: 0 3px 10px rgb(0 0 0 / 12%);
-  color: var(--text);
-  font-size: 9px;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.chip-action[aria-label]:hover::after,
-.chip-action[aria-label]:focus-visible::after {
-  opacity: 1;
-}
-
-.clear-comparison {
-  min-height: 30px;
-  flex: 0 0 auto;
-  padding: 0 8px;
-  border-bottom: 1px solid var(--line);
-}
-
 .report-description {
   max-width: 720px;
   margin: 7px 0 0;
@@ -1753,15 +1649,6 @@ dd {
 
   .run-list-row {
     min-width: 210px;
-  }
-
-  .comparison-bar {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .clear-comparison {
-    align-self: flex-end;
   }
 
   .document-cards,
