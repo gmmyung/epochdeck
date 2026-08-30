@@ -7,7 +7,7 @@
 
 Large experiment projects cannot be migrated through one in-memory document.
 W&B imports also need to survive process termination and ambiguous network
-failures without duplicating accepted history. A portable Runloom export must
+failures without duplicating accepted history. A portable EpochDeck export must
 retain raw data rather than dashboard samples.
 
 ## Decision
@@ -33,21 +33,21 @@ video history. Deterministic rich IDs include the source row and occurrence, so
 repeated equal media at one step cannot collide. Run files and logged artifacts
 are streamed one file at a time through bounded temporary storage, hashed with
 bounded buffers, and committed as deterministic artifact requests. Logged
-artifacts preserve a canonical W&B `vN` as Runloom's explicit integer version;
+artifacts preserve a canonical W&B `vN` as EpochDeck's explicit integer version;
 run-file shards keep ordinary automatic allocation. The source run's update
 token is checked again before completion; a moving source is retried instead of
 publishing an incoherent checkpoint.
 
 One source history row may contain at most 4,096 scalar metrics, 256 media
 references, 65,536 traversed values, and 64 nested levels. Wide scalar rows are
-split lexicographically into at most sixteen 256-key Runloom points with the
+split lexicographically into at most sixteen 256-key EpochDeck points with the
 same step and timestamp. The source-row checkpoint advances only after every
 point is acknowledged, so interruption replays the same deterministic requests.
 Each retained media reference is capped at 64 KiB. Source keys outside the
-Runloom key contract fail the run with the exact key rather than being renamed
+EpochDeck key contract fail the run with the exact key rather than being renamed
 or dropped.
 
-The Runloom exporter follows every cursor and writes full-resolution history
+The EpochDeck exporter follows every cursor and writes full-resolution history
 pages with at most 32 columns and 5,000 rows. CAS content streams in 1 MiB
 chunks, is deduplicated by destination path, and is verified before install.
 Lightweight sweep and trial pages are hydrated one record at a time so the
@@ -64,7 +64,7 @@ Runtime memory is independent of total run length, file size, and project
 history. Re-running an interrupted W&B import is safe without a remote job
 queue. Export artifacts are implementation-neutral and directly inspectable.
 
-The importer preserves W&B run files and logged output artifacts in Runloom's
+The importer preserves W&B run files and logged output artifacts in EpochDeck's
 CAS and reconstructs supported media-history references as native rich rows.
 Registry-wide collections and input-artifact lineage remain a separate adapter
 surface and do not change scalar storage or the export format.
@@ -74,7 +74,7 @@ surface and do not change scalar storage or the export format.
 ### Load a W&B project into a dataframe
 
 Memory would scale with total rows and metric width, precisely the failure mode
-Runloom is intended to avoid.
+EpochDeck is intended to avoid.
 
 ### Checkpoint only after each run
 

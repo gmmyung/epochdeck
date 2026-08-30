@@ -6,8 +6,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import MediaTimeline from "./MediaTimeline.svelte";
 import MetricChart from "./MetricChart.svelte";
 import MetricChartSettings from "./MetricChartSettings.svelte";
+import NavigationSidebar from "./NavigationSidebar.svelte";
 import RunDocumentPanels from "./RunDocumentPanels.svelte";
-import type { ChartHistory, RichValue, Run } from "./api";
+import SelectControl from "./SelectControl.svelte";
+import type { ChartHistory, RichValue, Run, RunListItem } from "./api";
 
 beforeEach(() => {
   class IntersectionObserverMock {
@@ -139,6 +141,216 @@ describe("interactive dashboard components", () => {
     target.remove();
   });
 
+  it("keeps simple legend visibility controls and honors an external run highlight", async () => {
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(MetricChart, {
+      target,
+      props: {
+        metric: "train/loss",
+        highlightedRunId: "run-b",
+        series: [
+          {
+            runId: "run-a",
+            runName: "Run A",
+            color: "#2766ad",
+            available: true,
+            history: singlePointHistory("run-a", "train/loss", 1.5),
+          },
+          {
+            runId: "run-b",
+            runName: "Run B",
+            color: "#d05a32",
+            available: true,
+            history: singlePointHistory("run-b", "train/loss", 2.5),
+          },
+          {
+            runId: "run-without-loss",
+            runName: "Run without loss",
+            color: "#777777",
+            available: false,
+            historyResolved: true,
+          },
+        ],
+        onvisibilitychange: vi.fn(),
+      },
+    });
+    await tick();
+
+    const entries = target.querySelectorAll<HTMLElement>(".legend-entry");
+    expect(entries).toHaveLength(2);
+    expect(entries[1].classList.contains("highlighted")).toBe(true);
+    expect(target.querySelector('[aria-label="Hide Run without loss"]')).toBeNull();
+    expect(target.textContent).not.toContain("Run without loss");
+    expect(target.textContent?.toLocaleLowerCase()).not.toContain("solo");
+    expect(target.querySelector(".chart-interaction-canvas")).not.toBeNull();
+
+    const runA = target.querySelector<HTMLButtonElement>('[aria-label="Hide Run A (run-a)"]')!;
+    runA.click();
+    await tick();
+    expect(target.querySelector('[aria-label="Show Run A (run-a)"]')).not.toBeNull();
+    const showAll = [...target.querySelectorAll("button")].find(
+      (button) => button.textContent?.trim() === "show all",
+    );
+    expect(showAll).toBeDefined();
+    showAll?.click();
+    await tick();
+    expect(target.querySelector('[aria-label="Hide Run A (run-a)"]')).not.toBeNull();
+    expect(target.textContent).not.toContain("show all");
+
+    await unmount(component);
+    target.remove();
+  });
+
+  it("renders selector options in the styled dashboard popover", async () => {
+    const change = vi.fn();
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SelectControl, {
+      target,
+      props: {
+        ariaLabel: "Axis scale",
+        value: "linear",
+        options: [
+          { value: "linear", label: "Linear" },
+          { value: "log", label: "Log" },
+        ],
+        onvaluechange: change,
+      },
+    });
+    await tick();
+
+    expect(target.querySelector("select")).toBeNull();
+    const trigger = target.querySelector<HTMLButtonElement>('button[aria-haspopup="listbox"]')!;
+    const accessibleName = trigger
+      .getAttribute("aria-labelledby")!
+      .split(" ")
+      .map((id) => document.getElementById(id)?.textContent)
+      .join(" ");
+    expect(accessibleName).toBe("Axis scale Linear");
+    trigger.click();
+    await tick();
+    const listbox = target.querySelector<HTMLElement>('[role="listbox"]')!;
+    expect(listbox.classList.contains("select-popover")).toBe(true);
+    expect(
+      target
+        .querySelector<HTMLElement>('[role="option"][aria-label="Linear"]')
+        ?.getAttribute("aria-selected"),
+    ).toBe("true");
+
+    target.querySelector<HTMLButtonElement>('[role="option"][aria-label="Log"]')!.click();
+    await tick();
+    expect(change).toHaveBeenCalledWith("log");
+    expect(target.querySelector('[role="listbox"]')).toBeNull();
+    expect(trigger.textContent).toContain("Log");
+
+    trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    await tick();
+    const logOption = target.querySelector<HTMLButtonElement>('[role="option"][aria-label="Log"]')!;
+    expect(logOption.tabIndex).toBe(0);
+    logOption.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true }));
+    await tick();
+    const linearOption = target.querySelector<HTMLButtonElement>(
+      '[role="option"][aria-label="Linear"]',
+    )!;
+    expect(linearOption.tabIndex).toBe(0);
+    linearOption.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await tick();
+    expect(change).toHaveBeenLastCalledWith("linear");
+
+    await unmount(component);
+    target.remove();
+  });
+
+  it("links sidebar hover and run style controls without changing selection", async () => {
+    const run = runListItem();
+    const hover = vi.fn();
+    const styleChange = vi.fn();
+    const resetStyle = vi.fn();
+    const toggle = vi.fn();
+    const choose = vi.fn();
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(NavigationSidebar, {
+      target,
+      props: {
+        visibleProjects: [],
+        selectedProject: "demo",
+        projectSearch: "",
+        projectCursor: null,
+        projectWindowTruncated: false,
+        loadingMoreProjects: false,
+        projectError: null,
+        reports: [],
+        visibleReports: [],
+        selectedReportId: null,
+        reportSearch: "",
+        reportCursor: null,
+        reportWindowTruncated: false,
+        loadingMoreReports: false,
+        reportError: null,
+        runs: [run],
+        selectedRunIds: [run.id],
+        primaryRunId: run.id,
+        runSearch: "",
+        runCursor: null,
+        runWindowTruncated: false,
+        loadingRuns: false,
+        runError: null,
+        selectionNotice: null,
+        onchooseproject: vi.fn(),
+        onloadprojects: vi.fn(),
+        onchoosereport: vi.fn(),
+        onloadreports: vi.fn(),
+        onsearchruns: vi.fn(),
+        onloadruns: vi.fn(),
+        ontogglerun: toggle,
+        onchooserun: choose,
+        onhoverrun: hover,
+        onrunstylechange: styleChange,
+        onresetrunstyle: resetStyle,
+      },
+    });
+    await tick();
+
+    const row = target.querySelector<HTMLElement>(".run-list-row")!;
+    row.dispatchEvent(new MouseEvent("mouseenter"));
+    row.dispatchEvent(new MouseEvent("mouseleave"));
+    expect(hover.mock.calls).toEqual([[run.id], [null]]);
+
+    expect(target.querySelector(`[aria-label="Line color for ${run.name}"]`)).toBeNull();
+    const styleMenu = target.querySelector<HTMLButtonElement>(
+      `[aria-label="Configure chart style for ${run.name} (${run.id.slice(0, 8)})"]`,
+    )!;
+    styleMenu.click();
+    await tick();
+    expect(styleMenu.getAttribute("aria-expanded")).toBe("true");
+
+    const color = target.querySelector<HTMLInputElement>(
+      `[aria-label="Line color for ${run.name}"]`,
+    )!;
+    color.value = "#abcdef";
+    color.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(styleChange).toHaveBeenCalledWith(run.id, expect.objectContaining({ color: "#abcdef" }));
+
+    target.querySelector<HTMLInputElement>(`[aria-label="Dotted line for ${run.name}"]`)!.click();
+    expect(styleChange).toHaveBeenCalledWith(run.id, expect.objectContaining({ pattern: "dot" }));
+    target
+      .querySelector<HTMLButtonElement>(`[aria-label="Reset chart style for ${run.name}"]`)!
+      .click();
+    expect(resetStyle).toHaveBeenCalledWith(run.id);
+    expect(toggle).not.toHaveBeenCalled();
+    expect(choose).not.toHaveBeenCalled();
+
+    document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    await tick();
+    expect(styleMenu.getAttribute("aria-expanded")).toBe("false");
+    expect(target.querySelector(`[aria-label="Line color for ${run.name}"]`)).toBeNull();
+
+    await unmount(component);
+    target.remove();
+  });
+
   it("shows compact accessible series, value, and step hover data", async () => {
     class VisibleIntersectionObserver {
       constructor(private readonly callback: IntersectionObserverCallback) {}
@@ -159,8 +371,9 @@ describe("interactive dashboard components", () => {
       readonly rootMargin = "0px";
       readonly thresholds = [0];
     }
+    const arc = vi.fn();
     const context = new Proxy(
-      { measureText: () => ({ width: 16 }) },
+      { arc, measureText: () => ({ width: 16 }) },
       {
         get: (target, property) =>
           property in target ? target[property as keyof typeof target] : () => undefined,
@@ -203,6 +416,7 @@ describe("interactive dashboard components", () => {
             runId: "run-a",
             runName: "policy baseline",
             color: "#2766ad",
+            pattern: "solid",
             available: true,
             history,
           },
@@ -234,6 +448,7 @@ describe("interactive dashboard components", () => {
       .querySelector('[aria-live="polite"]')
       ?.textContent?.replace(/\s+/g, " ");
     expect(announcement).toContain("policy baseline, value 1.25, step 42");
+    expect(arc).not.toHaveBeenCalled();
 
     await unmount(component);
     getContext.mockRestore();
@@ -266,9 +481,15 @@ describe("interactive dashboard components", () => {
 
     expect(target.querySelector("details")?.getAttribute("aria-keyshortcuts")).toBe("Escape");
 
-    const xScale = target.querySelector<HTMLSelectElement>('[aria-label="X axis scale"]')!;
-    xScale.value = "log";
-    xScale.dispatchEvent(new Event("change", { bubbles: true }));
+    const xScaleLabel = [...target.querySelectorAll<HTMLElement>(".select-label")].find(
+      (label) => label.textContent === "X axis scale",
+    )!;
+    const xScale = xScaleLabel.parentElement!.querySelector<HTMLButtonElement>(
+      'button[aria-haspopup="listbox"]',
+    )!;
+    xScale.click();
+    await tick();
+    target.querySelector<HTMLButtonElement>('[role="option"][aria-label="Log"]')!.click();
     expect(viewChange).toHaveBeenCalledOnce();
 
     const smoothingAmount = target.querySelector<HTMLInputElement>('input[type="number"]')!;
@@ -348,5 +569,45 @@ function videoValue(id: string, step: number): RichValue {
     },
     metadata: {},
     created_at: "2026-01-01T00:00:00Z",
+  };
+}
+
+function singlePointHistory(runId: string, metric: string, value: number): ChartHistory {
+  return {
+    run_id: runId,
+    step_min: 1,
+    step_max: 1,
+    bucket_count: 1,
+    source_points: 1,
+    source_last_sequence: 1,
+    metrics: {
+      [metric]: {
+        source_points: 1,
+        bucket: [0],
+        last_x: [1],
+        last_step: [1],
+        last_timestamp_ms: [1_000],
+        minimum: [value],
+        maximum: [value],
+        last: [value],
+      },
+    },
+  };
+}
+
+function runListItem(): RunListItem {
+  return {
+    id: "00000000-0000-7000-8000-000000000001",
+    project_id: "00000000-0000-7000-8000-000000000010",
+    project: "demo",
+    name: "policy baseline",
+    state: "finished",
+    summary_truncated: false,
+    document_revision: 1,
+    metric_revision: 2,
+    rich_data_revision: 3,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:01:00Z",
+    finished_at: "2026-01-01T00:01:00Z",
   };
 }

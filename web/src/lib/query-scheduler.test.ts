@@ -67,6 +67,47 @@ describe("QueryScheduler", () => {
     expect(publish).toHaveBeenCalledWith("new", "revision-2");
   });
 
+  it("coalesces revision-only work behind an active request without aborting it", async () => {
+    const scheduler = new QueryScheduler(1, 4);
+    const active = deferred<string>();
+    const superseded = deferred<string>();
+    const newest = deferred<string>();
+    const starts: string[] = [];
+    const discarded: string[] = [];
+    const signals: AbortSignal[] = [];
+    const publish = vi.fn();
+    const schedule = (requestKey: string, gate: Promise<string>) =>
+      scheduler.schedule({
+        identity: "loss",
+        requestKey,
+        schedulingPolicy: "coalesce-pending",
+        request: async (signal) => {
+          starts.push(requestKey);
+          signals.push(signal);
+          return gate;
+        },
+        publish,
+        discard: () => discarded.push(requestKey),
+      });
+
+    schedule("revision-1", active.promise);
+    schedule("revision-2", superseded.promise);
+    schedule("revision-3", newest.promise);
+
+    expect(starts).toEqual(["revision-1"]);
+    expect(signals[0]?.aborted).toBe(false);
+    expect(discarded).toEqual(["revision-2"]);
+
+    active.resolve("active");
+    await vi.waitFor(() => expect(starts).toEqual(["revision-1", "revision-3"]));
+    expect(publish).toHaveBeenCalledWith("active", "revision-1");
+    expect(signals[0]?.aborted).toBe(false);
+
+    newest.resolve("newest");
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledTimes(2));
+    expect(publish).toHaveBeenLastCalledWith("newest", "revision-3");
+  });
+
   it("keeps an aborted request in its physical slot until the promise settles", async () => {
     const scheduler = new QueryScheduler(1, 4);
     const stale = deferred<string>();

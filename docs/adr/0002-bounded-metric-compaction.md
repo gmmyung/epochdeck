@@ -17,7 +17,7 @@ swapping manifests, and deleting replaced files.
 
 ## Decision
 
-Runloom runs one cancellable background compaction worker. A candidate contains
+EpochDeck runs one cancellable background compaction worker. A candidate contains
 at least four adjacent segments with the same metric-schema signature, and its
 largest input has at most twice as many rows as its smallest input. This
 size-tiered rule lets a live run accumulate a cohort before rewriting it instead
@@ -60,7 +60,7 @@ union schema and keeps merge memory proportional to one known metric signature.
 Runs with rapidly alternating schemas may retain more segments until a future
 schema-reconciliation compactor is justified by measurements.
 
-The snapshot barrier is process-local, matching Runloom's single-service
+The snapshot barrier is process-local, matching EpochDeck's single-service
 deployment contract. Multiple server processes must not share one writable
 catalog and metric root.
 

@@ -9,10 +9,10 @@ from typing import Any
 import httpx
 import pytest
 
-import runloom
-from runloom import DeliveryError
-from runloom._summary import merge_metric_preview
-from runloom.run import create_run, sync_spool
+import epochdeck
+from epochdeck import DeliveryError
+from epochdeck._summary import merge_metric_preview
+from epochdeck.run import create_run, sync_spool
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "scalar_lifecycle.json").read_text(encoding="utf-8")
@@ -410,24 +410,24 @@ def test_restart_recovers_a_lost_finish_response(tmp_path) -> None:
 
 
 def test_module_level_common_workflow_and_explicit_errors(tmp_path) -> None:
-    assert runloom.run is None
-    directly_finished = runloom.init(project="contract", mode="disabled", dir=tmp_path)
+    assert epochdeck.run is None
+    directly_finished = epochdeck.init(project="contract", mode="disabled", dir=tmp_path)
     directly_finished.finish()
-    assert runloom.run is None
+    assert epochdeck.run is None
 
-    run = runloom.init(project="contract", mode="disabled", dir=tmp_path)
-    assert runloom.run is run
-    runloom.config.update({"seed": 3})
-    runloom.log({"loss": 1.0})
-    runloom.summary["status"] = "complete"
-    runloom.finish()
+    run = epochdeck.init(project="contract", mode="disabled", dir=tmp_path)
+    assert epochdeck.run is run
+    epochdeck.config.update({"seed": 3})
+    epochdeck.log({"loss": 1.0})
+    epochdeck.summary["status"] = "complete"
+    epochdeck.finish()
 
-    assert runloom.run is None
-    with pytest.raises(AttributeError, match=r"before runloom\.init"):
-        _ = runloom.config
-    with pytest.raises(RuntimeError, match="no active Runloom run"):
-        runloom.log({"loss": 0.0})
+    assert epochdeck.run is None
+    with pytest.raises(AttributeError, match=r"before epochdeck\.init"):
+        _ = epochdeck.config
+    with pytest.raises(RuntimeError, match="no active EpochDeck run"):
+        epochdeck.log({"loss": 0.0})
     with pytest.raises(TypeError, match="unexpected keyword argument 'reinit'"):
-        runloom.init(project="contract", mode="disabled", reinit=True)  # type: ignore[call-arg]
+        epochdeck.init(project="contract", mode="disabled", reinit=True)  # type: ignore[call-arg]
     with pytest.raises(ValueError, match="does not support resume"):
         create_run(project="contract", mode="disabled", resume="allow")

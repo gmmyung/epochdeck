@@ -1,0 +1,521 @@
+name: GitHub prerelease
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prerelease-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify release source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.release-version.outputs.version }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Require a commit reachable from main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+
+      - name: Read release version
+        id: release-version
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta|rc)\.[0-9]+$ ]]
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Verify protected signed tag
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "Release tag is not covered by a repository tag ruleset" >&2
+            exit 1
+          }
+          ./scripts/verify-release-tag.sh "$GITHUB_REF_NAME" "$(git rev-parse HEAD)"
+
+      - name: Validate release readiness
+        run: |
+          arguments=(--require-prerelease --require-release-ready)
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            arguments+=(--tag "$GITHUB_REF_NAME")
+          fi
+          python3 scripts/check-release-version.py "${arguments[@]}"
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@e9bfc9148566ca239aef4f5cb968674de15c3c20 # v3.5.2
+
+      - name: Install locked dependencies
+        run: nix develop --command just bootstrap
+
+      - name: Run complete repository checks
+        run: nix develop --command just check
+
+      - name: Test the supported W&B SDK contract
+        run: >-
+          nix develop --command uv run --project python --python 3.11 --locked
+          --extra wandb pytest python/tests/test_wandb_sdk_contract.py
+
+      - name: Preserve the tested dashboard
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dashboard-dist
+          path: web/dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  server:
+    name: Server ${{ matrix.target }}
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download tested dashboard
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dashboard-dist
+          path: web/dist
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.85.0
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.1
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        with:
+          tool: cargo-zigbuild@0.23.3
+
+      - name: Install binary inspection and emulation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends binutils file qemu-user-static
+
+      - name: Build static server
+        env:
+          TARGET: ${{ matrix.target }}
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct)"
+          cargo +1.85.0 zigbuild \
+            --release \
+            --locked \
+            --target "$TARGET" \
+            --package epochdeck-server \
+            --features embedded-dashboard
+
+      - name: Verify architecture and static linkage
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary="target/$TARGET/release/epochdeck-server"
+          test -x "$binary"
+          launcher=()
+          if [[ "$TARGET" == aarch64-* ]]; then
+            launcher=(qemu-aarch64-static)
+          fi
+          "${launcher[@]}" "$binary" --version | grep --fixed-strings --line-regexp \
+            "epochdeck-server $VERSION"
+          "${launcher[@]}" "$binary" --help | grep --fixed-strings --quiet \
+            'Usage: epochdeck-server [OPTIONS]'
+          if "${launcher[@]}" "$binary" --unknown; then
+            echo "Release binary accepted an unknown command-line argument" >&2
+            exit 1
+          fi
+          file "$binary"
+          if readelf --program-headers "$binary" |
+            grep --quiet "Requesting program interpreter"; then
+            echo "Release binary has a dynamic interpreter" >&2
+            exit 1
+          fi
+          if readelf --dynamic "$binary" 2>/dev/null |
+            grep --quiet "(NEEDED)"; then
+            echo "Release binary has dynamic dependencies" >&2
+            exit 1
+          fi
+          case "$TARGET" in
+            x86_64-*) file "$binary" | grep --quiet "x86-64" ;;
+            aarch64-*) file "$binary" | grep --quiet "ARM aarch64" ;;
+          esac
+
+      - name: Smoke-test API, branding, and embedded dashboard
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary="$PWD/target/$TARGET/release/epochdeck-server"
+          runtime="$(mktemp -d)"
+          printf '%s' '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><path d="M0 0h1v1z"/></svg>' >"$runtime/logo.svg"
+          export EPOCHDECK_BIND=127.0.0.1:18787
+          export EPOCHDECK_DATA_DIR="$runtime/data"
+          export EPOCHDECK_METRICS_DIR="$runtime/metrics"
+          export EPOCHDECK_BLOBS_DIR="$runtime/blobs"
+          export EPOCHDECK_DASHBOARD_ACCENT_COLOR="#8a3ffc"
+          export EPOCHDECK_DASHBOARD_LOGO_PATH="$runtime/logo.svg"
+          launcher=()
+          if [[ "$TARGET" == aarch64-* ]]; then
+            launcher=(qemu-aarch64-static)
+          fi
+          "${launcher[@]}" "$binary" >"$runtime/server.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; cat "$runtime/server.log"' EXIT
+          curl --fail --retry 30 --retry-all-errors --retry-delay 1 \
+            http://127.0.0.1:18787/api/v1/health |
+            jq --exit-status --arg version "$VERSION" \
+              '.status == "healthy" and .version == $version'
+          curl --fail http://127.0.0.1:18787/ | grep --quiet '<title>EpochDeck</title>'
+          curl --fail http://127.0.0.1:18787/api/v1/dashboard/config |
+            jq --exit-status \
+              '.accent_color == "#8a3ffc" and .logo_url == "/api/v1/dashboard/logo"'
+          curl --fail http://127.0.0.1:18787/api/v1/dashboard/logo >"$runtime/served-logo.svg"
+          cmp "$runtime/logo.svg" "$runtime/served-logo.svg"
+          kill -TERM "$pid"
+          set +e
+          wait "$pid"
+          status=$?
+          set -e
+          [[ "$status" -eq 0 || "$status" -eq 143 ]]
+          trap - EXIT
+          cat "$runtime/server.log"
+
+      - name: Create deterministic server archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          archive="epochdeck-server-${VERSION}-${TARGET}"
+          root="package/$archive"
+          install -Dm0755 "target/$TARGET/release/epochdeck-server" "$root/epochdeck-server"
+          install -Dm0644 LICENSE "$root/LICENSE"
+          install -Dm0644 THIRD_PARTY_NOTICES.txt "$root/THIRD_PARTY_NOTICES.txt"
+          install -Dm0644 README.md "$root/README.md"
+          install -Dm0644 SECURITY.md "$root/SECURITY.md"
+          install -Dm0644 deploy/epochdeck.service "$root/deploy/epochdeck.service"
+          install -Dm0644 deploy/epochdeck.env.example "$root/deploy/epochdeck.env.example"
+          while IFS= read -r document; do
+            install -Dm0644 "$document" "$root/$document"
+          done < <(find docs -type f -name '*.md' -print | LC_ALL=C sort)
+          mkdir -p release-out
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct)"
+          tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 \
+            --numeric-owner -C package -cf - "$archive" |
+            gzip -n -9 >"release-out/$archive.tar.gz"
+
+      - name: Extract and smoke-test the finished archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          archive="epochdeck-server-${VERSION}-${TARGET}"
+          archive_path="release-out/$archive.tar.gz"
+          inspection="$(mktemp -d)"
+          tar -tzf "$archive_path" >"$inspection/listing"
+          if grep --extended-regexp --quiet '(^/|(^|/)\.\.(/|$))' "$inspection/listing"; then
+            echo "Archive contains an unsafe path" >&2
+            exit 1
+          fi
+          tar -xzf "$archive_path" -C "$inspection"
+          root="$inspection/$archive"
+          test -x "$root/epochdeck-server"
+          test -z "$(find "$root" -type l -print -quit)"
+          [[ "$(stat --format='%a' "$root/epochdeck-server")" == "755" ]]
+          cmp "target/$TARGET/release/epochdeck-server" "$root/epochdeck-server"
+          {
+            printf '%s\n' \
+              LICENSE \
+              README.md \
+              SECURITY.md \
+              THIRD_PARTY_NOTICES.txt \
+              deploy/epochdeck.env.example \
+              deploy/epochdeck.service \
+              epochdeck-server
+            find docs -type f -name '*.md' -print
+          } | LC_ALL=C sort >"$inspection/expected-files"
+          find "$root" -type f -printf '%P\n' | LC_ALL=C sort >"$inspection/actual-files"
+          cmp "$inspection/expected-files" "$inspection/actual-files"
+          while IFS= read -r -d '' packaged_file; do
+            if [[ "$packaged_file" != "$root/epochdeck-server" ]]; then
+              [[ "$(stat --format='%a' "$packaged_file")" == "644" ]]
+            fi
+          done < <(find "$root" -type f -print0)
+
+          runtime="$inspection/runtime"
+          mkdir -p "$runtime"
+          export EPOCHDECK_BIND=127.0.0.1:18788
+          export EPOCHDECK_DATA_DIR="$runtime/data"
+          export EPOCHDECK_METRICS_DIR="$runtime/metrics"
+          export EPOCHDECK_BLOBS_DIR="$runtime/blobs"
+          launcher=()
+          if [[ "$TARGET" == aarch64-* ]]; then
+            launcher=(qemu-aarch64-static)
+          fi
+          "${launcher[@]}" "$root/epochdeck-server" >"$runtime/server.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; cat "$runtime/server.log"' EXIT
+          curl --fail --retry 30 --retry-all-errors --retry-delay 1 \
+            http://127.0.0.1:18788/api/v1/health |
+            jq --exit-status --arg version "$VERSION" \
+              '.status == "healthy" and .version == $version'
+          kill -TERM "$pid"
+          set +e
+          wait "$pid"
+          status=$?
+          set -e
+          [[ "$status" -eq 0 || "$status" -eq 143 ]]
+          trap - EXIT
+          cat "$runtime/server.log"
+
+      - name: Upload server archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-server-${{ matrix.target }}
+          path: release-out/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  python:
+    name: Python distributions
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: 0.12.7
+          enable-cache: true
+          cache-dependency-glob: python/uv.lock
+
+      - name: Install minimum supported Python
+        run: uv python install 3.11
+
+      - name: Install the locked release build environment
+        run: >-
+          uv sync --project python --python 3.11 --locked --only-group release
+          --no-install-project
+
+      - name: Build and validate wheel and source distribution
+        run: |
+          cmp LICENSE python/LICENSE
+          mkdir -p release-out
+          uv build --project python --python python/.venv/bin/python \
+            --no-build-isolation --out-dir release-out
+          uv run --project python --no-sync twine check release-out/*
+          wheels=(release-out/*.whl)
+          sdists=(release-out/*.tar.gz)
+          [[ "${#wheels[@]}" -eq 1 ]]
+          [[ "${#sdists[@]}" -eq 1 ]]
+          python/.venv/bin/python - "${wheels[0]}" "${sdists[0]}" LICENSE <<'PY'
+          import email
+          import pathlib
+          import sys
+          import tarfile
+          import zipfile
+
+          wheel = pathlib.Path(sys.argv[1])
+          sdist = pathlib.Path(sys.argv[2])
+          expected_license = pathlib.Path(sys.argv[3]).read_bytes()
+
+          with zipfile.ZipFile(wheel) as archive:
+              license_names = [
+                  name for name in archive.namelist()
+                  if name.endswith(".dist-info/licenses/LICENSE")
+              ]
+              metadata_names = [
+                  name for name in archive.namelist()
+                  if name.endswith(".dist-info/METADATA")
+              ]
+              assert len(license_names) == 1, license_names
+              assert len(metadata_names) == 1, metadata_names
+              assert archive.read(license_names[0]) == expected_license
+              message = email.message_from_bytes(archive.read(metadata_names[0]))
+              assert message["License-Expression"] == "Apache-2.0"
+              assert message.get_all("License-File") == ["LICENSE"]
+
+          with tarfile.open(sdist, "r:gz") as archive:
+              license_members = [
+                  member for member in archive.getmembers()
+                  if member.isfile() and member.name.endswith("/LICENSE")
+              ]
+              assert len(license_members) == 1, [member.name for member in license_members]
+              extracted = archive.extractfile(license_members[0])
+              assert extracted is not None
+              assert extracted.read() == expected_license
+          PY
+
+      - name: Smoke-test installed wheel
+        run: |
+          wheels=(release-out/*.whl)
+          [[ "${#wheels[@]}" -eq 1 ]]
+          uv venv --python 3.11 "$RUNNER_TEMP/epochdeck-wheel-smoke"
+          uv pip install --python "$RUNNER_TEMP/epochdeck-wheel-smoke/bin/python" "${wheels[0]}"
+          "$RUNNER_TEMP/epochdeck-wheel-smoke/bin/python" - \
+            "$PWD/python/pyproject.toml" "$PWD/LICENSE" <<'PY'
+          import importlib.metadata
+          import pathlib
+          import subprocess
+          import sys
+          import tomllib
+
+          import epochdeck
+
+          metadata = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
+          distribution = metadata["project"]["name"]
+          expected = metadata["project"]["version"]
+          expected_license = pathlib.Path(sys.argv[2]).read_bytes()
+          assert importlib.metadata.version(distribution) == expected
+          distribution_metadata = importlib.metadata.metadata(distribution)
+          assert distribution_metadata["License-Expression"] == metadata["project"]["license"]
+          assert distribution_metadata.get_all("License-File") == ["LICENSE"]
+          installed_files = importlib.metadata.files(distribution)
+          assert installed_files is not None
+          installed_licenses = [
+              path for path in installed_files
+              if str(path).endswith(".dist-info/licenses/LICENSE")
+          ]
+          assert len(installed_licenses) == 1, installed_licenses
+          assert installed_licenses[0].locate().read_bytes() == expected_license
+          assert epochdeck.__version__ == expected
+          command = pathlib.Path(sys.executable).with_name("epochdeck")
+          result = subprocess.run(
+              [command, "--version"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          assert result.stdout == f"epochdeck {expected}\n"
+          PY
+          "$RUNNER_TEMP/epochdeck-wheel-smoke/bin/epochdeck" --help
+
+      - name: Upload Python distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-python
+          path: |
+            release-out/*.whl
+            release-out/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble release candidate
+    needs: [verify, server, python]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release-dist
+          merge-multiple: true
+
+      - name: Generate and verify SHA256SUMS
+        run: |
+          cd release-dist
+          mapfile -t files < <(find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          [[ "${#files[@]}" -eq 4 ]]
+          sha256sum "${files[@]}" >SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+
+      - name: Upload complete release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate
+          path: release-dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Create GitHub prerelease
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [verify, assemble]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download complete release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-candidate
+          path: release-dist
+
+      - name: Verify assembled release candidate
+        run: |
+          cd release-dist
+          mapfile -t files < <(find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          [[ "${#files[@]}" -eq 5 ]]
+          [[ "$(wc -l <SHA256SUMS)" -eq 4 ]]
+          sha256sum --check --strict SHA256SUMS
+
+      - name: Revalidate protected signed tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "Release tag is not covered by a repository tag ruleset" >&2
+            exit 1
+          }
+          ./scripts/verify-release-tag.sh "$GITHUB_REF_NAME" "$(git rev-parse HEAD)"
+
+      - name: Publish reviewed prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          test -f "$notes"
+          mapfile -t assets < <(find release-dist -maxdepth 1 -type f | LC_ALL=C sort)
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            --verify-tag \
+            --prerelease \
+            --title "EpochDeck $VERSION" \
+            --notes-file "$notes"

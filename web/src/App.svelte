@@ -4,6 +4,7 @@
   import {
     getChartHistory,
     getComparisonChartHistory,
+    getDashboardConfig,
     getHealth,
     getProject,
     getProjectMetricCatalogPage,
@@ -13,9 +14,11 @@
     getRun,
     getRunPage,
     getRunSummariesByIds,
+    EpochDeckApiError,
     type ChartHistory,
     type ChartHistoryViewport,
     type ComparisonChartHistory,
+    type DashboardConfig,
     type Health,
     type MetricCatalogEntry,
     type Project,
@@ -42,6 +45,7 @@
     type ComparisonUrlState,
     type MetricSetMode,
     type RunAlignment,
+    type RunStyle,
   } from "./lib/comparison-state";
   import {
     CHART_BUCKET_BUDGET,
@@ -52,6 +56,7 @@
     ComparisonHistoryCache,
   } from "./lib/history-cache";
   import Icon from "./lib/Icon.svelte";
+  import { LiveRefreshCoordinator } from "./lib/live-refresh-coordinator";
   import { pushMetricCursor } from "./lib/metric-pagination";
   import NavigationSidebar from "./lib/NavigationSidebar.svelte";
   import ReportDashboard from "./lib/ReportDashboard.svelte";
@@ -64,6 +69,19 @@
   import { QueryScheduler } from "./lib/query-scheduler";
   import { appendUniquePage, reasonMessage } from "./lib/resource-state";
   import { retainHeadAndTail, retainRecord } from "./lib/retained-window";
+  import {
+    DEFAULT_SIDEBAR_WIDTH,
+    MIN_SIDEBAR_WIDTH,
+    clampSidebarWidth,
+    forgetRunStylePreference,
+    maximumSidebarWidth,
+    readSidebarCollapsed,
+    readRunStylePreferences,
+    readSidebarWidth,
+    rememberRunStylePreference,
+    rememberSidebarCollapsed,
+    rememberSidebarWidth,
+  } from "./lib/sidebar-preferences";
   import {
     mergeCurrentRunListFields,
     retainNewestRunDetail,
@@ -83,7 +101,9 @@
   const MAX_PENDING_CHART_REQUESTS = 256;
   const MAX_CONCURRENT_RUN_DETAILS = 2;
   const MAX_PENDING_RUN_DETAILS = 4;
-  const LIVE_REFRESH_MS = 2_000;
+  const LIVE_STATUS_REFRESH_MS = 2_000;
+  const LIVE_CHART_REFRESH_COOLDOWN_MS = 10_000;
+  const MAX_LIVE_REFRESH_IDENTITIES = 2;
   const MAX_RETAINED_PROJECTS = 200;
   const MAX_RETAINED_REPORTS = 200;
   const MAX_RETAINED_RUNS = 300;
@@ -98,13 +118,25 @@
     MAX_CONCURRENT_CHART_REQUESTS,
     MAX_PENDING_CHART_REQUESTS,
   );
+  const liveChartRefresh = new LiveRefreshCoordinator(
+    LIVE_CHART_REFRESH_COOLDOWN_MS,
+    MAX_LIVE_REFRESH_IDENTITIES,
+  );
   const runDetailScheduler = new BoundedRequestScheduler(
     MAX_CONCURRENT_RUN_DETAILS,
     MAX_PENDING_RUN_DETAILS,
   );
   const VALID_RUN_TABS = new Set<RunTab>(RUN_TABS.map((tab) => tab.id));
+  const DEFAULT_DASHBOARD_CONFIG: DashboardConfig = {
+    logo_url: null,
+    accent_color: "#2766ad",
+  };
+  type ReportSelectionResult = "selected" | "missing" | "failed" | "cancelled";
+  type ChartSchedulingPolicy = "abort-active" | "coalesce-pending";
 
   let health: Health | null = null;
+  let dashboardConfig = DEFAULT_DASHBOARD_CONFIG;
+  let dashboardLogoFailed = false;
   let projects: Project[] = [];
   let projectCursor: string | null = null;
   let projectWindowTruncated = false;
@@ -128,6 +160,18 @@
   let selectedRun: Run | null = null;
   let runDetailsById: Record<string, Run> = {};
   let selectedRunIds: string[] = [];
+  let hoveredRunId: string | null = null;
+  let runStylePreferences = readRunStylePreferences();
+  let sidebarViewportWidth = typeof window === "undefined" ? 1440 : window.innerWidth;
+  let sidebarWidth = readSidebarWidth(sidebarViewportWidth);
+  let sidebarCollapsed = readSidebarCollapsed();
+  let sidebarResizing = false;
+  let sidebarResizeStart: {
+    pointerId: number;
+    x: number;
+    width: number;
+    target: HTMLElement;
+  } | null = null;
   let metricCatalog: MetricCatalogEntry[] = [];
   let metricCatalogNextAfter: string | null = null;
   let metricAfter: string | null = null;
@@ -168,9 +212,11 @@
   let instantiatedMetricSignature = "";
   let fullRangeFlushScheduled = false;
   let fullRangeFlushFrame: number | null = null;
+  let fullRangeFlushPolicy: ChartSchedulingPolicy = "abort-active";
   const fullRangeBatchMetrics = new Map<string, Set<string>>();
   let reportHistories: Record<string, ChartHistory> = {};
   let reportHistoryRequestKeys: Record<string, string> = {};
+  let scheduledReportRequestKeys: Record<string, string> = {};
   let reportViewports: Record<string, ChartHistoryViewport | null> = {};
   let loadingReportMetrics = new Set<string>();
   let reportErrors: Record<string, string> = {};
@@ -219,7 +265,7 @@
   onMount(() => {
     const controller = new AbortController();
     appController = controller;
-    const refreshTimer = window.setInterval(refreshSelectedRuns, LIVE_REFRESH_MS);
+    const refreshTimer = window.setInterval(refreshSelectedRuns, LIVE_STATUS_REFRESH_MS);
     const handlePopState = () => void restoreFromLocation();
     const handleVisibility = () => {
       if (document.visibilityState === "visible") {
@@ -230,8 +276,30 @@
         pauseChartRequests();
       }
     };
+    const handleWindowResize = () => {
+      sidebarViewportWidth = window.innerWidth;
+      sidebarWidth = clampSidebarWidth(sidebarWidth, sidebarViewportWidth);
+    };
     window.addEventListener("popstate", handlePopState);
+    window.addEventListener("resize", handleWindowResize);
     document.addEventListener("visibilitychange", handleVisibility);
+    void getDashboardConfig(controller.signal)
+      .then((result) => {
+        if (!/^#[0-9a-f]{6}$/i.test(result.accent_color)) {
+          throw new Error("EpochDeck dashboard config returned an invalid accent color");
+        }
+        if (
+          result.logo_url !== null &&
+          (!result.logo_url.startsWith("/") || result.logo_url.startsWith("//"))
+        ) {
+          throw new Error("EpochDeck dashboard config returned an invalid logo URL");
+        }
+        dashboardConfig = result;
+        dashboardLogoFailed = false;
+      })
+      .catch((reason) => {
+        if (!controller.signal.aborted) showError(reason);
+      });
     void getHealth(controller.signal)
       .then((result) => {
         health = result;
@@ -265,9 +333,11 @@
       metricCatalogController?.abort();
       if (metricSearchTimer !== null) window.clearTimeout(metricSearchTimer);
       chartScheduler.cancelAll();
+      liveChartRefresh.clear();
       cancelFullRangeFlush();
       runDetailScheduler.cancelAll();
       window.removeEventListener("popstate", handlePopState);
+      window.removeEventListener("resize", handleWindowResize);
       document.removeEventListener("visibilitychange", handleVisibility);
       window.clearInterval(refreshTimer);
     };
@@ -326,8 +396,19 @@
         chartMetric: null,
         chartViewport: null,
       };
-      await applyComparisonState(state, !state.runSelectionSpecified, controller.signal);
-      if (historyMode !== "none") syncComparisonUrl(historyMode);
+      const applied = await applyComparisonState(
+        state,
+        !state.runSelectionSpecified,
+        controller.signal,
+      );
+      if (
+        applied &&
+        historyMode !== "none" &&
+        !controller.signal.aborted &&
+        projectController === controller
+      ) {
+        syncComparisonUrl(historyMode);
+      }
     } catch (reason) {
       if (!controller.signal.aborted) showError(reason);
     }
@@ -443,28 +524,49 @@
     state: ComparisonUrlState<RunTab>,
     selectDefault: boolean,
     signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const requestedRunIds =
       selectDefault && state.runIds.length === 0 && navigationRuns[0]
         ? [navigationRuns[0].id]
         : [...new Set(state.runIds)].slice(0, MAX_SELECTED_RUNS);
-    await ensureKnownRuns(requestedRunIds, signal);
-    if (signal.aborted) return;
+    const unavailableRunIds = await ensureKnownRuns(requestedRunIds, signal);
+    if (signal.aborted) return false;
     const available = new Set(runs.map((run) => run.id));
-    const normalized = normalizeRunSelection(requestedRunIds, available, state.primaryRunId);
+    let normalized = normalizeRunSelection(requestedRunIds, available, state.primaryRunId);
+    if (
+      normalized.runIds.length === 0 &&
+      navigationRuns[0] &&
+      (requestedRunIds.length > 0 || state.reportId !== null)
+    ) {
+      normalized = normalizeRunSelection([navigationRuns[0].id], available, navigationRuns[0].id);
+    }
     selectedRunIds = normalized.runIds;
     metricMode = state.metricMode;
     metricSearch = state.search;
     xAlignment = state.alignment;
     activeRunTab = state.tab;
-    selectionNotice = null;
+    selectionNotice = unavailableRunNotice(unavailableRunIds.size);
     resetChartState(false);
     const requestedReport = state.reportId;
-    if (requestedReport) await chooseReport(requestedReport, false);
-    else await activatePrimaryRun(normalized.primaryRunId, true);
+    let reportSelected = false;
+    if (requestedReport) {
+      const result = await chooseReport(requestedReport, false);
+      if (result === "cancelled" || result === "failed") return false;
+      reportSelected = result === "selected";
+      if (!reportSelected) {
+        await activatePrimaryRun(normalized.primaryRunId, true);
+        if (signal.aborted) return false;
+        selectionNotice = selectedRun
+          ? `The requested report is unavailable. Showing ${selectedRun.name}.`
+          : "The requested report is unavailable.";
+      }
+    } else {
+      await activatePrimaryRun(normalized.primaryRunId, true);
+    }
     metricBackHistoryTruncated = false;
     await loadMetricCatalog(state.metricAfter, [], signal);
-    if (requestedReport) return;
+    if (signal.aborted) return false;
+    if (reportSelected) return true;
     if (
       state.chartMetric &&
       state.chartViewport &&
@@ -477,6 +579,7 @@
       }
     }
     queueVisibleMetrics();
+    return true;
   }
 
   async function chooseRun(run: RunListItem): Promise<void> {
@@ -585,14 +688,103 @@
     syncComparisonUrl("push");
   }
 
-  async function ensureKnownRuns(runIds: readonly string[], signal: AbortSignal): Promise<void> {
+  function hoverRun(runId: string | null): void {
+    hoveredRunId = runId;
+  }
+
+  function updateRunStyle(runId: string, style: RunStyle): void {
+    runStylePreferences = rememberRunStylePreference(runStylePreferences, runId, style);
+  }
+
+  function resetRunStyle(runId: string): void {
+    runStylePreferences = forgetRunStylePreference(runStylePreferences, runId);
+  }
+
+  function startSidebarResize(event: PointerEvent): void {
+    if (event.button !== 0 || !(event.currentTarget instanceof HTMLElement)) return;
+    event.preventDefault();
+    sidebarResizeStart = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      width: sidebarWidth,
+      target: event.currentTarget,
+    };
+    sidebarResizing = true;
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  }
+
+  function moveSidebarResize(event: PointerEvent): void {
+    const start = sidebarResizeStart;
+    if (!start || event.pointerId !== start.pointerId) return;
+    sidebarWidth = clampSidebarWidth(start.width + event.clientX - start.x, sidebarViewportWidth);
+  }
+
+  function finishSidebarResize(event: PointerEvent): void {
+    const start = sidebarResizeStart;
+    if (!start || event.pointerId !== start.pointerId) return;
+    if (start.target.hasPointerCapture?.(event.pointerId)) {
+      start.target.releasePointerCapture(event.pointerId);
+    }
+    sidebarResizeStart = null;
+    sidebarResizing = false;
+    sidebarWidth = rememberSidebarWidth(sidebarWidth, sidebarViewportWidth);
+  }
+
+  function resizeSidebarWithKeyboard(event: KeyboardEvent): void {
+    const increment = event.shiftKey ? 48 : 16;
+    let next: number | null = null;
+    if (event.key === "ArrowLeft") next = sidebarWidth - increment;
+    else if (event.key === "ArrowRight") next = sidebarWidth + increment;
+    else if (event.key === "Home") next = MIN_SIDEBAR_WIDTH;
+    else if (event.key === "End") next = maximumSidebarWidth(sidebarViewportWidth);
+    if (next === null) return;
+    event.preventDefault();
+    sidebarWidth = rememberSidebarWidth(next, sidebarViewportWidth);
+  }
+
+  function resetSidebarWidth(): void {
+    sidebarWidth = rememberSidebarWidth(DEFAULT_SIDEBAR_WIDTH, sidebarViewportWidth);
+  }
+
+  function toggleSidebarCollapsed(): void {
+    sidebarCollapsed = rememberSidebarCollapsed(!sidebarCollapsed);
+  }
+
+  async function ensureKnownRuns(
+    runIds: readonly string[],
+    signal: AbortSignal,
+  ): Promise<Set<string>> {
     const known = new Set(runs.map((run) => run.id));
     const missing = [...new Set(runIds)].filter((runId) => runId && !known.has(runId));
-    if (missing.length === 0) return;
-    const summaries = await getRunSummariesByIds(selectedProject, missing, signal);
-    if (signal.aborted) return;
+    if (missing.length === 0) return new Set();
+    let summaries: RunListItem[];
+    try {
+      summaries = await getRunSummariesByIds(selectedProject, missing, signal);
+    } catch (reason) {
+      if (!isNotFound(reason)) throw reason;
+      if (missing.length === 1) return new Set(missing);
+      summaries = [];
+      for (const runId of missing) {
+        if (signal.aborted) return new Set(missing);
+        try {
+          summaries.push(...(await getRunSummariesByIds(selectedProject, [runId], signal)));
+        } catch (candidateReason) {
+          if (!isNotFound(candidateReason)) throw candidateReason;
+        }
+      }
+    }
+    if (signal.aborted) return new Set(missing);
     runs = upsertRuns(runs, summaries);
     navigationRuns = upsertRuns(navigationRuns, summaries, true);
+    const resolved = new Set(summaries.map((run) => run.id));
+    return new Set(missing.filter((runId) => !resolved.has(runId)));
+  }
+
+  function unavailableRunNotice(count: number): string | null {
+    if (count === 0) return null;
+    return count === 1
+      ? "One unavailable run was removed from this view."
+      : `${count} unavailable runs were removed from this view.`;
   }
 
   function runListItem(run: Run): RunListItem {
@@ -785,12 +977,23 @@
     }
     if (!requestedProject) return;
     if (requestedProject.name !== selectedProject) {
-      await chooseProject(requestedProject.name, "none", state);
+      await chooseProject(requestedProject.name, "replace", state);
       return;
     }
     const controller = projectController;
     if (!controller) return;
-    await applyComparisonState(state, !state.runSelectionSpecified, controller.signal);
+    try {
+      const applied = await applyComparisonState(
+        state,
+        !state.runSelectionSpecified,
+        controller.signal,
+      );
+      if (applied && !controller.signal.aborted && projectController === controller) {
+        syncComparisonUrl("replace");
+      }
+    } catch (reason) {
+      if (!controller.signal.aborted) showError(reason);
+    }
   }
 
   async function resolveProject(
@@ -800,7 +1003,13 @@
     if (!requestedName) return projects[0];
     const loaded = projects.find((project) => project.name === requestedName);
     if (loaded) return loaded;
-    const project = await getProject(requestedName, signal);
+    let project: Project;
+    try {
+      project = await getProject(requestedName, signal);
+    } catch (reason) {
+      if (isNotFound(reason)) return projects[0];
+      throw reason;
+    }
     if (signal.aborted) return undefined;
     const retained = retainHeadAndTail(
       appendUniquePage(projects, [project], (candidate) => candidate.id),
@@ -844,6 +1053,7 @@
     runDetailScheduler.cancelAll();
     selectedRun = null;
     selectedRunIds = [];
+    hoveredRunId = null;
     runDetailsById = {};
     selectedReport = null;
     metricCatalogController?.abort();
@@ -863,6 +1073,7 @@
   }
 
   function resetChartState(resetVisibility = true): void {
+    liveChartRefresh.forget("comparison");
     chartScheduler.cancelAll();
     comparisonHistories = {};
     historyRequestKeys = {};
@@ -878,9 +1089,11 @@
   }
 
   function pauseChartRequests(): void {
+    liveChartRefresh.clear();
     chartScheduler.cancelAll();
     loadingMetrics = new Set();
     loadingReportMetrics = new Set();
+    scheduledReportRequestKeys = {};
     scheduledMetricStateKeys = {};
     scheduledMetricBatchKeys = {};
     cancelFullRangeFlush();
@@ -888,15 +1101,20 @@
   }
 
   function resetReportState(): void {
+    liveChartRefresh.forget("report");
     reportHistories = {};
     reportHistoryRequestKeys = {};
+    scheduledReportRequestKeys = {};
     reportViewports = {};
     loadingReportMetrics = new Set();
     reportErrors = {};
     visibleReportMetrics = new Set();
   }
 
-  async function chooseReport(report: ReportSummary | string, updateHistory = true): Promise<void> {
+  async function chooseReport(
+    report: ReportSummary | string,
+    updateHistory = true,
+  ): Promise<ReportSelectionResult> {
     runController?.abort();
     runDetailScheduler.cancelAll();
     const controller = new AbortController();
@@ -905,18 +1123,15 @@
     selectedReport = null;
     traceSearch = "";
     runResourceController.reset();
+    liveChartRefresh.clear();
     chartScheduler.cancelAll();
     resetReportState();
     error = null;
     try {
       const reportId = typeof report === "string" ? report : report.id;
       const detail = await getReport(reportId, controller.signal);
-      if (
-        controller.signal.aborted ||
-        runController !== controller ||
-        detail.project !== selectedProject
-      )
-        return;
+      if (controller.signal.aborted || runController !== controller) return "cancelled";
+      if (detail.project !== selectedProject) return "missing";
       selectedReport = detail;
       reports = retainReports(
         appendUniquePage(reports, [reportSummary(detail)], (candidate) => candidate.id),
@@ -928,12 +1143,19 @@
           reportRunIds,
           controller.signal,
         );
-        if (controller.signal.aborted || runController !== controller) return;
+        if (controller.signal.aborted || runController !== controller) return "cancelled";
         runs = upsertRuns(runs, summaries);
       }
       if (updateHistory) syncComparisonUrl("push");
+      return "selected";
     } catch (reason) {
-      if (!controller.signal.aborted) showError(reason);
+      if (controller.signal.aborted || runController !== controller) return "cancelled";
+      if (isNotFound(reason)) {
+        if (updateHistory) showError(reason);
+        return "missing";
+      }
+      showError(reason);
+      return "failed";
     }
   }
 
@@ -973,7 +1195,10 @@
     queueReportMetric({ identity, runId, metric });
   }
 
-  function queueReportMetric(request: { identity: string; runId: string; metric: string }): void {
+  function queueReportMetric(
+    request: { identity: string; runId: string; metric: string },
+    schedulingPolicy: ChartSchedulingPolicy = "abort-active",
+  ): void {
     const report = selectedReport;
     if (!report || !visibleReportMetrics.has(request.identity) || pageIsHidden()) return;
     const viewport = reportViewports[request.identity] ?? null;
@@ -984,9 +1209,14 @@
     delete nextErrors[request.identity];
     reportErrors = nextErrors;
     loadingReportMetrics = new Set([...loadingReportMetrics, request.identity]);
+    scheduledReportRequestKeys = {
+      ...scheduledReportRequestKeys,
+      [request.identity]: requestKey,
+    };
     chartScheduler.schedule({
       identity: `report:${request.identity}`,
       requestKey,
+      schedulingPolicy,
       request: async (signal) => {
         const cached = historyCache.get(
           request.runId,
@@ -1015,6 +1245,7 @@
       },
       publish: (history, publishedKey) => {
         if (selectedReport?.id !== report.id) return;
+        if (scheduledReportRequestKeys[request.identity] !== publishedKey) return;
         if (reportRequestKey(request) !== publishedKey) return;
         reportHistories = { ...reportHistories, [request.identity]: history };
         reportHistoryRequestKeys = {
@@ -1024,10 +1255,15 @@
         finishReportLoading(request.identity);
       },
       reject: (reason) => {
+        if (scheduledReportRequestKeys[request.identity] !== requestKey) return;
         finishReportLoading(request.identity);
         reportErrors = { ...reportErrors, [request.identity]: reasonMessage(reason) };
       },
-      discard: () => finishReportLoading(request.identity),
+      discard: () => {
+        if (scheduledReportRequestKeys[request.identity] === requestKey) {
+          finishReportLoading(request.identity);
+        }
+      },
     });
   }
 
@@ -1040,6 +1276,9 @@
     const next = new Set(loadingReportMetrics);
     next.delete(identity);
     loadingReportMetrics = next;
+    const requests = { ...scheduledReportRequestKeys };
+    delete requests[identity];
+    scheduledReportRequestKeys = requests;
   }
 
   function evictReportMetric(identity: string): void {
@@ -1047,14 +1286,17 @@
     const requests = { ...reportHistoryRequestKeys };
     const viewports = { ...reportViewports };
     const errors = { ...reportErrors };
+    const scheduled = { ...scheduledReportRequestKeys };
     delete histories[identity];
     delete requests[identity];
     delete viewports[identity];
     delete errors[identity];
+    delete scheduled[identity];
     reportHistories = histories;
     reportHistoryRequestKeys = requests;
     reportViewports = viewports;
     reportErrors = errors;
+    scheduledReportRequestKeys = scheduled;
     finishReportLoading(identity);
   }
 
@@ -1062,7 +1304,9 @@
     return `${panel.id}:${panel.run_id ?? ""}:${metric}`;
   }
 
-  function queueVisibleReportMetrics(): void {
+  function queueVisibleReportMetrics(
+    schedulingPolicy: ChartSchedulingPolicy = "abort-active",
+  ): void {
     const report = selectedReport;
     if (!report) return;
     for (const panel of report.layout.panels) {
@@ -1070,7 +1314,7 @@
       for (const metric of panel.metric_keys) {
         const identity = reportMetricIdentity(panel, metric);
         if (visibleReportMetrics.has(identity)) {
-          queueReportMetric({ identity, runId: panel.run_id, metric });
+          queueReportMetric({ identity, runId: panel.run_id, metric }, schedulingPolicy);
         }
       }
     }
@@ -1095,11 +1339,14 @@
     syncComparisonUrl("replace");
   }
 
-  function queueMetric(metric: string): void {
+  function queueMetric(
+    metric: string,
+    schedulingPolicy: ChartSchedulingPolicy = "abort-active",
+  ): void {
     if (pageIsHidden()) return;
     const viewport = metricViewports[metric] ?? null;
     if (!viewport) {
-      scheduleFullRangeFlush();
+      scheduleFullRangeFlush(schedulingPolicy);
       return;
     }
     const candidate = comparisonCandidate(metric);
@@ -1114,28 +1361,34 @@
       viewport,
       `comparison:${chartPreferenceIdentity(selectedProject, metric)}`,
       new Set([metric]),
+      schedulingPolicy,
     );
   }
 
-  function scheduleFullRangeFlush(): void {
+  function scheduleFullRangeFlush(schedulingPolicy: ChartSchedulingPolicy = "abort-active"): void {
+    if (schedulingPolicy === "abort-active") fullRangeFlushPolicy = schedulingPolicy;
     if (fullRangeFlushScheduled) return;
+    fullRangeFlushPolicy = schedulingPolicy;
     fullRangeFlushScheduled = true;
     fullRangeFlushFrame = window.requestAnimationFrame(() => {
       fullRangeFlushFrame = null;
       if (!fullRangeFlushScheduled) return;
       fullRangeFlushScheduled = false;
-      flushFullRangeMetrics();
+      const policy = fullRangeFlushPolicy;
+      fullRangeFlushPolicy = "abort-active";
+      flushFullRangeMetrics(policy);
     });
   }
 
   function cancelFullRangeFlush(): void {
     fullRangeFlushScheduled = false;
+    fullRangeFlushPolicy = "abort-active";
     if (fullRangeFlushFrame === null) return;
     window.cancelAnimationFrame(fullRangeFlushFrame);
     fullRangeFlushFrame = null;
   }
 
-  function flushFullRangeMetrics(): void {
+  function flushFullRangeMetrics(schedulingPolicy: ChartSchedulingPolicy): void {
     if (pageIsHidden()) return;
     for (const plan of deterministicComparisonPlans(visibleMetrics)) {
       const trackedMetrics = new Set(
@@ -1152,7 +1405,7 @@
       if (trackedMetrics.size === 0) continue;
       const metrics = plan.candidates.map((candidate) => candidate.metric);
       const identity = `comparison-batch:${selectedProject}:${JSON.stringify(metrics)}`;
-      scheduleComparisonPlan(plan, null, identity, trackedMetrics);
+      scheduleComparisonPlan(plan, null, identity, trackedMetrics, schedulingPolicy);
     }
   }
 
@@ -1170,6 +1423,7 @@
     viewport: ChartHistoryViewport | null,
     identity: string,
     trackedMetrics = new Set(plan.candidates.map((candidate) => candidate.metric)),
+    schedulingPolicy: ChartSchedulingPolicy = "abort-active",
   ): void {
     const project = selectedProject;
     const alignment = xAlignment;
@@ -1197,6 +1451,7 @@
     chartScheduler.schedule({
       identity,
       requestKey,
+      schedulingPolicy,
       request: async (signal) => {
         const cached = comparisonHistoryCache.get(requestKey);
         if (cached) return cached;
@@ -1233,7 +1488,7 @@
         }
         comparisonHistories = nextHistories;
         historyRequestKeys = nextHistoryKeys;
-        fullRangeBatchMetrics.delete(identity);
+        finishFullRangeBatch(identity);
       },
       reject: (reason) => {
         const message = reasonMessage(reason);
@@ -1244,11 +1499,11 @@
           if (visibleMetrics.has(metric)) nextErrors[metric] = message;
         }
         metricErrors = nextErrors;
-        fullRangeBatchMetrics.delete(identity);
+        finishFullRangeBatch(identity);
       },
       discard: () => {
         for (const { metric } of plan.candidates) finishMetricRequest(metric, requestKey);
-        fullRangeBatchMetrics.delete(identity);
+        finishFullRangeBatch(identity);
       },
     });
     if (!viewport) {
@@ -1257,6 +1512,13 @@
         new Set([...(fullRangeBatchMetrics.get(identity) ?? []), ...trackedMetrics]),
       );
     }
+  }
+
+  function finishFullRangeBatch(identity: string): void {
+    const metrics = fullRangeBatchMetrics.get(identity);
+    if (!metrics) return;
+    if ([...metrics].some((metric) => scheduledMetricBatchKeys[metric] !== undefined)) return;
+    fullRangeBatchMetrics.delete(identity);
   }
 
   function comparisonCandidate(metric: string): { metric: string; runIds: string[] } | null {
@@ -1364,8 +1626,67 @@
     visibleMetrics = new Set([...visibleMetrics].filter((metric) => metrics.has(metric)));
   }
 
-  function queueVisibleMetrics(): void {
-    for (const metric of visibleMetrics) queueMetric(metric);
+  function queueVisibleMetrics(schedulingPolicy: ChartSchedulingPolicy = "abort-active"): void {
+    for (const metric of visibleMetrics) queueMetric(metric, schedulingPolicy);
+  }
+
+  function scheduleLiveComparisonRefresh(finalRefresh: boolean): void {
+    const project = selectedProject;
+    liveChartRefresh.invalidate(
+      "comparison",
+      () => void refreshLiveComparisonCharts(project),
+      finalRefresh,
+    );
+  }
+
+  async function refreshLiveComparisonCharts(project: string): Promise<void> {
+    const controller = projectController;
+    if (
+      !controller ||
+      controller.signal.aborted ||
+      project !== selectedProject ||
+      selectedReport ||
+      pageIsHidden()
+    ) {
+      return;
+    }
+    queueVisibleMetrics("coalesce-pending");
+    if (metricCatalogLoading) return;
+    try {
+      const catalogFailure = await loadMetricCatalog(
+        metricAfter,
+        metricCursorStack,
+        controller.signal,
+      );
+      if (
+        controller.signal.aborted ||
+        projectController !== controller ||
+        project !== selectedProject ||
+        selectedReport
+      ) {
+        return;
+      }
+      if (catalogFailure) refreshError = `Metric catalog refresh: ${catalogFailure}`;
+      queueVisibleMetrics("coalesce-pending");
+    } catch (reason) {
+      if (!controller.signal.aborted && projectController === controller) {
+        refreshError = `Metric catalog refresh: ${reasonMessage(reason)}`;
+      }
+    }
+  }
+
+  function scheduleLiveReportRefresh(finalRefresh: boolean): void {
+    const reportId = selectedReport?.id;
+    if (!reportId) return;
+    liveChartRefresh.invalidate(
+      "report",
+      () => {
+        if (selectedReport?.id === reportId && !pageIsHidden()) {
+          queueVisibleReportMetrics("coalesce-pending");
+        }
+      },
+      finalRefresh,
+    );
   }
 
   function retryMetric(metric: string): void {
@@ -1386,6 +1707,7 @@
 
   function changeAlignment(_: string, alignment: RunAlignment): void {
     if (xAlignment === alignment) return;
+    liveChartRefresh.forget("comparison");
     xAlignment = alignment;
     comparisonHistories = {};
     historyRequestKeys = {};
@@ -1402,6 +1724,7 @@
 
   async function changeMetricMode(mode: MetricSetMode): Promise<void> {
     if (metricMode === mode) return;
+    liveChartRefresh.forget("comparison");
     metricMode = mode;
     metricAfter = null;
     metricCursorStack = [];
@@ -1452,6 +1775,14 @@
         const previous = previousRuns.get(latest.id);
         return latest.metric_revision > (previous?.metric_revision ?? -1);
       });
+      const finishedRunIds = new Set(
+        latestRuns.flatMap((latest) => {
+          const previous = previousRuns.get(latest.id);
+          return previous?.state === "running" && latest.state === "finished" ? [latest.id] : [];
+        }),
+      );
+      const comparisonFinished = [...finishedRunIds].some((runId) => stillSelected.has(runId));
+      const reportFinished = selectedReport !== null && finishedRunIds.size > 0;
       runs = upsertRuns(runs, latestRuns);
       navigationRuns = upsertRuns(navigationRuns, latestRuns, true);
       const primaryCurrent = runs.find((run) => run.id === primaryRunId);
@@ -1466,16 +1797,12 @@
           if (documentFailure) refreshError = `Run detail refresh: ${documentFailure}`;
         }
       }
-      if (revisionsChanged.length > 0) {
-        const catalogFailure = await loadMetricCatalog(
-          metricAfter,
-          metricCursorStack,
-          controller.signal,
-        );
-        if (catalogFailure) refreshError = `Metric catalog refresh: ${catalogFailure}`;
-        queueVisibleMetrics();
+      if (!selectedReport && (revisionsChanged.length > 0 || comparisonFinished)) {
+        scheduleLiveComparisonRefresh(comparisonFinished);
       }
-      if (selectedReport && anyMetricRevisionChanged) queueVisibleReportMetrics();
+      if (selectedReport && (anyMetricRevisionChanged || reportFinished)) {
+        scheduleLiveReportRefresh(reportFinished);
+      }
       const resourceContext = activeResourceContext();
       if (!resourceContext || !richDataChanged) return;
       const resourceFailure = await runResourceController.applyResourceRevision(
@@ -1511,6 +1838,10 @@
 
   function showError(reason: unknown): void {
     error = reasonMessage(reason);
+  }
+
+  function isNotFound(reason: unknown): reason is EpochDeckApiError {
+    return reason instanceof EpochDeckApiError && reason.status === 404;
   }
 
   function activeResourceContext(): RunResourceContext | null {
@@ -1599,16 +1930,34 @@
 </script>
 
 <svelte:head>
-  <title>Runloom</title>
+  <title>EpochDeck</title>
   <meta
     name="description"
-    content="Runloom is a lossless, self-hosted experiment tracker built for large histories."
+    content="EpochDeck is a lossless, self-hosted experiment tracker built for large histories."
   />
+  {#if dashboardConfig.logo_url && !dashboardLogoFailed}
+    <link rel="icon" href={dashboardConfig.logo_url} />
+  {/if}
 </svelte:head>
 
-<div class="app-shell">
+<div
+  class="app-shell"
+  style={`--configured-accent: ${dashboardConfig.accent_color}; --series-accent: ${dashboardConfig.accent_color}`}
+>
   <header>
-    <div class="brand"><h1>Runloom</h1></div>
+    <div class="brand">
+      <h1>
+        {#if dashboardConfig.logo_url && !dashboardLogoFailed}
+          <img
+            src={dashboardConfig.logo_url}
+            alt="EpochDeck"
+            onerror={() => (dashboardLogoFailed = true)}
+          />
+        {:else}
+          EpochDeck
+        {/if}
+      </h1>
+    </div>
     <div class="status" class:failed={Boolean(error || refreshError || healthError)}>
       <span class="status-dot" aria-hidden="true"></span>
       {health
@@ -1642,15 +1991,20 @@
     {/if}
 
     {#if loading}
-      <section class="empty">Loading the loom…</section>
+      <section class="empty">Loading EpochDeck…</section>
     {:else if projects.length === 0}
       <section class="empty">
         <p class="eyebrow">Ready for a first run</p>
         <h1>No experiments yet.</h1>
-        <code>runloom.init(project="my-project")</code>
+        <code>import epochdeck as ed; ed.init(project="my-project")</code>
       </section>
     {:else}
-      <div class="workspace">
+      <div
+        class="workspace"
+        class:resizing-sidebar={sidebarResizing}
+        class:sidebar-collapsed={sidebarCollapsed}
+        style={`--sidebar-width: ${sidebarWidth}px`}
+      >
         <NavigationSidebar
           visibleProjects={filteredProjects}
           {selectedProject}
@@ -1669,7 +2023,9 @@
           reportError={reportNavigationError}
           runs={navigationRuns}
           {selectedRunIds}
+          {runStylePreferences}
           primaryRunId={selectedRun?.id ?? null}
+          collapsed={sidebarCollapsed}
           bind:runSearch
           {runCursor}
           {runWindowTruncated}
@@ -1684,13 +2040,36 @@
           onloadruns={() => void loadMoreRuns()}
           ontogglerun={(run, selected) => void toggleRun(run, selected)}
           onchooserun={(run) => void chooseRun(run)}
+          onhoverrun={hoverRun}
+          onrunstylechange={updateRunStyle}
+          onresetrunstyle={resetRunStyle}
+          ontogglecollapsed={toggleSidebarCollapsed}
         />
+
+        {#if !sidebarCollapsed}
+          <button
+            type="button"
+            class="sidebar-resizer"
+            class:active={sidebarResizing}
+            aria-label={`Resize run sidebar, ${sidebarWidth} pixels`}
+            title="Drag to resize the run sidebar. Double-click to reset."
+            onpointerdown={startSidebarResize}
+            onpointermove={moveSidebarResize}
+            onpointerup={finishSidebarResize}
+            onpointercancel={finishSidebarResize}
+            onlostpointercapture={finishSidebarResize}
+            onkeydown={resizeSidebarWithKeyboard}
+            ondblclick={resetSidebarWidth}
+          ></button>
+        {/if}
 
         <section class="run-view">
           {#if selectedReport}
             <ReportDashboard
               report={selectedReport}
               {runs}
+              {runStylePreferences}
+              highlightedRunId={hoveredRunId}
               histories={reportHistories}
               viewports={reportViewports}
               loadingMetrics={loadingReportMetrics}
@@ -1728,6 +2107,8 @@
               active={activeRunTab === "metrics"}
               project={selectedProject}
               runs={comparisonRuns}
+              {runStylePreferences}
+              highlightedRunId={hoveredRunId}
               selectedRunCount={selectedRunIds.length}
               catalog={metricCatalog}
               catalogLoading={metricCatalogLoading}

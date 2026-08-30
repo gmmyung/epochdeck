@@ -1,6 +1,7 @@
 <script lang="ts">
   import MediaTimeline from "./MediaTimeline.svelte";
   import type { PaginatedRunTab, RunResourceState } from "./run-resources";
+  import SelectControl from "./SelectControl.svelte";
 
   export let active: boolean;
   export let state: RunResourceState;
@@ -50,14 +51,15 @@
       <div class="media-key-toolbar">
         <label>
           <span>Media key</span>
-          <select
+          <SelectControl
+            ariaLabel="Media key"
             value={state.selectedRichKey ?? ""}
-            onchange={(event) => onselectkey(event.currentTarget.value)}
-          >
-            {#each state.richKeys as key (key.key)}
-              <option value={key.key}>{key.key} · {key.count.toLocaleString()}</option>
-            {/each}
-          </select>
+            options={state.richKeys.map((key) => ({
+              value: key.key,
+              label: `${key.key} · ${key.count.toLocaleString()}`,
+            }))}
+            onvaluechange={onselectkey}
+          />
         </label>
         {#if state.richKeyCursor}
           <button type="button" disabled={state.loadingRichKeys} onclick={onloadkeys}>

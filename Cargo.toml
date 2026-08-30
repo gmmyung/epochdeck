@@ -1,16 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/runloom-catalog",
-  "crates/runloom-protocol",
-  "crates/runloom-server",
-  "crates/runloom-storage",
+  "crates/epochdeck-catalog",
+  "crates/epochdeck-protocol",
+  "crates/epochdeck-server",
+  "crates/epochdeck-storage",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.85"
+publish = false
+license = "Apache-2.0"
+repository = "https://github.com/gmmyung/epochdeck"
 
 [workspace.dependencies]
 anyhow = "1.0"

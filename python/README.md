@@ -1,24 +1,41 @@
-# Runloom Python SDK
+# EpochDeck Python SDK
 
-The Python client for Runloom, a standalone experiment tracker designed for
+The Python client for EpochDeck, a standalone experiment tracker designed for
 W&B-compatible workflows without hosted-service or Hugging Face dependencies.
 
 The SDK supports online, offline, and disabled scalar runs with durable
 background delivery, host telemetry, alerts, controlled config mutation, and
 JSON summary documents.
 
-```python
-import runloom as wandb
+Add the wheel attached to the matching GitHub prerelease to the project that
+imports the SDK; the distribution is not published to PyPI:
 
-run = wandb.init(project="demo", config={"seed": 42})
-assert wandb.run is run
+```bash
+uv add ./epochdeck-*.whl
+export EPOCHDECK_SERVER_URL=https://epochdeck.<tailnet>.ts.net
+```
+
+Use the conventional `import epochdeck as ed` alias in Python; the CLI command is
+`epochdeck`. Install the administrative CLI in an isolated tool environment when
+it is not needed as a project dependency. The optional W&B importer supports W&B
+SDK `>=0.29,<0.30`; add it to that tool environment when needed:
+
+```bash
+uv tool install --with 'wandb>=0.29,<0.30' ./epochdeck-*.whl
+```
+
+```python
+import epochdeck as ed
+
+run = ed.init(project="demo", config={"seed": 42})
+assert ed.run is run
 run.config.update({"optimizer": "adam"})
 run.config.update({"seed": 7}, allow_val_change=True)
-wandb.log({"loss": 0.25})
-wandb.log({"rollout": wandb.Video("rollout.mp4", caption="latest policy")})
-wandb.alert("Checkpoint saved", "Validation improved", level="info")
-wandb.summary["status"] = "complete"
-wandb.finish(summary={"tags": ["baseline", None]})
+ed.log({"loss": 0.25})
+ed.log({"rollout": ed.Video("rollout.mp4", caption="latest policy")})
+ed.alert("Checkpoint saved", "Validation improved", level="info")
+ed.summary["status"] = "complete"
+ed.finish(summary={"tags": ["baseline", None]})
 ```
 
 Changing an existing config value requires `allow_val_change=True`. Config and
@@ -28,9 +45,9 @@ value nodes, before writing durable state. Integer document values must stay in
 the signed JSON-safe range `-9007199254740991` through `9007199254740991`.
 
 Run IDs can be resumed explicitly with `resume="allow"` or `resume="must"`.
-The version-2 durable spool restores config, separate explicit and
-metric-derived summaries, steps, sequences, and the exact in-flight batch after
-a restart. A summary snapshot records its exact metric-journal boundary every
+The durable spool restores config, separate explicit and metric-derived
+summaries, steps, sequences, and the exact in-flight batch after a restart. A
+summary snapshot records its exact metric-journal boundary every
 128 records or 512 KiB and after explicit summary or finish changes; recovery
 validates that boundary and scans only the bounded crash tail, independently of
 delivery acknowledgements. Online resume requires a server that returns the
@@ -54,7 +71,7 @@ key discovery.
 
 CPU, memory, disk, network, process, load-average, and available NVIDIA GPU
 metrics are recorded under `system/` every 15 seconds after the first user
-metric. Set `RUNLOOM_SYSTEM_METRICS_INTERVAL=0` to disable collection or a
+metric. Set `EPOCHDECK_SYSTEM_METRICS_INTERVAL=0` to disable collection or a
 positive number of seconds to change the interval. System metrics do not change
 automatic steps or the user summary. Alerts accept `info`, `warn`, and `error`
 levels and use a separate durable delivery journal.
@@ -62,13 +79,15 @@ levels and use a separate durable delivery journal.
 Native rich values can be mixed with scalars in the same step:
 
 ```python
+import epochdeck as ed
+
 run.log(
     {
-        "frame": wandb.Image("frame.png", caption="camera 0"),
-        "audio": wandb.Audio("episode.wav", sample_rate=48_000),
-        "video": wandb.Video("episode.mp4"),
-        "scores": wandb.Table(columns=["step", "score"], data=rows),
-        "rewards": wandb.Histogram(reward_values, num_bins=64),
+        "frame": ed.Image("frame.png", caption="camera 0"),
+        "audio": ed.Audio("episode.wav", sample_rate=48_000),
+        "video": ed.Video("episode.mp4"),
+        "scores": ed.Table(columns=["step", "score"], data=rows),
+        "rewards": ed.Histogram(reward_values, num_bins=64),
     }
 )
 ```
@@ -81,11 +100,13 @@ bins are computed, so neither requires retaining a complete generator in memory.
 Artifacts reuse the same durable blob spool:
 
 ```python
-artifact = wandb.Artifact("policy", type="model", metadata={"step": 100_000})
+import epochdeck as ed
+
+artifact = ed.Artifact("policy", type="model", metadata={"step": 100_000})
 artifact.add_file("checkpoint.bin", name="weights/checkpoint.bin")
 run.log_artifact(artifact, aliases=["latest", "best"])
 
-downstream = wandb.init(project="demo")
+downstream = ed.init(project="demo")
 downstream.use_artifact(artifact)
 ```
 
@@ -96,6 +117,8 @@ artifact object or ID; online runs may also resolve `name:alias`.
 Structured traces use the same durable delivery path:
 
 ```python
+import epochdeck as ed
+
 with run.trace("answer", kind="llm", inputs={"prompt": "hello"}) as span:
     span.add_message("assistant", "hello back")
     span.set_outputs({"tokens": 2})
@@ -117,7 +140,9 @@ and 65,536 JSON value nodes.
 The public read API performs server-side filtering and lazy cursor pagination:
 
 ```python
-with wandb.Api() as api:
+import epochdeck as ed
+
+with ed.Api() as api:
     runs = api.runs(
         "demo",
         filters={"state": "finished", "config.seed": 7},
@@ -137,7 +162,9 @@ collections are lazy iterators; consume them while the `Api` context is open.
 Grid and random sweeps use finite typed value sets:
 
 ```python
-sweep_id = wandb.sweep(
+import epochdeck as ed
+
+sweep_id = ed.sweep(
     {
         "method": "random",
         "metric": {"name": "loss", "goal": "minimize"},
@@ -146,7 +173,7 @@ sweep_id = wandb.sweep(
     },
     project="demo",
 )
-wandb.agent(sweep_id, train, count=12)
+ed.agent(sweep_id, train, count=12)
 ```
 
 The agent injects claimed parameters into `init`, binds the resulting run, and

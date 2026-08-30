@@ -1,6 +1,6 @@
 # Compatibility contract
 
-Runloom treats compatibility as executable behavior, not matching names alone.
+EpochDeck treats compatibility as executable behavior, not matching names alone.
 Every supported feature requires contract tests covering local behavior, remote
 behavior, restart recovery, idempotency, and dashboard visibility where
 applicable.
@@ -29,19 +29,19 @@ usable and tested, not that the entire feature group is complete.
 | Traces | structured spans, messages, search metadata | Compatible |
 | Python API | synchronous public API and background delivery | Partial |
 | Remote server | authenticated ingestion and read APIs | Partial |
-| CLI | list, get, query, sync, W&B import, Runloom export | Partial |
-| Dashboard | projects, runs, metrics, media, artifacts, traces, reports | Partial |
+| CLI | list, get, query, sync, W&B import, EpochDeck export | Partial |
+| Dashboard | projects, runs, metrics, media, artifacts, traces, reports, server branding | Partial |
 | Import/export | lossless local export and resumable import | Partial |
 
 Features tied specifically to third-party hosting platforms are deliberately
-excluded. Runloom provides its own server, storage roots, and deployment model;
+excluded. EpochDeck provides its own server, storage roots, and deployment model;
 the documented pre-alpha deployment uses Tailnet policy as its access boundary.
 
 ## W&B parity roadmap
 
 | Feature group | Required behavior | Status |
 |---|---|---|
-| Drop-in workflow | `import runloom as wandb` for common training code | Partial |
+| Native workflow | `import epochdeck as ed` for common training code | Partial |
 | Run modes | online, offline, disabled, resume policies | Compatible |
 | Public API | projects, runs, filters, history, files, artifacts | Partial |
 | Media semantics | captions, grouping, sequences, native playback | Partial |
@@ -73,7 +73,7 @@ normalizing nondeterministic identifiers before comparison. A compatible row
 above applies only to its documented required behavior; it does not imply rich
 values, artifacts, sweeps, reports, or the complete W&B API.
 
-Unsupported arguments must fail or warn explicitly. Runloom will not silently
+Unsupported arguments must fail or warn explicitly. EpochDeck will not silently
 accept inert compatibility flags.
 
 The current partial scalar contract supports finite numeric and boolean values,
@@ -106,7 +106,7 @@ unsupported; native media and table values retain their documented captions,
 metadata, and string cells.
 
 The SDK records bounded host and process telemetry every 15 seconds after the
-first user metric. Set `RUNLOOM_SYSTEM_METRICS_INTERVAL=0` to disable it. System
+first user metric. Set `EPOCHDECK_SYSTEM_METRICS_INTERVAL=0` to disable it. System
 samples use the most recently completed user step and never change automatic
 step progression or the run summary. Alerts use a separate fsynced journal,
 sortable UUIDv7 identities, idempotent delivery, and a bounded dashboard list.
@@ -140,7 +140,7 @@ catalog growth do not depend on complete prompt or response payload size. The
 Python SDK caps attributes at 256 KiB and the complete JSON payload of each span
 at 16 MiB, and rejects an oversized span before writing it to the durable spool.
 
-`runloom.Api` exposes bounded project discovery, lazy server-filtered run pages,
+`epochdeck.Api` exposes bounded project discovery, lazy server-filtered run pages,
 single-run lookup, full-resolution history scans, artifacts, and traces. Filters
 currently support state, name, and typed top-level config/summary equality. The
 wider W&B filter language, general run-file surface, and alternate ordering are
@@ -150,7 +150,7 @@ Sweep definitions and trial claims are durable SQLite transactions. Grid and
 random schedulers select from finite typed `values` sets without materializing
 the Cartesian product. Agents lease claims, bind exactly one run, report a
 terminal result idempotently, and inherit the scheduled config through ordinary
-`runloom.init`. Optional median stopping compares bounded peer observations;
+`epochdeck.init`. Optional median stopping compares bounded peer observations;
 the batch acknowledgement sets `run.should_stop`, and the next `log` raises
 `SweepEarlyStop`. Continuous distributions, Hyperband, and process-level remote
 agents remain outside the current partial W&B surface and fail explicitly.
@@ -176,14 +176,14 @@ separate bounded transfer windows, with temporary files released immediately
 after upload.
 Scalar history, config, final source summary, source metadata, W&B run files,
 and logged output artifacts are retained in CAS. Image, audio, and video history
-references become native Runloom rich rows, and logged artifacts preserve their
-canonical W&B `vN` version number in Runloom's exact version slot. Only terminal
+references become native EpochDeck rich rows, and logged artifacts preserve their
+canonical W&B `vN` version number in EpochDeck's exact version slot. Only terminal
 source runs are accepted, and the importer rejects a source whose update token
 changes before completion. Unsupported history cells are counted in the final
 imported summary. Registry-wide and input artifact lineage remain outside this
 partial importer.
 
-Runloom project exports are lossless for the current supported Runloom surface.
+EpochDeck project exports are lossless for the current supported EpochDeck surface.
 They cursor-scan full-resolution metric columns and every paginated metadata
 collection, retain artifact links and control-plane definitions, stream each
 referenced CAS digest once, and verify content before an atomic directory

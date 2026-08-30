@@ -25,16 +25,16 @@ web/.svelte-kit/
 # Runtime data
 /data/
 /data.prealpha-archive-*/
-.runloom/
+.epochdeck/
 *.sqlite
 *.sqlite3
 *.sqlite-shm
 *.sqlite-wal
 *.sqlite3-shm
 *.sqlite3-wal
-*runloom-wandb-checkpoint.json*
+*epochdeck-wandb-checkpoint.json*
 *.import.json*
-*.runloom-export/
+*.epochdeck-export/
 *.parquet
 *.arrow
 *.ipc

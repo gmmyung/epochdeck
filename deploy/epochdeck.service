@@ -1,0 +1,38 @@
+[Unit]
+Description=EpochDeck experiment tracking server
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+RequiresMountsFor=/srv/epochdeck
+ConditionPathIsMountPoint=/srv/epochdeck
+
+[Service]
+Type=simple
+User=epochdeck
+Group=epochdeck
+EnvironmentFile=/etc/epochdeck/epochdeck.env
+ExecStart=/usr/local/bin/epochdeck-server
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=90s
+StateDirectory=epochdeck
+UMask=0027
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/epochdeck /srv/epochdeck/blobs
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

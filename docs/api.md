@@ -229,10 +229,10 @@ from the user summary and do not advance the logical training step.
 - `GET /rich-values/{value_id}` returns the selected complete manifest.
 
 Blob uploads send the digest in the path and content type in the header. The
-optional `x-runloom-file-name` header is a percent-encoded UTF-8 basename; after
+optional `x-epochdeck-file-name` header is a percent-encoded UTF-8 basename; after
 one decoding pass it must contain 1 to 512 non-control UTF-8 bytes and no `/` or
 `\\`. The server hashes while streaming to a staging file, rejects mismatches,
-syncs the file, and atomically installs it under `RUNLOOM_BLOBS_DIR/sha256`.
+syncs the file, and atomically installs it under `EPOCHDECK_BLOBS_DIR/sha256`.
 Repeating an already installed digest is idempotent and does not rewrite
 content. Successful reads carry a digest-derived strong `ETag` and
 `Cache-Control: public, max-age=31536000, immutable`; conditional and byte-range
@@ -366,6 +366,10 @@ Report list responses use the same `next_before` cursor convention.
 - `GET /runs/{run_id}` returns the selected complete run document.
 - `POST /query/runs` returns a bounded, cursor-paginated page of lightweight run
   summaries.
+- `GET /dashboard/config` returns the server's immutable dashboard accent color
+  and optional same-origin logo URL.
+- `GET /dashboard/logo` returns the configured bounded image, or 404 when no
+  logo is configured.
 - `GET /health` checks the SQLite catalog and writable metric/blob roots.
 - `GET /diagnostics` returns bounded process, queue, storage-capacity, and
   slow-request telemetry.
@@ -400,6 +404,14 @@ Run list items contain identity, name, state, timestamps,
 record. `summary_equals` tests an explicit value first and falls back to the
 derived metric preview only when the explicit layer lacks that key.
 
+Dashboard configuration has the shape
+`{"accent_color":"#2766ad","logo_url":null}`. When a logo is configured,
+`logo_url` is `/api/v1/dashboard/logo`; the response never exposes its server
+filesystem path. Logo responses use the validated `image/png`, `image/jpeg`,
+`image/webp`, or `image/svg+xml` content type and `Cache-Control: no-cache`.
+SVG responses carry a route-specific sandboxed `default-src 'none'` content
+security policy in addition to startup validation.
+
 Authentication and stable external deployment guarantees are not implemented
 yet. Keep the current server on a trusted interface or Tailnet.
 
@@ -416,7 +428,7 @@ embedded static dashboard assets bypass API admission. Admission permits remain
 attached to response bodies until EOF or disconnect. Raw blob and artifact-file
 responses additionally use a 16-stream pool, preventing slow media clients from
 occupying the general 64-request capacity. The default slow threshold is 1,000 ms and
-`RUNLOOM_SLOW_REQUEST_MS` accepts values from 1 to 60,000. Counters reset on
+`EPOCHDECK_SLOW_REQUEST_MS` accepts values from 1 to 60,000. Counters reset on
 process restart and do not add a telemetry database.
 
 SQLite writer acquisition is also bounded. If catalog contention outlasts that

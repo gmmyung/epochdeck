@@ -6,8 +6,8 @@ from collections.abc import Iterator, Mapping
 import httpx
 import pytest
 
-from runloom import Api
-from runloom.public_api import _compile_filters, _normalize_report_layout
+from epochdeck import Api
+from epochdeck.public_api import _compile_filters, _normalize_report_layout
 
 
 def test_public_api_pages_filtered_runs_and_scans_history(monkeypatch) -> None:
@@ -87,7 +87,7 @@ def test_public_api_pages_filtered_runs_and_scans_history(monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "Client", client_with_mock_transport)
 
-    with Api(server_url="http://runloom.test") as api:
+    with Api(server_url="http://epochdeck.test") as api:
         runs = list(
             api.runs(
                 "robotics",
@@ -121,7 +121,7 @@ def test_public_api_pages_filtered_runs_and_scans_history(monkeypatch) -> None:
 
 def test_public_api_rejects_inert_filter_and_order_options(monkeypatch) -> None:
     monkeypatch.setattr(httpx, "Client", httpx.Client)
-    api = Api(server_url="http://runloom.test")
+    api = Api(server_url="http://epochdeck.test")
     try:
         with pytest.raises(ValueError, match="unsupported comparison operator"):
             api.runs(filters={"config.seed": {"$gt": 2}})
@@ -226,7 +226,7 @@ def test_public_run_samples_full_history_and_pages_every_artifact(monkeypatch) -
         return original_client(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "Client", client_with_mock_transport)
-    with Api(server_url="http://runloom.test") as api:
+    with Api(server_url="http://epochdeck.test") as api:
         run = api.run("run-1")
         assert run.history(keys=["loss"], samples=25)[0]["_step"] == 100
         assert [item["artifact"]["id"] for item in run.artifacts(page_size=1)] == [
@@ -293,7 +293,7 @@ def test_public_api_manages_persisted_reports(monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "Client", client_with_mock_transport)
 
-    with Api(server_url="http://runloom.test") as api:
+    with Api(server_url="http://epochdeck.test") as api:
         created = api.create_report("robotics", name="Overview", layout=layout, id="report-1")
         listed = list(api.reports("robotics", per_page=20))
         loaded = api.report("report-1")
@@ -361,7 +361,7 @@ def test_public_collections_are_lazy_and_reject_bad_or_repeated_cursors(monkeypa
         return original_client(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "Client", client_with_mock_transport)
-    with Api(server_url="http://runloom.test") as api:
+    with Api(server_url="http://epochdeck.test") as api:
         projects = api.projects(per_page=1)
         assert requests == []
         assert next(projects)["id"] == "project-1"

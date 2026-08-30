@@ -35,6 +35,6 @@ describe("resource state", () => {
 
   it("uses concrete errors and a stable fallback", () => {
     expect(reasonMessage(new Error("broken"))).toBe("broken");
-    expect(reasonMessage(null)).toBe("Unable to reach Runloom");
+    expect(reasonMessage(null)).toBe("Unable to reach EpochDeck");
   });
 });

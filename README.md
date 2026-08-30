@@ -1,6 +1,6 @@
-# Runloom
+# EpochDeck
 
-Runloom is a standalone, self-hosted experiment tracking library and server.
+EpochDeck is a standalone, self-hosted experiment tracking library and server.
 Its public Python API targets W&B compatibility, while its storage and dashboard
 are designed for long-running, high-dimensional workloads.
 
@@ -8,12 +8,12 @@ The immediate compatibility milestone is Trackio feature parity. The long-term
 contract is practical W&B feature parity across logging, run management, rich
 media, artifacts, querying, and the dashboard.
 
-Runloom is pre-alpha. Scalar run tracking, native rich media, host telemetry,
+EpochDeck is pre-alpha. Scalar run tracking, native rich media, host telemetry,
 durable alerts, bounded dashboard sampling, background metric compaction,
 versioned artifacts, and structured traces are usable end to end. Finite sweeps
-and persisted reports are also usable. Authentication, import/export,
-multi-user authorization and the wider compatibility surface remain under
-active development.
+and persisted reports are also usable. Authentication, multi-user
+authorization, and the wider compatibility surface remain under active
+development.
 
 ## Non-negotiable properties
 
@@ -52,7 +52,34 @@ See [System architecture](docs/architecture.md), the
 [compatibility matrix](docs/compatibility.md), the [HTTP API](docs/api.md), and
 [metric benchmarks](docs/benchmarks.md). Production setup is covered by the
 [Tailnet deployment](docs/deployment.md) and [operations](docs/operations.md)
-runbooks.
+runbooks. See [SECURITY.md](SECURITY.md) before exposing a server.
+
+## Installing a prerelease
+
+GitHub prereleases attach static Linux server archives for x86_64 and arm64, a
+Python wheel and source distribution, and `SHA256SUMS`. Download all required
+files from the same release, verify them together, and install the archive for
+your machine:
+
+```bash
+sha256sum --ignore-missing --check --strict SHA256SUMS
+tar -xzf epochdeck-server-0.1.0-alpha.1-x86_64-unknown-linux-musl.tar.gz
+sudo install -m 0755 \
+  epochdeck-server-0.1.0-alpha.1-x86_64-unknown-linux-musl/epochdeck-server \
+  /usr/local/bin/epochdeck-server
+uv add ./epochdeck-*.whl
+```
+
+The checksum command verifies every release asset present in the current
+directory and fails if it finds none. Keep only files from that one release in
+the directory; missing assets for other architectures are intentionally
+ignored.
+
+Install the wheel with `uv add` in each training project that imports the SDK.
+Use `uv tool install ./epochdeck-*.whl` instead only when you want the isolated
+administration CLI. This release channel does not publish packages to PyPI,
+crates.io, or npm. EpochDeck remains pre-alpha: deploy only behind Tailnet
+policy and start each incompatible build with empty storage roots.
 
 ## Development
 
@@ -68,29 +95,31 @@ fetches the locked Rust dependencies and installs the locked Python and
 dashboard dependencies; subsequent incremental checks and single-binary builds
 do not reinstall them.
 
-Run the API and dashboard in separate terminals:
+Run the API and dashboard together:
 
 ```bash
-just dev-server
-just dev-web
+just dev
 ```
 
 The API listens on `127.0.0.1:8787` by default. The Vite development server
-proxies `/api` to it.
+proxies `/api` to it. `just dev` stops both processes when either one exits or
+when you press Ctrl-C. This two-process setup is only for contributor hot
+reload; release archives contain one server executable with the dashboard
+embedded.
 
 Log a run from Python:
 
 ```python
-import runloom as wandb
+import epochdeck as ed
 
-run = wandb.init(
-    project="bello-mujoco",
+run = ed.init(
+    project="robot-locomotion",
     config={"seed": 42, "learning_rate": 3e-4},
     server_url="http://127.0.0.1:8787",
 )
 for step in range(1_000):
     run.log({"train": {"loss": 1 / (step + 1)}, "reward": step * 0.1})
-run.log({"rollout": wandb.Video("rollout.mp4", caption="latest policy")})
+run.log({"rollout": ed.Video("rollout.mp4", caption="latest policy")})
 run.alert("Checkpoint saved", "Validation improved", level="info")
 with run.trace("policy-evaluation", kind="agent", inputs={"episode": 7}) as span:
     span.add_message("assistant", "The rollout completed successfully")
@@ -110,12 +139,12 @@ lost after the server commits it.
 
 The SDK samples host and process metrics every 15 seconds after the first user
 metric. These `system/` histories do not advance training steps or enter the
-summary. Set `RUNLOOM_SYSTEM_METRICS_INTERVAL=0` to disable collection. Alerts
+summary. Set `EPOCHDECK_SYSTEM_METRICS_INTERVAL=0` to disable collection. Alerts
 are also fsynced locally and delivered idempotently without blocking training.
 Use `mode="offline"`, then upload later with:
 
 ```bash
-runloom sync ~/.local/share/runloom/spool/<run-id>
+epochdeck sync ~/.local/share/epochdeck/spool/<run-id>
 ```
 
 Metric history accepts finite numbers and booleans. Config and summary documents
@@ -130,25 +159,27 @@ levels and 65,536 traversed values. Flattened paths must be unique string keys;
 booleans are stored canonically as `0.0` or `1.0`.
 
 Rich log values use `Image`, `Audio`, `Video`, `Table`, and `Histogram`.
-Runloom copies their bytes into the durable local spool, streams uploads without
+EpochDeck copies their bytes into the durable local spool, streams uploads without
 buffering complete files, and deduplicates server content by SHA-256. Put
-`RUNLOOM_BLOBS_DIR` on HDD/ZFS while leaving the catalog and metric roots on SSD.
+`EPOCHDECK_BLOBS_DIR` on HDD/ZFS while leaving the catalog and metric roots on SSD.
 The full-width dashboard renders each type natively, groups repeated media keys
 into step timelines, and supports byte-range video playback. Summary,
 configuration, metrics, media, traces, and artifacts have separate tabs;
-configuration documents are expandable trees. Metric charts are searchable and
-support hover values, pan, zoom, region selection, axis ranges and log scales,
-multiple smoothing modes, and line or exact min/max band display. Wheel and
-region selection zoom without a separate zoom mode.
+summary and configuration documents are searchable, expandable trees. Metric
+charts are searchable and support hover values, pan, zoom, region selection,
+axis ranges and log scales, multiple smoothing modes, and line or exact min/max
+band display. Wheel and region selection zoom without a separate zoom mode.
 
 Version checkpoints and datasets independently from run media:
 
 ```python
-artifact = wandb.Artifact("policy", type="model", metadata={"step": 100_000})
+import epochdeck as ed
+
+artifact = ed.Artifact("policy", type="model", metadata={"step": 100_000})
 artifact.add_file("checkpoint.bin", name="weights/checkpoint.bin")
 run.log_artifact(artifact, aliases=["latest", "best"])
 run.finish()
-downstream = wandb.init(project="bello-mujoco")
+downstream = ed.init(project="robot-locomotion")
 downstream.use_artifact(artifact)  # explicit input lineage
 ```
 
@@ -160,6 +191,8 @@ tabbed file browser.
 Log LLM, tool, chain, or agent execution as structured spans:
 
 ```python
+import epochdeck as ed
+
 with run.trace("answer", kind="llm", attributes={"model": "local-model"}) as span:
     span.set_inputs({"prompt": "Summarize the rollout"})
     span.add_message("user", "Summarize the rollout")
@@ -178,9 +211,11 @@ journaling.
 Query runs without loading an entire project:
 
 ```python
-api = wandb.Api(server_url="http://127.0.0.1:8787")
+import epochdeck as ed
+
+api = ed.Api(server_url="http://127.0.0.1:8787")
 runs = api.runs(
-    "bello-mujoco",
+    "robot-locomotion",
     filters={"state": "finished", "config.seed": 42, "summary.result": "complete"},
     per_page=100,
 )
@@ -190,13 +225,15 @@ for stored_run in runs:  # cursor pages are fetched lazily
 api.close()
 ```
 
-The matching CLI commands are `runloom projects`, `runloom runs`, `runloom get`,
-and `runloom history`. All list and history operations require bounded pages.
+The matching CLI commands are `epochdeck projects`, `epochdeck runs`, `epochdeck get`,
+and `epochdeck history`. All list and history operations require bounded pages.
 
 Schedule a finite parameter search with durable agents:
 
 ```python
-sweep_id = wandb.sweep(
+import epochdeck as ed
+
+sweep_id = ed.sweep(
     {
         "method": "grid",
         "metric": {"name": "validation/loss", "goal": "minimize"},
@@ -206,18 +243,18 @@ sweep_id = wandb.sweep(
         },
         "early_terminate": {"type": "median", "min_iter": 100, "min_trials": 3},
     },
-    project="bello-mujoco",
+    project="robot-locomotion",
 )
 
 
 def train():
-    run = wandb.init(project="bello-mujoco")  # claimed values populate run.config
+    run = ed.init(project="robot-locomotion")  # claimed values populate run.config
     while not run.should_stop:
         run.log(train_step(run.config))
     run.finish()
 
 
-wandb.agent(sweep_id, train)
+ed.agent(sweep_id, train)
 ```
 
 Claims and trial results survive agent restarts. Search spaces are generated by
@@ -226,9 +263,11 @@ index and remain memory-bounded even when the Cartesian grid is large.
 Persist a multi-run dashboard without copying metric history into the report:
 
 ```python
-api = wandb.Api(server_url="http://127.0.0.1:8787")
+import epochdeck as ed
+
+api = ed.Api(server_url="http://127.0.0.1:8787")
 report = api.create_report(
-    "bello-mujoco",
+    "robot-locomotion",
     name="Training comparison",
     description="Loss curves for the current baselines.",
     layout={
@@ -267,13 +306,13 @@ opening a report does not duplicate or return complete histories.
 Import a W&B project with four run workers and a durable checkpoint:
 
 ```bash
-uv run --project python --with wandb runloom import-wandb gyungmin bello-mujoco \
+uv run --project python --extra wandb epochdeck import-wandb your-entity your-project \
   --server-url http://127.0.0.1:8787 \
-  --checkpoint bello-mujoco.import.json \
+  --checkpoint your-project.import.json \
   --workers 4
 ```
 
-The importer derives stable Runloom IDs from terminal W&B runs and sends scalar
+The importer derives stable EpochDeck IDs from terminal W&B runs and sends scalar
 history in deterministic batches. Sparse high-step histories adapt their scan
 window to avoid issuing millions of empty W&B requests. A response lost after
 commit is replayed exactly; completed runs are skipped on the next invocation.
@@ -288,8 +327,8 @@ to resume contiguous acknowledged watermarks.
 W&B run files and logged artifacts, including checkpoints, are streamed into
 CAS with durable progress and bounded parallel transfer windows. Logged
 artifacts retain their canonical W&B `vN` version; run-file shards use ordinary
-automatic Runloom versions. Image, audio, and video history references are
-downloaded and uploaded in parallel as native Runloom rich values while their
+automatic EpochDeck versions. Image, audio, and video history references are
+downloaded and uploaded in parallel as native EpochDeck rich values while their
 original files remain preserved. Temporary disk usage is bounded by active
 transfers rather than the complete artifact.
 Unsupported non-scalar history cells are counted in the imported summary rather
@@ -299,7 +338,7 @@ lineage remain outside this importer surface.
 Create a complete portable project bundle:
 
 ```bash
-uv run --project python runloom export bello-mujoco ./bello-mujoco.runloom-export
+uv run --project python epochdeck export robot-locomotion ./robot-locomotion.epochdeck-export
 ```
 
 Before exporting, finish every selected run and quiesce all project writers. The
@@ -315,10 +354,10 @@ See [Export format](docs/export-format.md).
 
 ```text
 crates/
-  runloom-catalog/   SQLite catalog and transactional metadata
-  runloom-protocol/  shared API types
-  runloom-server/    HTTP server and process lifecycle
-  runloom-storage/   storage roots and columnar data plane
+  epochdeck-catalog/   SQLite catalog and transactional metadata
+  epochdeck-protocol/  shared API types
+  epochdeck-server/    HTTP server and process lifecycle
+  epochdeck-storage/   storage roots and columnar data plane
 python/              W&B-compatible Python SDK and CLI
 web/                 standalone Svelte dashboard
 docs/                architecture, compatibility, and roadmap
@@ -326,4 +365,4 @@ docs/                architecture, compatibility, and roadmap
 
 Trackio and W&B are compatibility references, not runtime dependencies.
 
-License is intentionally undecided until the project is ready to publish.
+EpochDeck is licensed under [Apache-2.0](LICENSE).

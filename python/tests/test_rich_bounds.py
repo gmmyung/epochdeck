@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from runloom import Artifact, Audio, Histogram, Image, Table
+from epochdeck import Artifact, Audio, Histogram, Image, Table
 
-artifact_module = importlib.import_module("runloom.artifact")
+artifact_module = importlib.import_module("epochdeck.artifact")
 
 
 def test_table_stops_reading_a_row_after_the_column_bound(tmp_path: Path) -> None:
@@ -120,7 +120,7 @@ def test_media_descriptor_validation_precedes_blob_copy(monkeypatch, tmp_path) -
         install_calls += 1
         return "0" * 64, len(data)
 
-    monkeypatch.setattr("runloom.rich._install_bytes", install_bytes)
+    monkeypatch.setattr("epochdeck.rich._install_bytes", install_bytes)
     with pytest.raises(ValueError, match="mime_type"):
         Image(b"large-media", mime_type="bad\n/type")
     with pytest.raises(ValueError, match="serialized image metadata exceeds"):

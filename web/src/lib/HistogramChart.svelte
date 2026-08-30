@@ -35,7 +35,7 @@
     const gap = values.length > 128 ? 0 : 1;
     const barWidth = width / Math.max(values.length, 1);
     const styles = getComputedStyle(target);
-    context.fillStyle = styles.getPropertyValue("--accent").trim() || "#2766ad";
+    context.fillStyle = styles.getPropertyValue("--series-accent").trim() || "#2766ad";
     for (let index = 0; index < values.length; index += 1) {
       const barHeight = (Math.max(values[index], 0) / maximum) * (height - 4);
       context.fillRect(

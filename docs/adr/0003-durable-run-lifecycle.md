@@ -19,16 +19,16 @@ history.
 
 ## Decision
 
-The Python spool is a versioned lifecycle record. Format version 2 stores run
-identity, config, the explicit summary, the bounded metric-derived summary
-preview and truncation flag, batch size, finish intent, and metric events. The
-summary snapshot carries a `summary_event_offset` that must be an exact journal
-record boundary. The SDK checkpoints the current preview and offset every 128
-metric records or 512 KiB of journal growth, and whenever explicit summary or
-finish state changes. Recovery never uses the delivery acknowledgement as a
-summary cursor: it validates the snapshot boundary and scans at most the
-bounded crash tail after that offset. Missing, malformed, unbounded, or
-non-record-boundary offsets fail visibly; there is no older spool fallback.
+The current Python spool lifecycle record stores run identity, config, the
+explicit summary, the bounded metric-derived summary preview and truncation
+flag, batch size, finish intent, and metric events. The summary snapshot carries
+a `summary_event_offset` that must be an exact journal record boundary. The SDK
+checkpoints the current preview and offset every 128 metric records or 512 KiB
+of journal growth, and whenever explicit summary or finish state changes.
+Recovery never uses the delivery acknowledgement as a summary cursor: it
+validates the snapshot boundary and scans at most the bounded crash tail after
+that offset. Missing, malformed, unbounded, or non-record-boundary offsets fail
+visibly; there is no older spool fallback.
 
 Before a metric HTTP upload, the spool atomically records the selected journal
 byte range, first sequence, canonical request-body size, and SHA-256 digest.
@@ -68,10 +68,11 @@ an in-flight batch. Offline runs restore explicit summary state and a bounded
 metric-derived preview without scanning the complete journal, and repeated sync
 of a finished spool is safe.
 
-The spool format is now an explicit compatibility boundary. Unknown versions,
-identity mismatches, corrupt delivery ranges, and missing server resume cursors
-fail visibly. The server performs one bounded Parquet-tail read on remote
-resume; ordinary creation and ingestion do not pay that cost.
+The spool has one current pre-alpha shape with no generation marker or upgrade
+path. Identity mismatches, corrupt delivery ranges, and missing server resume
+cursors fail visibly. An incompatible build starts with an empty spool root.
+The server performs one bounded Parquet-tail read on remote resume; ordinary
+creation and ingestion do not pay that cost.
 
 ## Rejected alternatives
 

@@ -12,7 +12,7 @@ unlink the file accepted by the successful request. The catalog would then
 reference a missing segment. Compaction had a related ambiguity when a
 deterministic output already existed after an interrupted pass.
 
-The server process already holds the exclusive Runloom storage lock, but HTTP
+The server process already holds the exclusive EpochDeck storage lock, but HTTP
 requests inside that process still execute concurrently. Cleanup therefore
 needs both mutation ordering and an explicit notion of which operation
 installed a file.
@@ -25,7 +25,7 @@ catalog registration, and error cleanup. Hash collisions may serialize
 unrelated runs, but the lock set remains explicitly bounded.
 
 MetricStore creates owned temporary files under
-`RUNLOOM_METRICS_DIR/staging`, on the same filesystem as final segments, and
+`EPOCHDECK_METRICS_DIR/staging`, on the same filesystem as final segments, and
 installs completed files with an atomic, no-clobber hard link. Every write
 reports either `InstalledNew` or `AlreadyPresent`; it never replaces an existing
 deterministic path. Temporary files are fully written and synced before

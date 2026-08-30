@@ -6,6 +6,7 @@
     | "check"
     | "close"
     | "chevron-down"
+    | "chevron-left"
     | "chevron-right"
     | "download"
     | "expand"
@@ -15,6 +16,7 @@
     | "info"
     | "media"
     | "minimize"
+    | "more"
     | "reset"
     | "search"
     | "select"
@@ -50,6 +52,8 @@
     <path d="m6 6 12 12M18 6 6 18" />
   {:else if name === "chevron-down"}
     <path d="m7 9 5 5 5-5" />
+  {:else if name === "chevron-left"}
+    <path d="m14 7-5 5 5 5" />
   {:else if name === "chevron-right"}
     <path d="m9 7 5 5-5 5" />
   {:else if name === "download"}
@@ -70,6 +74,8 @@
     <rect x="3" y="5" width="18" height="14" rx="1" /><path d="m10 9 5 3-5 3z" />
   {:else if name === "minimize"}
     <path d="M9 4v5H4M15 4v5h5M20 15h-5v5M4 15h5v5M9 9 3 3M15 9l6-6M15 15l6 6M9 15l-6 6" />
+  {:else if name === "more"}
+    <path d="M5 12h.01M12 12h.01M19 12h.01" stroke-width="3" />
   {:else if name === "reset"}
     <path d="M4 4v6h6M5.5 9A8 8 0 1 1 4 14" />
   {:else if name === "search"}

@@ -56,7 +56,7 @@ or operational acceptance criteria for that contract.
 - [x] Public query API and filtering.
 - [x] Sweeps, agents, scheduling, and early termination.
 - [x] Persisted reports and dashboard layouts.
-- [x] Resumable W&B importer and lossless Runloom export.
+- [x] Resumable W&B importer and lossless EpochDeck export.
 
 ## Milestone 5: production operations
 

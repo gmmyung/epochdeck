@@ -1,21 +1,41 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "runloom"
-version = "0.1.0"
+name = "epochdeck"
+version = "0.1.0a1"
 description = "Standalone, W&B-compatible experiment tracking"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
+keywords = ["experiment-tracking", "machine-learning", "mlops", "wandb"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
 dependencies = [
   "httpx>=0.28,<1",
   "psutil>=7,<8",
   "typer>=0.15,<1",
 ]
 
+[project.optional-dependencies]
+wandb = ["wandb>=0.29,<0.30"]
+
 [project.scripts]
-runloom = "runloom.cli:app"
+epochdeck = "epochdeck.cli:app"
+
+[project.urls]
+Documentation = "https://github.com/gmmyung/epochdeck#readme"
+Issues = "https://github.com/gmmyung/epochdeck/issues"
+Repository = "https://github.com/gmmyung/epochdeck"
 
 [dependency-groups]
 dev = [
@@ -24,9 +44,10 @@ dev = [
   "ruff>=0.11,<1",
   "types-psutil>=7,<8",
 ]
+release = ["hatchling==1.32.0", "twine==7.0.0"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/runloom"]
+packages = ["src/epochdeck"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

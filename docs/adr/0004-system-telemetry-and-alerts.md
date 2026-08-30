@@ -34,7 +34,7 @@ bounded UUID cursor list for the dashboard.
 Telemetry uses the same lossless storage and bounded history queries as scalar
 metrics without contaminating user summaries. It adds one lightweight sampling
 thread per active run and an optional bounded subprocess call. Alerts survive
-offline operation and lost responses, but Runloom does not yet send email,
+offline operation and lost responses, but EpochDeck does not yet send email,
 webhook, or mobile notifications.
 
 System metrics are absolute host observations rather than a separate resource
@@ -46,7 +46,7 @@ changing the catalog layout.
 ### Store telemetry in SQLite
 
 Long-running samples would make the control-plane database a metric store and
-recreate the dashboard performance problem Runloom's columnar data plane is
+recreate the dashboard performance problem EpochDeck's columnar data plane is
 designed to avoid.
 
 ### Encode alerts as scalar metrics

@@ -7,9 +7,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-import runloom.exporter as exporter_module
-from runloom.client import RunloomClient
-from runloom.exporter import (
+import epochdeck.exporter as exporter_module
+from epochdeck.client import EpochDeckClient
+from epochdeck.exporter import (
     ExportConsistencyError,
     _batches,
     _cursor_records,
@@ -168,7 +168,7 @@ def test_export_project_streams_all_current_resources_and_deduplicates_blobs(
     monkeypatch.setattr(exporter_module, "_sync_private_tree", record_sync_tree)
     monkeypatch.setattr(exporter_module.os, "replace", record_replace)
     monkeypatch.setattr(exporter_module, "_fsync_directory", record_fsync_directory)
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         manifest = export_project(client, "demo", destination)
 
     assert destination.stat().st_mode & 0o777 == 0o700
@@ -188,7 +188,8 @@ def test_export_project_streams_all_current_resources_and_deduplicates_blobs(
         "sweeps": 0,
         "traces": 0,
     }
-    assert json.loads((destination / "manifest.json").read_text())["format_version"] == 1
+    assert json.loads((destination / "manifest.json").read_text()) == manifest
+    assert manifest["format"] == "epochdeck-export"
     assert (destination / "blobs" / "sha256" / digest[:2] / digest).read_bytes() == content
     metric_page = json.loads(
         (destination / "runs" / "run-1" / "metrics" / "0000.jsonl").read_text()
@@ -219,7 +220,7 @@ def test_export_rejects_a_live_project_before_writing_a_partial_bundle(tmp_path)
 
     destination = tmp_path / "bundle"
     with (
-        RunloomClient(transport=httpx.MockTransport(handler)) as client,
+        EpochDeckClient(transport=httpx.MockTransport(handler)) as client,
         pytest.raises(ExportConsistencyError, match="still running"),
     ):
         export_project(client, "demo", destination)
@@ -282,7 +283,7 @@ def test_export_hydrates_lightweight_sweep_and_trial_pages(tmp_path) -> None:
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     destination = tmp_path / "bundle"
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         export_project(client, "demo", destination)
 
     exported_sweep = json.loads((destination / "sweeps.jsonl").read_text())
@@ -387,7 +388,7 @@ def test_export_rejects_a_changed_project_mutation_token(tmp_path) -> None:
 
     destination = tmp_path / "bundle"
     with (
-        RunloomClient(transport=httpx.MockTransport(handler)) as client,
+        EpochDeckClient(transport=httpx.MockTransport(handler)) as client,
         pytest.raises(ExportConsistencyError, match="project changed during export"),
     ):
         export_project(client, "demo", destination)
@@ -439,7 +440,7 @@ def test_export_mutation_token_rejects_transient_create_delete_aba(tmp_path) -> 
 
     destination = tmp_path / "bundle"
     with (
-        RunloomClient(transport=httpx.MockTransport(handler)) as client,
+        EpochDeckClient(transport=httpx.MockTransport(handler)) as client,
         pytest.raises(ExportConsistencyError, match="project changed during export"),
     ):
         export_project(client, "demo", destination)

@@ -5,7 +5,15 @@ import json
 import httpx
 from typer.testing import CliRunner
 
-from runloom.cli import app
+from epochdeck import __version__
+from epochdeck.cli import app
+
+
+def test_version_is_available_without_server_state() -> None:
+    result = CliRunner().invoke(app, ["--version"])
+
+    assert result.exit_code == 0
+    assert result.stdout == f"epochdeck {__version__}\n"
 
 
 def test_health_is_an_explicit_subcommand(monkeypatch) -> None:
@@ -13,7 +21,7 @@ def test_health_is_an_explicit_subcommand(monkeypatch) -> None:
         assert request.url.path == "/api/v1/health"
         return httpx.Response(
             200,
-            json={"service": "runloom", "version": "0.1.0", "status": "healthy"},
+            json={"service": "epochdeck", "version": "0.1.0", "status": "healthy"},
         )
 
     original_client = httpx.Client
@@ -24,11 +32,11 @@ def test_health_is_an_explicit_subcommand(monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "Client", client_with_mock_transport)
 
-    result = CliRunner().invoke(app, ["health", "--server-url", "http://runloom.test"])
+    result = CliRunner().invoke(app, ["health", "--server-url", "http://epochdeck.test"])
 
     assert result.exit_code == 0
     assert json.loads(result.stdout) == {
-        "service": "runloom",
+        "service": "epochdeck",
         "status": "healthy",
         "version": "0.1.0",
     }
@@ -36,7 +44,7 @@ def test_health_is_an_explicit_subcommand(monkeypatch) -> None:
 
 def test_doctor_returns_bounded_server_diagnostics(monkeypatch) -> None:
     diagnostics = {
-        "service": "runloom",
+        "service": "epochdeck",
         "version": "0.1.0",
         "requests_total": 12,
         "recent_slow_requests": [],
@@ -53,7 +61,7 @@ def test_doctor_returns_bounded_server_diagnostics(monkeypatch) -> None:
         return original_client(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "Client", client_with_mock_transport)
-    result = CliRunner().invoke(app, ["doctor", "--server-url", "http://runloom.test"])
+    result = CliRunner().invoke(app, ["doctor", "--server-url", "http://epochdeck.test"])
 
     assert result.exit_code == 0
     assert json.loads(result.stdout) == diagnostics
@@ -94,7 +102,7 @@ def test_runs_command_sends_typed_document_filters(monkeypatch) -> None:
             "--limit",
             "25",
             "--server-url",
-            "http://runloom.test",
+            "http://epochdeck.test",
         ],
     )
 
@@ -110,7 +118,7 @@ def test_runs_command_rejects_untyped_filter_values() -> None:
 
 
 def test_export_help_states_consistency_preconditions() -> None:
-    result = CliRunner().invoke(app, ["export", "--help"])
+    result = CliRunner().invoke(app, ["export", "--help"], terminal_width=160)
 
     assert result.exit_code == 0
     help_text = " ".join(result.stdout.split())

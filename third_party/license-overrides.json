@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "overrides": [
+    {
+      "ecosystem": "cargo",
+      "name": "alloc-stdlib",
+      "version": "0.2.4",
+      "license_expression": "BSD-3-Clause",
+      "documents": [
+        {
+          "path": "cargo/alloc-stdlib-0.2.4/LICENSE",
+          "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae",
+          "source": "https://github.com/dropbox/rust-alloc-no-stdlib/blob/ae42d22078b98549e987d2f03d12df7b984fde47/LICENSE",
+          "provenance": "verbatim upstream file at the Cargo 0.2.4 tag commit"
+        }
+      ]
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "crc-catalog",
+      "version": "2.5.0",
+      "license_expression": "MIT OR Apache-2.0",
+      "documents": [
+        {
+          "path": "cargo/crc-catalog-2.5.0/LICENSE-MIT",
+          "sha256": "5ef8fcfb6cccec8fcae043c834099a60c8b7406408db576e026d2b7e67dc5cf5",
+          "source": "https://github.com/akhilles/crc-catalog/blob/ed4ad631f22b05055c21a3a4127eb7cf6d75bb62/LICENSES/MIT.txt",
+          "provenance": "verbatim MIT alternative from the upstream Cargo 2.5.0 tag"
+        }
+      ]
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "flatbuffers",
+      "version": "25.12.19",
+      "license_expression": "Apache-2.0",
+      "documents": [
+        {
+          "path": "cargo/flatbuffers-25.12.19/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "source": "https://github.com/google/flatbuffers/blob/7e163021e59cca4f8e1e35a7c828b5c6b7915953/LICENSE",
+          "provenance": "verbatim upstream file at the Cargo v25.12.19 tag commit"
+        }
+      ]
+    },
+    {
+      "ecosystem": "pnpm",
+      "name": "is-reference",
+      "version": "3.0.3",
+      "license_expression": "MIT",
+      "documents": [
+        {
+          "path": "npm/rich-harris-mit/LICENSE",
+          "sha256": "82838dbc68b885c3c92029dbabb59b87ceb3bfc3532ff8182961d4998aa7ec02",
+          "source": "https://github.com/Rich-Harris/is-reference/tree/8bb053129bfabe2f6a7d7ed050159d67ebe82829",
+          "provenance": "MIT terms synthesized with the author from package metadata because the tagged archive declares MIT but contains no license file"
+        }
+      ]
+    },
+    {
+      "ecosystem": "pnpm",
+      "name": "locate-character",
+      "version": "3.0.0",
+      "license_expression": "MIT",
+      "documents": [
+        {
+          "path": "npm/rich-harris-mit/LICENSE",
+          "sha256": "82838dbc68b885c3c92029dbabb59b87ceb3bfc3532ff8182961d4998aa7ec02",
+          "source": "https://registry.npmjs.org/locate-character/-/locate-character-3.0.0.tgz",
+          "provenance": "MIT terms synthesized with the author from package metadata because the locked npm archive declares MIT but contains no license file"
+        }
+      ]
+    }
+  ]
+}

@@ -6,10 +6,10 @@ import threading
 import httpx
 import pytest
 
-import runloom
-from runloom import SweepEarlyStop
-from runloom.run import create_run
-from runloom.sweep import _MAX_AGENT_STATE_BYTES, _AgentState, _normalize_sweep
+import epochdeck
+from epochdeck import SweepEarlyStop
+from epochdeck.run import create_run
+from epochdeck.sweep import _MAX_AGENT_STATE_BYTES, _AgentState, _normalize_sweep
 
 
 def _summary_fields(
@@ -123,9 +123,9 @@ def test_sweep_and_agent_bind_claimed_configuration(monkeypatch, tmp_path) -> No
         return original_client(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "Client", client_with_mock_transport)
-    monkeypatch.setenv("RUNLOOM_SERVER_URL", "http://runloom.test")
+    monkeypatch.setenv("EPOCHDECK_SERVER_URL", "http://epochdeck.test")
 
-    sweep_id = runloom.sweep(
+    sweep_id = epochdeck.sweep(
         {
             "method": "grid",
             "metric": {"name": "loss", "goal": "minimize"},
@@ -138,12 +138,12 @@ def test_sweep_and_agent_bind_claimed_configuration(monkeypatch, tmp_path) -> No
     )
 
     def train() -> None:
-        run = runloom.init(project="demo", dir=tmp_path)
+        run = epochdeck.init(project="demo", dir=tmp_path)
         assert run.config.to_dict() == {"learning_rate": 0.1, "seed": 7}
         run.log({"loss": 0.25})
         run.finish()
 
-    runloom.agent(sweep_id, train, count=1, agent_id="agent-1")
+    epochdeck.agent(sweep_id, train, count=1, agent_id="agent-1")
 
     create_sweep_body = requests[0][2]
     assert create_sweep_body["max_runs"] == 2
@@ -221,7 +221,7 @@ def test_run_raises_after_scheduler_stop_acknowledgement(tmp_path) -> None:
 
 def test_sweep_rejects_unsupported_distribution_fields() -> None:
     with pytest.raises(ValueError, match="unsupported sweep parameter"):
-        runloom.sweep(
+        epochdeck.sweep(
             {
                 "method": "random",
                 "metric": {"name": "loss", "goal": "minimize"},
@@ -346,14 +346,14 @@ def test_agent_resumes_a_reclaimed_bound_run(monkeypatch, tmp_path) -> None:
         return original_client(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "Client", client_with_mock_transport)
-    monkeypatch.setenv("RUNLOOM_SERVER_URL", "http://runloom.test")
+    monkeypatch.setenv("EPOCHDECK_SERVER_URL", "http://epochdeck.test")
 
     def train() -> None:
-        run = runloom.init(project="demo", dir=tmp_path)
+        run = epochdeck.init(project="demo", dir=tmp_path)
         assert run.id == recovered_run_id
         run.finish(summary={"loss": 0.1})
 
-    runloom.agent(
+    epochdeck.agent(
         "sweep-1",
         train,
         count=1,
@@ -389,3 +389,13 @@ def test_sweep_agent_state_reads_and_writes_are_bounded(tmp_path) -> None:
                 "config": {"payload": "x" * _MAX_AGENT_STATE_BYTES},
             }
         )
+
+    state.write({"phase": "running", "trial_id": "trial-1"})
+    stored = json.loads(path.read_text())
+    assert stored == {
+        "agent_id": "agent-1",
+        "phase": "running",
+        "sweep_id": "sweep-1",
+        "trial_id": "trial-1",
+    }
+    assert state.read() == stored

@@ -9,6 +9,23 @@
   } from "./chart-data";
   import type { XAlignment } from "./chart-series";
   import Icon from "./Icon.svelte";
+  import SelectControl from "./SelectControl.svelte";
+
+  const DISPLAY_OPTIONS = [
+    { value: "band", label: "Band" },
+    { value: "line", label: "Line" },
+  ];
+  const SMOOTHING_OPTIONS = [
+    { value: "none", label: "None" },
+    { value: "time-ema", label: "Time-weighted EMA" },
+    { value: "running", label: "Running average" },
+    { value: "gaussian", label: "Gaussian" },
+    { value: "ema", label: "EMA" },
+  ];
+  const SCALE_OPTIONS = [
+    { value: "linear", label: "Linear" },
+    { value: "log", label: "Log" },
+  ];
 
   export let open = false;
   export let displayMode: "band" | "line";
@@ -30,6 +47,13 @@
   onMount(() => {
     const keydown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || !open) return;
+      if (
+        event.target instanceof Element &&
+        settings.contains(event.target) &&
+        event.target.closest('[role="listbox"]')
+      ) {
+        return;
+      }
       event.preventDefault();
       event.stopImmediatePropagation();
       close(true);
@@ -50,8 +74,7 @@
     if (restoreFocus) window.requestAnimationFrame(() => summary?.focus());
   }
 
-  function changeSmoothing(event: Event): void {
-    const mode = (event.currentTarget as HTMLSelectElement).value as SmoothingMode;
+  function changeSmoothing(mode: SmoothingMode): void {
     smoothingMode = mode;
     if (mode === "ema") smoothingAmount = 0.15;
     else if (mode === "time-ema") smoothingAmount = 25;
@@ -94,26 +117,30 @@
   <div class="chart-settings-popover" role="group" aria-label="Chart display settings">
     <label>
       Display
-      <select bind:value={displayMode}>
-        <option value="band">Band</option>
-        <option value="line">Line</option>
-      </select>
+      <SelectControl
+        ariaLabel="Chart display"
+        compact
+        value={displayMode}
+        options={DISPLAY_OPTIONS}
+        onvaluechange={(value) => (displayMode = value as "band" | "line")}
+      />
     </label>
     <label>
       Smoothing
-      <select value={smoothingMode} onchange={changeSmoothing}>
-        <option value="none">None</option>
-        <option value="time-ema">Time-weighted EMA</option>
-        <option value="running">Running average</option>
-        <option value="gaussian">Gaussian</option>
-        <option value="ema">EMA</option>
-      </select>
+      <SelectControl
+        ariaLabel="Smoothing"
+        compact
+        value={smoothingMode}
+        options={SMOOTHING_OPTIONS}
+        onvaluechange={(value) => changeSmoothing(value as SmoothingMode)}
+      />
     </label>
     {#if smoothingMode !== "none"}
       <label>
         {smoothingAmountLabel(smoothingMode)}
         <input
           type="number"
+          name="smoothing-amount"
           min={smoothingMode === "ema" ? 0.001 : 1}
           max={smoothingMode === "ema"
             ? 1
@@ -128,17 +155,25 @@
     {/if}
     <fieldset>
       <legend>X axis · {alignmentLabel(xAlignment)}</legend>
-      <select aria-label="X axis scale" bind:value={xScale} onchange={onviewchange}>
-        <option value="linear">Linear</option>
-        <option value="log">Log</option>
-      </select>
+      <SelectControl
+        ariaLabel="X axis scale"
+        compact
+        value={xScale}
+        options={SCALE_OPTIONS}
+        onvaluechange={(value) => {
+          xScale = value as ScaleMode;
+          onviewchange();
+        }}
+      />
       <input
+        name="x-minimum"
         aria-label="X axis minimum"
         placeholder="Auto min"
         bind:value={xMinimum}
         onchange={onviewchange}
       />
       <input
+        name="x-maximum"
         aria-label="X axis maximum"
         placeholder="Auto max"
         bind:value={xMaximum}
@@ -147,17 +182,25 @@
     </fieldset>
     <fieldset>
       <legend>Y axis</legend>
-      <select aria-label="Y axis scale" bind:value={yScale} onchange={onviewchange}>
-        <option value="linear">Linear</option>
-        <option value="log">Log</option>
-      </select>
+      <SelectControl
+        ariaLabel="Y axis scale"
+        compact
+        value={yScale}
+        options={SCALE_OPTIONS}
+        onvaluechange={(value) => {
+          yScale = value as ScaleMode;
+          onviewchange();
+        }}
+      />
       <input
+        name="y-minimum"
         aria-label="Y axis minimum"
         placeholder="Auto min"
         bind:value={yMinimum}
         onchange={onviewchange}
       />
       <input
+        name="y-maximum"
         aria-label="Y axis maximum"
         placeholder="Auto max"
         bind:value={yMaximum}

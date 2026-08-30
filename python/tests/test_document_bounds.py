@@ -5,10 +5,10 @@ from collections.abc import Iterator, Mapping
 
 import pytest
 
-from runloom.run import create_run
+from epochdeck.run import create_run
 
-run_module = importlib.import_module("runloom.run")
-api_module = importlib.import_module("runloom.api")
+run_module = importlib.import_module("epochdeck.run")
+api_module = importlib.import_module("epochdeck.api")
 
 
 def test_config_rejects_excessive_nesting_without_recursion_error() -> None:

@@ -8,7 +8,7 @@ the full blob CAS including content not currently reachable from one project.
 Client delivery journals live on each training machine and are backed up
 separately from the server roots.
 
-The server holds an advisory `runloom.lock` in each distinct canonical data,
+The server holds an advisory `epochdeck.lock` in each distinct canonical data,
 metric, and blob root for its entire lifetime. It sorts and deduplicates the
 canonical lock paths before taking all locks, so two instances cannot share an
 external metric or blob root even when their data roots differ. Physical backup
@@ -23,31 +23,31 @@ New bundle roots are mode `0700` and their files are mode `0600`, independent
 of the invoking shell's umask.
 
 ```bash
-sudo systemctl stop runloom
-sudo -u runloom env \
-  RUNLOOM_DATA_DIR=/var/lib/runloom/data \
-  RUNLOOM_METRICS_DIR=/var/lib/runloom/metrics \
-  RUNLOOM_BLOBS_DIR=/srv/runloom/blobs \
-  runloom backup /backups/runloom-$(date +%Y%m%d-%H%M%S)
-sudo systemctl start runloom
+sudo systemctl stop epochdeck
+sudo -u epochdeck env \
+  EPOCHDECK_DATA_DIR=/var/lib/epochdeck/data \
+  EPOCHDECK_METRICS_DIR=/var/lib/epochdeck/metrics \
+  EPOCHDECK_BLOBS_DIR=/srv/epochdeck/blobs \
+  epochdeck backup /backups/epochdeck-$(date +%Y%m%d-%H%M%S)
+sudo systemctl start epochdeck
 ```
 
 For multi-terabyte blob stores, keep downtime short with filesystem snapshots.
-Stop Runloom, snapshot every dataset that contains a configured root, then start
-Runloom immediately. Replicate or run `runloom backup` against read-only mounts
+Stop EpochDeck, snapshot every dataset that contains a configured root, then start
+EpochDeck immediately. Replicate or run `epochdeck backup` against read-only mounts
 of those snapshots while the live service continues. The stop/snapshot/start
 window is what coordinates snapshots across the SSD and HDD/ZFS roots.
 
 Restore only into empty roots:
 
 ```bash
-sudo systemctl stop runloom
-sudo -u runloom env \
-  RUNLOOM_DATA_DIR=/var/lib/runloom/data \
-  RUNLOOM_METRICS_DIR=/var/lib/runloom/metrics \
-  RUNLOOM_BLOBS_DIR=/srv/runloom/blobs \
-  runloom restore /backups/runloom-20260828-220000
-sudo systemctl start runloom
+sudo systemctl stop epochdeck
+sudo -u epochdeck env \
+  EPOCHDECK_DATA_DIR=/var/lib/epochdeck/data \
+  EPOCHDECK_METRICS_DIR=/var/lib/epochdeck/metrics \
+  EPOCHDECK_BLOBS_DIR=/srv/epochdeck/blobs \
+  epochdeck restore /backups/epochdeck-20260828-220000
+sudo systemctl start epochdeck
 ```
 
 Restore streams each regular bundle file once into exclusive staging while
@@ -58,15 +58,40 @@ its parent synced last, so a failed restore cannot expose manifests before their
 durable files. It rejects symbolic-link
 sources, duplicate inventory destinations, any bundle/storage-root overlap in
 either ancestor direction, an existing catalog, and non-empty metric/blob
-roots other than their acquired `runloom.lock` files. Metric and blob roots must
+roots other than their acquired `epochdeck.lock` files. Metric and blob roots must
 be disjoint; the data root may contain them but cannot equal or sit inside
 either.
 Practice restore to separate paths and query representative long runs before
 depending on a backup schedule.
 
+## Pre-alpha upgrade and rollback
+
+Treat the executable and its three storage roots as one versioned unit. Before
+an upgrade, stop the service, snapshot or archive the catalog, metric, and blob
+roots together, and record the exact running binary checksum. Install the new
+server and matching Python wheel, point the service at empty replacement roots,
+then start it and run:
+
+```bash
+epochdeck doctor --server-url http://127.0.0.1:8787
+curl --fail http://127.0.0.1:8787/api/v1/health
+```
+
+Log a sample run, inspect metrics and native media in the dashboard, and verify
+a backup/restore exercise before importing production-scale data. To roll back,
+stop the new process and restore the previous binary with its untouched matching
+roots. Never open newer roots with an older binary or mix roots from different
+deployments.
+
+Dashboard branding is deployment configuration, not EpochDeck storage. Physical
+backups do not include `/etc/epochdeck/epochdeck.env` or a file named by
+`EPOCHDECK_DASHBOARD_LOGO_PATH`; back up and restore those files with the rest of
+the host configuration. The server loads and validates branding once at
+startup, so replacing a logo or changing the accent color requires a restart.
+
 ## Diagnostics
 
-`GET /api/v1/diagnostics` and `runloom doctor` report a bounded operational
+`GET /api/v1/diagnostics` and `epochdeck doctor` report a bounded operational
 snapshot:
 
 - process uptime;
@@ -94,7 +119,7 @@ outstanding. Raw blob and artifact-file responses additionally use a
 
 ## Disposable pre-alpha storage
 
-Runloom has one current internal storage definition and no catalog-generation
+EpochDeck has one current internal storage definition and no catalog-generation
 marker or automatic upgrade path. When that definition changes, stop the
 service, archive all three configured roots together, and start the new build
 with empty roots. Physical backups preserve bytes and integrity but carry no

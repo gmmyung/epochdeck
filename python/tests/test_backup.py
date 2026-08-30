@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-import runloom.backup as backup_module
-from runloom.backup import BackupError, StorageRoots, backup_storage, restore_storage
+import epochdeck.backup as backup_module
+from epochdeck.backup import BackupError, StorageRoots, backup_storage, restore_storage
 
 
 def test_physical_backup_verifies_and_restores_split_storage(tmp_path) -> None:
@@ -37,16 +37,15 @@ def test_physical_backup_verifies_and_restores_split_storage(tmp_path) -> None:
         "created_at",
         "file_count",
         "format",
-        "format_version",
         "total_bytes",
     }
     assert not (bundle / "journal").exists()
     assert not (bundle / "metrics" / "staging").exists()
     assert not (bundle / "blobs" / "staging").exists()
-    assert not (bundle / "metrics" / "runloom.lock").exists()
-    assert not (bundle / "blobs" / "runloom.lock").exists()
+    assert not (bundle / "metrics" / "epochdeck.lock").exists()
+    assert not (bundle / "blobs" / "epochdeck.lock").exists()
     assert all(
-        (root / "runloom.lock").is_file() for root in (source.data, source.metrics, source.blobs)
+        (root / "epochdeck.lock").is_file() for root in (source.data, source.metrics, source.blobs)
     )
     assert bundle.stat().st_mode & 0o777 == 0o700
     for path in [
@@ -93,6 +92,7 @@ def test_directory_tree_sync_is_bottom_up_and_depth_bounded(monkeypatch, tmp_pat
 
     assert synced == [leaf, root / "branch", root]
 
+    monkeypatch.setattr(backup_module, "_MAX_TREE_DEPTH", 8)
     deep_root = tmp_path / "deep"
     deep_root.mkdir()
     current = deep_root
@@ -235,18 +235,18 @@ def test_backup_acquires_every_canonical_storage_root_lock(tmp_path) -> None:
     with sqlite3.connect(roots.catalog) as database:
         database.execute("CREATE TABLE health (ok INTEGER)")
 
-    with (roots.metrics / "runloom.lock").open("a+b") as active_metric_lock:
+    with (roots.metrics / "epochdeck.lock").open("a+b") as active_metric_lock:
         fcntl.flock(active_metric_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         with pytest.raises(BackupError, match="storage is active"):
             backup_storage(roots, tmp_path / "blocked-backup")
 
-    with (roots.data / "runloom.lock").open("a+b") as released_data_lock:
+    with (roots.data / "epochdeck.lock").open("a+b") as released_data_lock:
         fcntl.flock(released_data_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(released_data_lock.fileno(), fcntl.LOCK_UN)
 
     backup_storage(roots, tmp_path / "backup")
     assert all(
-        (root / "runloom.lock").is_file() for root in (roots.data, roots.metrics, roots.blobs)
+        (root / "epochdeck.lock").is_file() for root in (roots.data, roots.metrics, roots.blobs)
     )
 
 
@@ -321,8 +321,8 @@ def test_failed_restore_rolls_back_every_installed_root(monkeypatch, tmp_path) -
         restore_storage(bundle, target)
 
     assert not target.catalog.exists()
-    assert [path.name for path in target.metrics.iterdir()] == ["runloom.lock"]
-    assert [path.name for path in target.blobs.iterdir()] == ["runloom.lock"]
+    assert [path.name for path in target.metrics.iterdir()] == ["epochdeck.lock"]
+    assert [path.name for path in target.blobs.iterdir()] == ["epochdeck.lock"]
     assert list(target.data.glob(".restore-*")) == []
 
 
@@ -359,8 +359,8 @@ def test_restore_rejects_duplicate_inventory_destinations(tmp_path) -> None:
     with pytest.raises(BackupError, match="duplicate backup inventory destination"):
         restore_storage(bundle, target)
     assert not target.catalog.exists()
-    assert [path.name for path in target.metrics.iterdir()] == ["runloom.lock"]
-    assert [path.name for path in target.blobs.iterdir()] == ["runloom.lock"]
+    assert [path.name for path in target.metrics.iterdir()] == ["epochdeck.lock"]
+    assert [path.name for path in target.blobs.iterdir()] == ["epochdeck.lock"]
 
 
 @pytest.mark.parametrize("linked_source", ["manifest", "inventory", "metric"])
@@ -527,7 +527,7 @@ def test_backup_metadata_reads_reject_oversized_manifest_inventory_and_paths(tmp
         json.dumps(
             {
                 "category": "metrics",
-                "path": "runloom.lock",
+                "path": "epochdeck.lock",
                 "size": 0,
                 "sha256": "0" * 64,
             }

@@ -30,7 +30,7 @@ export function appendUniquePage<T>(
   return [...current, ...appended];
 }
 
-export function reasonMessage(reason: unknown, fallback = "Unable to reach Runloom"): string {
+export function reasonMessage(reason: unknown, fallback = "Unable to reach EpochDeck"): string {
   return reason instanceof Error && reason.message ? reason.message : fallback;
 }
 

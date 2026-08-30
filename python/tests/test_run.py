@@ -8,11 +8,11 @@ import uuid
 import httpx
 import pytest
 
-from runloom import Artifact, Audio, Histogram, Image, Table
-from runloom import _spool as spool_module
-from runloom._protocol import encode_json_request
-from runloom.rich import PreparedRichValue, RichValue
-from runloom.run import (
+from epochdeck import Artifact, Audio, Histogram, Image, Table
+from epochdeck import _spool as spool_module
+from epochdeck._protocol import encode_json_request
+from epochdeck.rich import PreparedRichValue, RichValue
+from epochdeck.run import (
     _SUMMARY_CHECKPOINT_BYTE_INTERVAL,
     _SUMMARY_CHECKPOINT_RECORD_INTERVAL,
     DeliveryError,
@@ -147,6 +147,22 @@ def test_offline_run_keeps_a_durable_journal(tmp_path) -> None:
     metadata = json.loads((run_directory / "run.json").read_text())
     assert event["step"] == 7
     assert event["metrics"] == {"loss": 1.5}
+    assert set(metadata) == {
+        "batch_size",
+        "config",
+        "explicit_summary",
+        "finished",
+        "finishing",
+        "id",
+        "metric_summary",
+        "name",
+        "project",
+        "resume",
+        "server_url",
+        "summary_event_offset",
+        "summary_truncated",
+        "sweep_trial_id",
+    }
     assert metadata["finished"] is True
     assert metadata["config"] == {"optimizer": "adam", "seed": 8}
     assert {**metadata["metric_summary"], **metadata["explicit_summary"]} == {
@@ -578,32 +594,6 @@ def test_resume_rejects_a_malformed_summary_event_offset(tmp_path, offset) -> No
         )
 
 
-def test_resume_does_not_fall_back_to_the_pre_snapshot_spool_format(tmp_path) -> None:
-    run_id = "019c1234-5678-7000-8000-000000000039"
-    run = create_run(
-        project="robotics",
-        run_id=run_id,
-        mode="offline",
-        spool_root=tmp_path,
-        system_monitor_interval=0,
-    )
-    metadata_path = tmp_path / run_id / "run.json"
-    metadata = json.loads(metadata_path.read_text())
-    metadata["format_version"] = 1
-    metadata_path.write_text(json.dumps(metadata))
-    del run
-
-    with pytest.raises(DeliveryError, match="unsupported spool format version 1"):
-        create_run(
-            project="robotics",
-            run_id=run_id,
-            mode="offline",
-            resume="allow",
-            spool_root=tmp_path,
-            system_monitor_interval=0,
-        )
-
-
 def test_metric_summary_is_bounded_and_explicit_values_keep_precedence(tmp_path) -> None:
     run = create_run(
         project="robotics",
@@ -669,7 +659,7 @@ def test_online_finish_reclaims_acknowledged_payloads_and_keeps_private_metadata
                         "digest": request.url.path.rsplit("/", 1)[1],
                         "size": len(content),
                         "mime_type": request.headers["content-type"],
-                        "file_name": request.headers.get("x-runloom-file-name"),
+                        "file_name": request.headers.get("x-epochdeck-file-name"),
                     },
                     "duplicate": False,
                 },
@@ -1040,7 +1030,7 @@ def test_offline_rich_values_stream_blobs_and_sync_idempotently(tmp_path) -> Non
                         "digest": digest,
                         "size": len(content),
                         "mime_type": request.headers["content-type"],
-                        "file_name": request.headers.get("x-runloom-file-name"),
+                        "file_name": request.headers.get("x-epochdeck-file-name"),
                     },
                     "duplicate": False,
                 },
@@ -1115,7 +1105,7 @@ def test_artifacts_upload_versions_and_durable_lineage_operations(tmp_path) -> N
                         "digest": digest,
                         "size": len(content),
                         "mime_type": request.headers["content-type"],
-                        "file_name": request.headers.get("x-runloom-file-name"),
+                        "file_name": request.headers.get("x-epochdeck-file-name"),
                     },
                     "duplicate": False,
                 },
@@ -1236,7 +1226,7 @@ def test_trace_sync_replays_the_same_span_after_response_loss(tmp_path) -> None:
                         "digest": digest,
                         "size": len(content),
                         "mime_type": request.headers["content-type"],
-                        "file_name": request.headers.get("x-runloom-file-name"),
+                        "file_name": request.headers.get("x-epochdeck-file-name"),
                     },
                     "duplicate": attempts > 0,
                 },

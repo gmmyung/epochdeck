@@ -276,6 +276,7 @@
           </div>
           <input
             type="range"
+            name="media-snapshot"
             min="0"
             max={Math.max(group.values.length - 1, 0)}
             step="1"

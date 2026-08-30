@@ -25,7 +25,7 @@ An agent claim has a renewable 60-second lease before and after it binds a run.
 Run creation verifies project ownership and atomically changes the trial from
 claimed to running. The owning agent heartbeats while training. Expired claimed
 or running trials are reassigned with their original configuration and any bound
-run ID, allowing the replacement agent to resume the same Runloom run. Heartbeat
+run ID, allowing the replacement agent to resume the same EpochDeck run. Heartbeat
 and terminal updates include the agent ID and reject stale owners. Terminal
 completion accepts only completed, failed, or stopped and is idempotent for the
 current owner.

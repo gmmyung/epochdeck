@@ -5,6 +5,7 @@ import {
   blobUrl,
   artifactFileUrl,
   comparisonSeriesHistory,
+  getDashboardConfig,
   getAlertPage,
   getArtifact,
   getArtifactLineagePage,
@@ -40,17 +41,33 @@ describe("getHealth", () => {
       vi.fn(
         async () =>
           new Response(
-            JSON.stringify({ service: "runloom", version: "0.1.0", status: "healthy" }),
+            JSON.stringify({ service: "epochdeck", version: "0.1.0", status: "healthy" }),
             { status: 200 },
           ),
       ),
     );
 
     await expect(getHealth()).resolves.toEqual({
-      service: "runloom",
+      service: "epochdeck",
       version: "0.1.0",
       status: "healthy",
     });
+  });
+
+  it("loads server dashboard branding", async () => {
+    const fetchMock = vi.fn(async () =>
+      Response.json({
+        logo_url: "/api/v1/dashboard/logo",
+        accent_color: "#8a31c7",
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getDashboardConfig()).resolves.toEqual({
+      logo_url: "/api/v1/dashboard/logo",
+      accent_color: "#8a31c7",
+    });
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/dashboard/config", { signal: undefined });
   });
 
   it("encodes project names and requests only selected history columns", async () => {
@@ -255,7 +272,7 @@ describe("getHealth", () => {
     );
 
     await expect(getHealth()).rejects.toMatchObject({
-      name: "RunloomApiError",
+      name: "EpochDeckApiError",
       status: 422,
       code: "invalid_request",
       message: "bad metric",

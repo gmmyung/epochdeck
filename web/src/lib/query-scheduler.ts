@@ -1,6 +1,7 @@
 export type ScheduledQuery<T> = {
   identity: string;
   requestKey: string;
+  schedulingPolicy?: "abort-active" | "coalesce-pending";
   request: (signal: AbortSignal) => Promise<T>;
   publish: (value: T, requestKey: string) => void;
   reject?: (reason: unknown) => void;
@@ -32,7 +33,7 @@ export class QueryScheduler {
     const active = this.active.get(query.identity);
     if (active?.requestKey === query.requestKey && !active.controller.signal.aborted) return;
     if (this.pending.get(query.identity)?.requestKey === query.requestKey) return;
-    if (active) {
+    if (active && query.schedulingPolicy !== "coalesce-pending") {
       active.controller.abort();
     }
     this.discardPending(query.identity);

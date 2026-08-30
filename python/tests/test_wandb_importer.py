@@ -11,10 +11,10 @@ from typing import ClassVar
 
 import pytest
 
-import runloom.wandb_importer as importer_module
-from runloom._wandb_state import Checkpoint, ImportCancellation, ImportCancelled
-from runloom.client import RunloomApiError
-from runloom.wandb_importer import _history_page_size, import_wandb_runs
+import epochdeck.wandb_importer as importer_module
+from epochdeck._wandb_state import Checkpoint, ImportCancellation, ImportCancelled
+from epochdeck.client import EpochDeckApiError
+from epochdeck.wandb_importer import _history_page_size, import_wandb_runs
 
 
 class CommError(Exception):
@@ -251,7 +251,7 @@ class FakeClient:
 
     def get_run(self, run_id: str):
         if self.run is None:
-            raise RunloomApiError(404, "not_found", "missing")
+            raise EpochDeckApiError(404, "not_found", "missing")
         return self.run
 
     def create_run(self, **request):
@@ -291,7 +291,7 @@ class FakeClient:
         assert self.run is not None
         self.run["state"] = "finished"
         assert (
-            summary["_runloom_wandb_source"]["unsupported_history_values"]
+            summary["_epochdeck_wandb_source"]["unsupported_history_values"]
             == self.expected_unsupported
         )
         return {"run": {"id": run_id, "state": "finished"}}
@@ -521,6 +521,34 @@ def test_wandb_iterator_restarts_without_duplicating_emitted_items(monkeypatch) 
     assert attempts == 2
 
 
+def test_wandb_iterator_rejects_identity_changes_while_repositioning(monkeypatch) -> None:
+    monkeypatch.setattr(importer_module, "_WANDB_RETRY_INITIAL_SECONDS", 0.0)
+    attempts = 0
+
+    def records() -> Iterator[str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            yield "run-a"
+            raise CommError("the service process is busy")
+        yield from ("run-new", "run-a", "run-b")
+
+    with pytest.raises(
+        importer_module.WandbImportError,
+        match="changed identity or order while resuming",
+    ):
+        list(
+            importer_module._retrying_wandb_reads(
+                records,
+                ImportCancellation(),
+                "W&B test listing",
+                resume_key=lambda value: value,
+            )
+        )
+
+    assert attempts == 2
+
+
 def test_history_scan_resumes_in_process_after_transient_comm_error(
     monkeypatch,
     tmp_path,
@@ -566,7 +594,69 @@ def test_history_scan_resumes_in_process_after_transient_comm_error(
     ]
 
 
-def test_media_download_retries_before_any_runloom_write(monkeypatch) -> None:
+def test_history_scan_must_match_authoritative_row_count(tmp_path) -> None:
+    class ShortHistoryRun(FakeRun):
+        historyLineCount = 4
+
+    client = FakeClient()
+    client.fail_first_batch = False
+
+    result = import_wandb_runs(
+        OneRunSourceApi(ShortHistoryRun()),
+        client,
+        entity="team",
+        project="demo",
+        target_project="imported",
+        checkpoint_path=tmp_path / "checkpoint.jsonl",
+        workers=1,
+        include_files=False,
+    )
+
+    assert result.failed == 1
+    assert "yielded 3 rows but historyLineCount declares 4" in result.failures[0]
+    assert client.finished is False
+    checkpoint = Checkpoint(
+        tmp_path / "checkpoint.jsonl",
+        entity="team",
+        project="demo",
+        target_project="imported",
+    )
+    assert checkpoint.state(FakeRun.id)["phase"] == "history"
+    assert checkpoint.state(FakeRun.id)["status"] == "failed"
+
+
+def test_authoritative_empty_history_does_not_start_a_step_scan(tmp_path) -> None:
+    class EmptyHistoryRun(FakeRun):
+        id = "empty-history-source"
+        name = "empty history source"
+        url = "https://wandb.ai/team/demo/runs/empty-history-source"
+        historyLineCount = 0
+        lastHistoryStep = 10**15
+
+        def scan_history(self, *, page_size: int):
+            raise AssertionError(f"empty history started a scan with page size {page_size}")
+
+    client = FakeClient()
+    client.fail_first_batch = False
+    client.expected_unsupported = 0
+
+    result = import_wandb_runs(
+        OneRunSourceApi(EmptyHistoryRun()),
+        client,
+        entity="team",
+        project="demo",
+        target_project="imported",
+        checkpoint_path=tmp_path / "checkpoint.jsonl",
+        workers=1,
+        include_files=False,
+    )
+
+    assert result.completed == 1
+    assert client.batches == []
+    assert client.finished is True
+
+
+def test_media_download_retries_before_any_epochdeck_write(monkeypatch) -> None:
     monkeypatch.setattr(importer_module, "_WANDB_RETRY_INITIAL_SECONDS", 0.0)
 
     class TransientMediaFile(FakeFile):
@@ -635,8 +725,8 @@ def test_wandb_import_replays_a_lost_batch_and_resumes_from_checkpoint(tmp_path)
     assert client.rich_values[-1]["metadata"]["caption"] == "policy rollout"
     assert client.finished is True
     assert client.run is not None
-    assert client.run["config"]["_runloom_wandb_source"]["state"] == "finished"
-    assert client.run["config"]["_runloom_wandb_source"]["updated_at"] == "2026-08-28T00:00:00Z"
+    assert client.run["config"]["_epochdeck_wandb_source"]["state"] == "finished"
+    assert client.run["config"]["_epochdeck_wandb_source"]["updated_at"] == "2026-08-28T00:00:00Z"
 
     third = import_wandb_runs(FakeSourceApi(), client, **arguments)
     assert third.skipped == 1
@@ -660,6 +750,7 @@ def test_resource_failure_resumes_after_completed_history(
         name = "resource source"
         url = "https://wandb.ai/team/demo/runs/resource-source"
         lastHistoryStep = 0
+        historyLineCount = 1
 
         def __init__(self) -> None:
             self.scan_calls = 0
@@ -733,8 +824,8 @@ def test_resource_failure_resumes_after_completed_history(
     [
         ("missing", "target run does not exist"),
         ("running", "target run is not finished"),
-        ("project", "deterministic Runloom run ID collision"),
-        ("source", "deterministic Runloom run ID collision"),
+        ("project", "deterministic EpochDeck run ID collision"),
+        ("source", "deterministic EpochDeck run ID collision"),
     ],
 )
 def test_completed_checkpoint_revalidates_target_run(
@@ -764,7 +855,7 @@ def test_completed_checkpoint_revalidates_target_run(
     elif target_problem == "project":
         client.run["project"] = "other-project"
     else:
-        client.run["config"]["_runloom_wandb_source"]["run_id"] = "other-source"
+        client.run["config"]["_epochdeck_wandb_source"]["run_id"] = "other-source"
 
     resumed = import_wandb_runs(FakeSourceApi(), client, **arguments)
 
@@ -928,6 +1019,42 @@ def test_wandb_import_no_files_skips_media_and_artifacts(tmp_path) -> None:
     assert client.artifacts == []
 
 
+def test_file_import_requires_logged_artifact_capability(tmp_path) -> None:
+    class MissingLoggedArtifactsRun(FakeRun):
+        id = "missing-artifact-api-source"
+        name = "missing artifact API source"
+        url = "https://wandb.ai/team/demo/runs/missing-artifact-api-source"
+        logged_artifacts = None
+
+        def files(self):
+            return iter(())
+
+    client = FakeClient()
+    client.fail_first_batch = False
+
+    result = import_wandb_runs(
+        OneRunSourceApi(MissingLoggedArtifactsRun()),
+        client,
+        entity="team",
+        project="demo",
+        target_project="imported",
+        checkpoint_path=tmp_path / "checkpoint.jsonl",
+        workers=1,
+        include_files=True,
+    )
+
+    assert result.failed == 1
+    assert "does not provide callable logged_artifacts" in result.failures[0]
+    assert client.finished is False
+    checkpoint = Checkpoint(
+        tmp_path / "checkpoint.jsonl",
+        entity="team",
+        project="demo",
+        target_project="imported",
+    )
+    assert checkpoint.state(MissingLoggedArtifactsRun.id)["phase"] == "logged_artifacts"
+
+
 def test_wide_wandb_history_row_is_split_and_replayed_at_its_row_boundary(
     monkeypatch,
     tmp_path,
@@ -937,6 +1064,7 @@ def test_wide_wandb_history_row_is_split_and_replayed_at_its_row_boundary(
         name = "wide source"
         url = "https://wandb.ai/team/demo/runs/wide-source"
         lastHistoryStep = 0
+        historyLineCount = 1
 
         def scan_history(self, *, page_size: int):
             assert page_size == 1_000
@@ -1001,6 +1129,7 @@ def test_unsupported_count_checkpoint_matches_byte_budget_batch_cursor(
         name = "two row source"
         url = "https://wandb.ai/team/demo/runs/two-row-source"
         lastHistoryStep = 1
+        historyLineCount = 2
 
         def scan_history(self, *, page_size: int):
             assert page_size == 1_000
@@ -1070,6 +1199,7 @@ def test_wandb_import_reports_the_exact_unsupported_metric_key(metric_key, tmp_p
         name = "invalid metric source"
         url = "https://wandb.ai/team/demo/runs/invalid-metric-source"
         lastHistoryStep = 0
+        historyLineCount = 1
 
         def scan_history(self, *, page_size: int):
             assert page_size == 1_000
@@ -1201,6 +1331,21 @@ def test_wandb_history_page_and_checkpoint_writes_are_bounded(tmp_path) -> None:
     )
     assert math.ceil(sparse_span / sparse_page_size) <= importer_module._TARGET_HISTORY_PAGE_COUNT
 
+    empty_sparse_page_size = _history_page_size(
+        SimpleNamespace(
+            lastHistoryStep=sparse_span - 1,
+            _attrs={"historyLineCount": 0},
+        )
+    )
+    assert (
+        math.ceil(sparse_span / empty_sparse_page_size)
+        <= importer_module._TARGET_HISTORY_PAGE_COUNT
+    )
+    assert (
+        _history_page_size(SimpleNamespace(lastHistoryStep=-1, _attrs={"historyLineCount": 0}))
+        == importer_module._MIN_HISTORY_PAGE_SIZE
+    )
+
     with pytest.raises(importer_module.WandbImportError, match="100000-row"):
         _history_page_size(
             SimpleNamespace(
@@ -1226,12 +1371,20 @@ def test_wandb_history_page_and_checkpoint_writes_are_bounded(tmp_path) -> None:
     assert initial_size < first_update_size < path.stat().st_size
     assert path.stat().st_mode & 0o777 == 0o600
     assert checkpoint.state("run-1")["rows_committed"] == 20
-    assert [json.loads(line)["type"] for line in path.read_text().splitlines()] == [
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["type"] for record in records] == [
         "header",
         "snapshot",
         "update",
         "update",
     ]
+    assert set(records[0]) == {
+        "entity",
+        "project",
+        "source",
+        "target_project",
+        "type",
+    }
 
 
 def test_history_media_is_parallel_bounded_and_does_not_hold_metric_ingest(tmp_path) -> None:
@@ -1707,6 +1860,35 @@ def test_artifact_import_uploads_and_unlinks_each_temporary_file_immediately() -
         "download:checkpoints/two.bin",
         "upload:two.bin",
     ]
+
+
+def test_run_file_artifact_names_use_the_complete_run_identity() -> None:
+    client = FakeClient()
+    cancellation = ImportCancellation()
+    run_ids = [
+        "deadbeef-0000-4000-8000-000000000001",
+        "deadbeef-0000-4000-8000-000000000002",
+    ]
+
+    for run_id in run_ids:
+        importer_module._import_file_chunk(
+            client,
+            [FakeFile()],
+            run_id=run_id,
+            source_metadata={
+                "entity": "team",
+                "project": "demo",
+                "run_id": run_id,
+                "url": f"https://wandb.ai/team/demo/runs/{run_id}",
+            },
+            chunk_start=0,
+            cancellation=cancellation,
+        )
+
+    assert [artifact["name"] for artifact in client.artifacts] == [
+        f"wandb-run-{run_id}-files-0000" for run_id in run_ids
+    ]
+    assert client.artifacts[0]["name"] != client.artifacts[1]["name"]
 
 
 @pytest.mark.parametrize(

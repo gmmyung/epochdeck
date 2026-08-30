@@ -4,6 +4,11 @@ export type Health = {
   status: "healthy" | "unhealthy";
 };
 
+export type DashboardConfig = {
+  logo_url: string | null;
+  accent_color: string;
+};
+
 export type Project = {
   id: string;
   name: string;
@@ -202,14 +207,14 @@ export type RunArtifactPage = {
   nextCursor: RunArtifactCursor | null;
 };
 
-export class RunloomApiError extends Error {
+export class EpochDeckApiError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
     message: string,
   ) {
     super(message);
-    this.name = "RunloomApiError";
+    this.name = "EpochDeckApiError";
   }
 }
 
@@ -264,6 +269,10 @@ export type ReportSummary = Pick<
 
 export function getHealth(signal?: AbortSignal): Promise<Health> {
   return getJson<Health>("/api/v1/health", signal);
+}
+
+export function getDashboardConfig(signal?: AbortSignal): Promise<DashboardConfig> {
+  return getJson<DashboardConfig>("/api/v1/dashboard/config", signal);
 }
 
 export async function getProjectPage(
@@ -435,7 +444,7 @@ export async function getRunArtifactPage(
     next_before_relation: RunArtifact["relation"] | null;
   }>(`/api/v1/runs/${encodeURIComponent(runId)}/artifacts?${query}`, signal);
   if ((result.next_before === null) !== (result.next_before_relation === null)) {
-    throw new Error("Runloom returned an incomplete artifact cursor");
+    throw new Error("EpochDeck returned an incomplete artifact cursor");
   }
   return {
     items: result.artifacts,
@@ -465,7 +474,7 @@ export async function getArtifactLineagePage(
     next_before: string | null;
   }>(`/api/v1/artifacts/${encodeURIComponent(artifactId)}/lineage?${query}`, signal);
   if (result.artifact_id !== artifactId || result.relation !== relation) {
-    throw new Error("Runloom returned lineage for a different artifact relation");
+    throw new Error("EpochDeck returned lineage for a different artifact relation");
   }
   return { items: result.runs, nextBefore: result.next_before };
 }
@@ -611,7 +620,7 @@ function validatedSearch(value: string, name: string): string {
 async function requestJson<T>(path: string, init: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
-    const fallback = `Runloom request failed with HTTP ${response.status}`;
+    const fallback = `EpochDeck request failed with HTTP ${response.status}`;
     let code = "http_error";
     let message = fallback;
     try {
@@ -621,7 +630,7 @@ async function requestJson<T>(path: string, init: RequestInit): Promise<T> {
     } catch {
       // A proxy or upstream may return a non-JSON error page.
     }
-    throw new RunloomApiError(response.status, code, message);
+    throw new EpochDeckApiError(response.status, code, message);
   }
   return (await response.json()) as T;
 }

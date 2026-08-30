@@ -4,8 +4,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from runloom import RunloomClient
-from runloom._protocol import DeliveryProtocolError, encode_json_request
+from epochdeck import EpochDeckClient
+from epochdeck._protocol import DeliveryProtocolError, encode_json_request
 
 
 def test_health_decodes_protocol_response() -> None:
@@ -13,13 +13,13 @@ def test_health_decodes_protocol_response() -> None:
         assert request.url.path == "/api/v1/health"
         return httpx.Response(
             200,
-            json={"service": "runloom", "version": "0.1.0", "status": "healthy"},
+            json={"service": "epochdeck", "version": "0.1.0", "status": "healthy"},
         )
 
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         health = client.health()
 
-    assert health.service == "runloom"
+    assert health.service == "epochdeck"
     assert health.status == "healthy"
 
 
@@ -36,7 +36,7 @@ def test_project_detail_validates_identity_and_opaque_mutation_token() -> None:
         assert request.url.path == "/api/v1/projects/demo"
         return httpx.Response(200, json=next(responses))
 
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         assert client.get_project("demo")["mutation_token"] == "184467440737095516160"
         with pytest.raises(DeliveryProtocolError, match="wrong project name"):
             client.get_project("demo")
@@ -52,7 +52,7 @@ def test_durable_writes_reject_malformed_success_acknowledgements() -> None:
         "batch_sequence": 1,
         "points": [{"sequence": 1, "step": 0, "timestamp_ms": 1, "metrics": {"x": 1}}],
     }
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(DeliveryProtocolError, match="run object"):
             client.create_run(
                 project="demo",
@@ -92,7 +92,7 @@ def test_explicit_artifact_version_is_validated_and_acknowledged_exactly() -> No
         )
 
     artifact = {"id": "artifact-1", "version": 3}
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(DeliveryProtocolError, match="wrong explicit version"):
             client.create_artifact("run-1", artifact)
         for invalid in (True, -1, 1 << 53, 1.0):
@@ -121,7 +121,7 @@ def test_history_selects_full_resolution_or_sampled_contract() -> None:
             },
         )
 
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         client.history("run-id", keys=["loss"], limit=250, after=10)
         client.history("run-id", keys=["loss"], max_points=500)
         with pytest.raises(ValueError, match="cannot combine"):
@@ -163,7 +163,7 @@ def test_history_rejects_requests_outside_the_http_bounds(kwargs, message) -> No
         raise AssertionError("invalid history request reached the transport")
 
     with (
-        RunloomClient(transport=httpx.MockTransport(handler)) as client,
+        EpochDeckClient(transport=httpx.MockTransport(handler)) as client,
         pytest.raises(ValueError, match=message),
     ):
         client.history("run-id", **kwargs)
@@ -200,7 +200,7 @@ def test_history_rejects_malformed_success_responses(updates, message) -> None:
         return httpx.Response(200, json=payload)
 
     with (
-        RunloomClient(transport=httpx.MockTransport(handler)) as client,
+        EpochDeckClient(transport=httpx.MockTransport(handler)) as client,
         pytest.raises(DeliveryProtocolError, match=message),
     ):
         client.history("run-1", keys=["loss"], after=1, limit=1)
@@ -224,7 +224,7 @@ def test_history_rejects_a_stalled_page_cursor() -> None:
         )
 
     with (
-        RunloomClient(transport=httpx.MockTransport(handler)) as client,
+        EpochDeckClient(transport=httpx.MockTransport(handler)) as client,
         pytest.raises(DeliveryProtocolError, match="did not advance"),
     ):
         client.history("run-1", keys=["loss"], after=10, limit=1)
@@ -246,7 +246,7 @@ def test_chart_clients_use_bounded_single_and_multi_run_contracts() -> None:
             {"run_id": "run-2", "key": "train/loss"},
         ],
     }
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         client.chart_history(
             "run/id",
             keys=["train/loss", "reward"],
@@ -280,7 +280,7 @@ def test_metric_discovery_uses_a_lexicographic_cursor() -> None:
             json={"run_id": "run-1", "keys": ["reward"], "next_after": None},
         )
 
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         client.metric_keys("run-1", after="loss,raw", limit=50)
 
     assert dict(requests[0].url.params) == {"after": "loss,raw", "limit": "50"}
@@ -293,7 +293,7 @@ def test_lightweight_collection_and_full_detail_routes() -> None:
         requests.append(request)
         return httpx.Response(200, json={})
 
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         client.projects(before="project-2", limit=25)
         client.runs("demo/project", before="run-2", q="eval run", limit=20)
         client.rich_value_keys("run/id", after="rollout/train", limit=15)
@@ -361,7 +361,7 @@ def test_document_updates_use_explicit_patch_contracts() -> None:
         requests.append(request)
         return httpx.Response(200, json={"run": {"config": {}, "summary": {}}})
 
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         client.update_config("run/id", {"seed": 2}, allow_val_change=True)
         client.update_summary("run/id", {"status": "complete"})
 
@@ -394,7 +394,7 @@ def test_ingest_quotes_the_run_identifier() -> None:
             },
         )
 
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         client.ingest_batch("run/id", batch)
 
     assert requests[0].url.raw_path == b"/api/v1/runs/run%2Fid/batches"
@@ -407,7 +407,7 @@ def test_get_run_uses_the_public_lifecycle_endpoint() -> None:
         assert request.url.path == "/api/v1/runs/run-id"
         return httpx.Response(200, json={"id": "run-id", "state": "finished"})
 
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         run = client.get_run("run-id")
 
     assert run == {"id": "run-id", "state": "finished"}
@@ -431,7 +431,7 @@ def test_alerts_use_bounded_create_and_list_contracts() -> None:
         "step": 4,
         "timestamp_ms": 1,
     }
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         client.create_alert("run/id", alert)
         client.alerts("run/id", before=alert["id"], limit=25)
 
@@ -464,7 +464,7 @@ def test_traces_use_create_and_search_contracts() -> None:
         "preview": {},
         "payload": None,
     }
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         client.create_trace_span("run/id", span)
         client.trace_spans("run/id", q="assistant reward", before=span["id"], limit=25)
 
@@ -491,7 +491,7 @@ def test_public_run_query_uses_a_structured_filter_body() -> None:
         "summary_equals": {"result": "complete"},
         "limit": 50,
     }
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         client.query_runs(query)
 
     assert requests[0].url.path == "/api/v1/query/runs"
@@ -510,7 +510,7 @@ def test_report_client_uses_project_collection_and_record_routes() -> None:
         return httpx.Response(200, json={"id": "report/id"})
 
     report = {"id": None, "name": "Overview", "description": None, "layout": {}}
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         client.create_report("demo/project", report)
         client.reports("demo/project", limit=25)
         client.update_report("report/id", {"name": "Updated", "layout": {}})
@@ -536,7 +536,7 @@ def test_sweep_detail_routes_quote_and_validate_record_identity() -> None:
             json={"id": "trial/id", "sweep_id": "sweep/id"},
         )
 
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         assert client.get_sweep("sweep/id")["id"] == "sweep/id"
         assert client.get_sweep_trial("trial/id")["id"] == "trial/id"
 
@@ -565,7 +565,7 @@ def test_sweep_detail_routes_reject_malformed_success_records(
         return httpx.Response(200, json=payload)
 
     with (
-        RunloomClient(transport=httpx.MockTransport(handler)) as client,
+        EpochDeckClient(transport=httpx.MockTransport(handler)) as client,
         pytest.raises(DeliveryProtocolError, match=message),
     ):
         getattr(client, method)("record-id")
@@ -588,7 +588,7 @@ def test_upload_blob_rejects_an_invalid_file_name_before_transport(
         raise AssertionError("invalid blob descriptor reached the transport")
 
     with (
-        RunloomClient(transport=httpx.MockTransport(handler)) as client,
+        EpochDeckClient(transport=httpx.MockTransport(handler)) as client,
         pytest.raises((TypeError, ValueError), match="file_name"),
     ):
         client.upload_blob(
@@ -621,7 +621,7 @@ def test_upload_blob_percent_encodes_and_validates_file_name_round_trip(
     digest = "0" * 64
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["x-runloom-file-name"] == encoded_file_name
+        assert request.headers["x-epochdeck-file-name"] == encoded_file_name
         assert request.read() == b"payload"
         return httpx.Response(
             201,
@@ -636,7 +636,7 @@ def test_upload_blob_percent_encodes_and_validates_file_name_round_trip(
             },
         )
 
-    with RunloomClient(transport=httpx.MockTransport(handler)) as client:
+    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         response = client.upload_blob(
             source,
             {
@@ -678,7 +678,7 @@ def test_upload_blob_rejects_a_mismatched_descriptor_acknowledgement(
         return httpx.Response(201, json={"blob": acknowledged, "duplicate": False})
 
     with (
-        RunloomClient(transport=httpx.MockTransport(handler)) as client,
+        EpochDeckClient(transport=httpx.MockTransport(handler)) as client,
         pytest.raises(DeliveryProtocolError, match=message),
     ):
         client.upload_blob(

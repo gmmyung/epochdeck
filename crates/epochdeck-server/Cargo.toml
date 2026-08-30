@@ -1,0 +1,39 @@
+[package]
+name = "epochdeck-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[features]
+embedded-dashboard = ["dep:mime_guess", "dep:rust-embed"]
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+fs2.workspace = true
+mime_guess = { workspace = true, optional = true }
+epochdeck-catalog = { path = "../epochdeck-catalog" }
+epochdeck-protocol = { path = "../epochdeck-protocol" }
+epochdeck-storage = { path = "../epochdeck-storage" }
+roxmltree = "0.21.1"
+rust-embed = { version = "8.0", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[lints]
+workspace = true

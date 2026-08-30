@@ -58,6 +58,7 @@
   export let series: MetricChartSeries[] = [];
   export let xAlignment: XAlignment = "step";
   export let parentViewport: MetricChartViewport | null = null;
+  export let highlightedRunId: string | null = null;
   export let onvisibilitychange: (metric: string, visible: boolean) => void;
   export let onviewportchange: (
     metric: string,
@@ -121,10 +122,11 @@
   let activeAlignment = xAlignment;
   let seriesIdentity = "";
   let hiddenRunIds = new Set<string>();
-  let hiddenBeforeSolo: Set<string> | null = null;
-  let soloRunId: string | null = null;
-  let highlightedRunId: string | null = null;
+  let legendHighlightedRunId: string | null = null;
+  let activeHighlightedRunId: string | null = null;
   let preparedSeries: PreparedMetricSeries[] = [];
+  let availableRunCount = 0;
+  let legendSeries: PreparedMetricSeries[] = [];
   let visibleSeries: PreparedMetricSeries[] = [];
   let renderableSeries: PreparedMetricSeries[] = [];
   let hoverPoints: SeriesHoverPoint[] = [];
@@ -183,24 +185,9 @@
     if (nextIdentity !== seriesIdentity) {
       seriesIdentity = nextIdentity;
       const currentRunIds = new Set(series.map(({ runId }) => runId));
-      if (soloRunId && currentRunIds.has(soloRunId)) {
-        hiddenRunIds = new Set(
-          series.filter(({ runId }) => runId !== soloRunId).map(({ runId }) => runId),
-        );
-      } else {
-        hiddenRunIds = new Set(
-          [...(soloRunId ? (hiddenBeforeSolo ?? []) : hiddenRunIds)].filter((runId) =>
-            currentRunIds.has(runId),
-          ),
-        );
-        soloRunId = null;
-        hiddenBeforeSolo = null;
-      }
-      if (highlightedRunId && !currentRunIds.has(highlightedRunId)) highlightedRunId = null;
-      if (hiddenBeforeSolo) {
-        hiddenBeforeSolo = new Set(
-          [...hiddenBeforeSolo].filter((runId) => currentRunIds.has(runId)),
-        );
+      hiddenRunIds = new Set([...hiddenRunIds].filter((runId) => currentRunIds.has(runId)));
+      if (legendHighlightedRunId && !currentRunIds.has(legendHighlightedRunId)) {
+        legendHighlightedRunId = null;
       }
       clearViewportRequest();
       resetTransientState();
@@ -210,6 +197,15 @@
   $: preparedSeries = series.map((item) =>
     prepareMetricSeries(item, metric, smoothingMode, smoothingAmount),
   );
+  $: availableRunCount = series.filter((item) => item.available).length;
+  $: legendSeries = preparedSeries.filter((item) => item.available);
+  $: activeHighlightedRunId =
+    (legendHighlightedRunId && legendSeries.some((item) => item.runId === legendHighlightedRunId)
+      ? legendHighlightedRunId
+      : null) ??
+    (highlightedRunId && legendSeries.some((item) => item.runId === highlightedRunId)
+      ? highlightedRunId
+      : null);
   $: visibleSeries = preparedSeries.filter((item) => !hiddenRunIds.has(item.runId));
   $: renderableSeries = visibleSeries.filter((item) => item.status === "ready");
   $: xValues = renderableSeries.flatMap((item) => item.x);
@@ -318,12 +314,12 @@
       yScale,
       configuredViewport,
       viewport,
-      highlightedRunId,
+      activeHighlightedRunId,
     );
   }
 
   $: if (canvas && visible && frame && renderableSeries.length > 0 && overlayRevision >= 0) {
-    drawInteraction(canvas, frame, xScale, yScale, hoverX, hoverPoints, drag, highlightedRunId);
+    drawInteraction(canvas, frame, xScale, yScale, hoverX, drag);
   }
 
   function redrawAll(): void {
@@ -422,9 +418,7 @@
     horizontalScale: ScaleMode,
     verticalScale: ScaleMode,
     activeHoverX: number | null,
-    activeHoverPoints: SeriesHoverPoint[],
     activeDrag: Drag | null,
-    highlighted: string | null,
   ): void {
     const { width, height, padding } = activeFrame;
     const requestedRatio = Math.min(window.devicePixelRatio || 1, CANVAS_DPR_LIMIT);
@@ -445,7 +439,6 @@
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
     const styles = getComputedStyle(target);
     const mutedColor = styles.getPropertyValue("--muted").trim() || "#596168";
-    const surfaceColor = styles.getPropertyValue("--surface").trim() || "#ffffff";
     const accentColor = styles.getPropertyValue("--accent").trim() || "#2766ad";
     const plotWidth = Math.max(width - padding.left - padding.right, 1);
     const plotHeight = Math.max(height - padding.top - padding.bottom, 1);
@@ -483,19 +476,6 @@
       context.lineTo(x, height - padding.bottom);
       context.stroke();
       context.setLineDash([]);
-      for (const point of activeHoverPoints) {
-        const emphasized = highlighted === null || highlighted === point.series.runId;
-        context.globalAlpha = emphasized ? 1 : 0.2;
-        drawMarker(
-          context,
-          toScreenX(point.x, activeFrame, horizontalScale),
-          toScreenY(point.smoothed, activeFrame, verticalScale),
-          point.series.color,
-          point.series.pattern,
-          surfaceColor,
-          4,
-        );
-      }
     }
     context.globalAlpha = 1;
     context.restore();
@@ -609,65 +589,20 @@
     context.globalAlpha = opacity;
     context.setLineDash(lineDash(pattern));
     context.beginPath();
-    const markers: Point[] = [];
     const valid = xValues.map((x, index) =>
       validPoint(x, values[index], horizontalScale, verticalScale),
     );
     for (const { start, end } of contiguousBucketRanges(buckets, valid)) {
-      let lastMarkerX = Number.NEGATIVE_INFINITY;
       for (let index = start; index < end; index += 1) {
         const x = toScreenX(xValues[index], activeFrame, horizontalScale);
         const y = toScreenY(values[index] as number, activeFrame, verticalScale);
         if (index === start) context.moveTo(x, y);
         else context.lineTo(x, y);
-        if (!Number.isFinite(lastMarkerX) || Math.abs(x - lastMarkerX) >= 88) {
-          markers.push({ x, y });
-          lastMarkerX = x;
-        }
       }
     }
     context.stroke();
     context.setLineDash([]);
-    for (const point of markers) {
-      drawMarker(context, point.x, point.y, color, pattern, "transparent", 2.5);
-    }
     context.globalAlpha = 1;
-  }
-
-  function drawMarker(
-    context: CanvasRenderingContext2D,
-    x: number,
-    y: number,
-    color: string,
-    pattern: SeriesPattern,
-    fill: string,
-    radius: number,
-  ): void {
-    context.save();
-    context.setLineDash([]);
-    context.strokeStyle = color;
-    context.fillStyle = fill === "transparent" ? color : fill;
-    context.lineWidth = 1.5;
-    context.beginPath();
-    if (pattern === "dash") {
-      context.rect(x - radius, y - radius, radius * 2, radius * 2);
-    } else if (pattern === "dot") {
-      context.moveTo(x, y - radius - 0.5);
-      context.lineTo(x + radius + 0.5, y);
-      context.lineTo(x, y + radius + 0.5);
-      context.lineTo(x - radius - 0.5, y);
-      context.closePath();
-    } else if (pattern === "dash-dot") {
-      context.moveTo(x, y - radius - 0.8);
-      context.lineTo(x + radius + 0.8, y + radius);
-      context.lineTo(x - radius - 0.8, y + radius);
-      context.closePath();
-    } else {
-      context.arc(x, y, radius, 0, Math.PI * 2);
-    }
-    context.fill();
-    if (fill !== "transparent") context.stroke();
-    context.restore();
   }
 
   function validPoint(
@@ -840,8 +775,12 @@
     if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
     const distanceX = Math.abs(completed.current.x - completed.start.x);
     const distanceY = Math.abs(completed.current.y - completed.start.y);
-    if (interactionMode === "select" && distanceX >= 6 && distanceY >= 6) {
-      viewport = viewportFromSelection(completed, frame, xScale, yScale);
+    if (interactionMode === "select" && distanceX >= 6) {
+      const selectedViewport = viewportFromSelection(completed, frame, xScale, yScale);
+      viewport = {
+        x: selectedViewport.x,
+        y: distanceY >= 6 ? selectedViewport.y : completed.viewport.y,
+      };
     }
     if (interactionMode === "pan" || viewport !== null) scheduleViewportRequest(viewport);
     overlayRevision += 1;
@@ -1059,7 +998,6 @@
   }
 
   function toggleRun(runId: string): void {
-    exitSolo();
     const next = new Set(hiddenRunIds);
     if (next.has(runId)) next.delete(runId);
     else next.add(runId);
@@ -1068,37 +1006,14 @@
     overlayRevision += 1;
   }
 
-  function toggleSolo(runId: string): void {
-    if (soloRunId === runId) {
-      exitSolo();
-    } else {
-      if (soloRunId === null) hiddenBeforeSolo = new Set(hiddenRunIds);
-      soloRunId = runId;
-      hiddenRunIds = new Set(
-        series.filter((item) => item.runId !== runId).map((item) => item.runId),
-      );
-    }
-    hoverX = null;
-    overlayRevision += 1;
-  }
-
-  function exitSolo(): void {
-    if (soloRunId === null) return;
-    hiddenRunIds = hiddenBeforeSolo ?? new Set<string>();
-    hiddenBeforeSolo = null;
-    soloRunId = null;
-  }
-
   function showAllRuns(): void {
     hiddenRunIds = new Set<string>();
-    hiddenBeforeSolo = null;
-    soloRunId = null;
     hoverX = null;
     overlayRevision += 1;
   }
 
   function highlightRun(runId: string | null): void {
-    highlightedRunId = runId;
+    legendHighlightedRunId = runId;
     overlayRevision += 1;
   }
 
@@ -1276,7 +1191,7 @@
   <div class="chart-heading">
     <div class="chart-title">
       <strong>{title ?? metric}</strong>
-      <small>{series.length} {series.length === 1 ? "run" : "runs"}</small>
+      <small>{availableRunCount} {availableRunCount === 1 ? "run" : "runs"}</small>
       {#if anyLoading}<span class="loading-label">updating</span>{/if}
     </div>
     <div class="chart-actions" role="toolbar" aria-label="Chart mouse actions">
@@ -1321,22 +1236,31 @@
     </div>
   </div>
 
-  {#if series.length > 0}
+  {#if legendSeries.length > 0}
     <div class="chart-legend" role="list" aria-label="Compared runs">
-      {#each preparedSeries as item (item.runId)}
+      {#each legendSeries as item (item.runId)}
         {@const status = statusLabel(item)}
         <div
           class="legend-entry"
           class:hidden={hiddenRunIds.has(item.runId)}
-          class:highlighted={highlightedRunId === item.runId}
+          class:highlighted={activeHighlightedRunId === item.runId}
           role="listitem"
           onmouseenter={() => highlightRun(item.runId)}
           onmouseleave={() => highlightRun(null)}
+          onfocusin={() => highlightRun(item.runId)}
+          onfocusout={(event) => {
+            if (
+              !(event.relatedTarget instanceof Node) ||
+              !event.currentTarget.contains(event.relatedTarget)
+            ) {
+              highlightRun(null);
+            }
+          }}
         >
           <button
             class="legend-toggle"
             type="button"
-            aria-label={`${hiddenRunIds.has(item.runId) ? "Show" : "Hide"} ${item.runName}`}
+            aria-label={`${hiddenRunIds.has(item.runId) ? "Show" : "Hide"} ${item.runName} (${item.runId.slice(0, 8)})`}
             aria-pressed={!hiddenRunIds.has(item.runId)}
             onclick={() => toggleRun(item.runId)}
           >
@@ -1348,17 +1272,9 @@
             <span class="legend-name" title={item.runName}>{item.runName}</span>
             {#if status}<small class:no-data={item.status === "no-data"}>{status}</small>{/if}
           </button>
-          <button
-            class="legend-solo"
-            class:active={soloRunId === item.runId}
-            type="button"
-            aria-label={`${soloRunId === item.runId ? "Restore all runs after soloing" : "Solo"} ${item.runName}`}
-            aria-pressed={soloRunId === item.runId}
-            onclick={() => toggleSolo(item.runId)}>solo</button
-          >
         </div>
       {/each}
-      {#if hiddenRunIds.size > 0}
+      {#if legendSeries.some((item) => hiddenRunIds.has(item.runId))}
         <button class="legend-show-all" type="button" onclick={showAllRuns}>show all</button>
       {/if}
     </div>
@@ -1429,7 +1345,8 @@
               <tbody>
                 {#each hoverPoints as point (point.series.runId)}
                   <tr
-                    class:deemphasized={highlightedRunId && highlightedRunId !== point.series.runId}
+                    class:deemphasized={activeHighlightedRunId &&
+                      activeHighlightedRunId !== point.series.runId}
                   >
                     <th scope="row" title={point.series.runName}>
                       <span class="tooltip-series">
@@ -1515,7 +1432,6 @@
   }
 
   .legend-toggle,
-  .legend-solo,
   .legend-show-all {
     min-width: 0;
     border: 0;
@@ -1525,6 +1441,7 @@
   }
 
   .legend-toggle {
+    width: 100%;
     display: grid;
     grid-template-columns: 28px minmax(40px, 1fr) auto;
     gap: 6px;
@@ -1534,8 +1451,6 @@
   }
 
   .legend-toggle:hover,
-  .legend-solo:hover,
-  .legend-solo.active,
   .legend-show-all:hover {
     background: var(--button-hover);
     color: var(--text);
@@ -1559,13 +1474,6 @@
     color: var(--faint);
   }
 
-  .legend-solo {
-    padding: 0 7px;
-    border-left: 1px solid var(--line);
-    font-size: 11px;
-    text-transform: uppercase;
-  }
-
   .legend-show-all {
     flex: none;
     padding: 6px 8px;
@@ -1574,61 +1482,30 @@
   }
 
   .series-swatch {
-    --series-color: var(--accent);
-    position: relative;
+    --series-color: var(--series-accent);
     width: 26px;
-    height: 10px;
+    height: 4px;
     display: inline-block;
     flex: none;
+    background: var(--series-color);
   }
 
-  .series-swatch::before {
-    position: absolute;
-    top: 4px;
-    right: 0;
-    left: 0;
-    border-top: 2px solid var(--series-color);
-    content: "";
+  .series-swatch.pattern-dash {
+    background: repeating-linear-gradient(90deg, var(--series-color) 0 7px, transparent 7px 11px);
   }
 
-  .series-swatch.pattern-dash::before,
-  .series-swatch.pattern-dash-dot::before {
-    border-top-style: dashed;
+  .series-swatch.pattern-dot {
+    background: repeating-linear-gradient(90deg, var(--series-color) 0 2px, transparent 2px 6px);
   }
 
-  .series-swatch.pattern-dot::before {
-    border-top-style: dotted;
-  }
-
-  .series-swatch::after {
-    position: absolute;
-    top: 1px;
-    left: 10px;
-    width: 7px;
-    height: 7px;
-    border: 1px solid var(--series-color);
-    background: var(--panel);
-    border-radius: 50%;
-    content: "";
-  }
-
-  .series-swatch.pattern-dash::after {
-    border-radius: 0;
-  }
-
-  .series-swatch.pattern-dot::after {
-    border-radius: 0;
-    transform: rotate(45deg);
-  }
-
-  .series-swatch.pattern-dash-dot::after {
-    top: 0;
-    width: 0;
-    height: 0;
-    border-width: 0 4px 8px;
-    border-color: transparent transparent var(--series-color);
-    background: transparent;
-    border-radius: 0;
+  .series-swatch.pattern-dash-dot {
+    background: repeating-linear-gradient(
+      90deg,
+      var(--series-color) 0 8px,
+      transparent 8px 11px,
+      var(--series-color) 11px 13px,
+      transparent 13px 17px
+    );
   }
 
   .chart-canvas-wrap {

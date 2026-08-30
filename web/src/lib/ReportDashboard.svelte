@@ -3,13 +3,15 @@
 
   import type { ChartHistory, ChartHistoryViewport, Report, ReportPanel, RunListItem } from "./api";
   import type { MetricChartSeries } from "./chart-series";
-  import { runStyle } from "./comparison-state";
   import MarkdownPanel from "./MarkdownPanel.svelte";
   import MetricChart from "./MetricChart.svelte";
   import { paginateReportPanels } from "./report-pagination";
+  import { resolveRunStyle, type RunStylePreferences } from "./sidebar-preferences";
 
   export let report: Report;
   export let runs: RunListItem[];
+  export let runStylePreferences: RunStylePreferences = {};
+  export let highlightedRunId: string | null = null;
   export let histories: Record<string, ChartHistory>;
   export let viewports: Record<string, ChartHistoryViewport | null>;
   export let loadingMetrics: Set<string>;
@@ -50,6 +52,7 @@
     panel: ReportPanel,
     metric: string,
     currentRuns: RunListItem[],
+    styles: RunStylePreferences,
     history: ChartHistory | undefined,
     loading: boolean,
   ): MetricChartSeries[] {
@@ -60,7 +63,7 @@
       {
         runId,
         runName: run?.name ?? runId.slice(0, 8),
-        ...runStyle(runId),
+        ...resolveRunStyle(runId, styles),
         available: true,
         history,
         historyResolved: history !== undefined,
@@ -166,9 +169,11 @@
                   panel,
                   metric,
                   runs,
+                  runStylePreferences,
                   histories[chartIdentity],
                   loadingMetrics.has(chartIdentity),
                 )}
+                {highlightedRunId}
                 parentViewport={viewports[chartIdentity]
                   ? {
                       minimum: viewports[chartIdentity]!.stepMin,

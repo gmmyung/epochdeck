@@ -5,14 +5,14 @@
 
 ## Context
 
-Runloom needs W&B-compatible behavior without inheriting a row-oriented storage
+EpochDeck needs W&B-compatible behavior without inheriting a row-oriented storage
 model or third-party hosting integrations. The target deployment is a trusted,
 Tailnet-only server with local SSD and ZFS storage. A distributed control plane
 would add operational cost without solving the primary query problem.
 
 ## Decision
 
-Runloom will use:
+EpochDeck will use:
 
 - Rust, Tokio, and Axum for the server;
 - Apache Arrow as the in-process columnar representation;
@@ -28,7 +28,7 @@ must project explicit metric columns and apply display-resolution budgets before
 serialization.
 
 The runtime dependency graph must not include Gradio, Hugging Face Hub,
-Datasets, Spaces, Buckets, or related clients. Runloom owns its server,
+Datasets, Spaces, Buckets, or related clients. EpochDeck owns its server,
 authentication, storage, protocol, and dashboard.
 
 ## Consequences
@@ -37,7 +37,7 @@ The system can retain raw data while bounding dashboard work. Immutable
 segments make backup and recovery straightforward, and independent roots support
 SSD metrics plus HDD blobs.
 
-Parquet is not appendable, so Runloom needs a journal, atomic segment manifests,
+Parquet is not appendable, so EpochDeck needs a journal, atomic segment manifests,
 and background compaction. Dynamic metric schemas require signature-aware
 segments and schema reconciliation at query time. These are deliberate costs.
 

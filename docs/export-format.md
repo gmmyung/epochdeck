@@ -1,8 +1,8 @@
-# Runloom export format
+# EpochDeck export format
 
-A `runloom export` bundle is a portable directory for one project. Format
-version 1 contains only JSON, JSON Lines, and original content-addressed bytes.
-No file requires SQLite, Parquet, or a running Runloom server to inspect.
+An `epochdeck export` bundle is a portable directory for one project. It
+contains only JSON, JSON Lines, and original content-addressed bytes. No file
+requires SQLite, Parquet, or a running EpochDeck server to inspect.
 
 Portable export requires every selected run to be finished and all project
 writers to be quiesced. A running run is rejected. The exporter captures the
@@ -36,14 +36,14 @@ point without dashboard sampling.
 The exporter hydrates these from their lightweight list summaries without
 holding the project-wide collections in memory.
 
-The top-level manifest is written last and records the format version, project,
-creation time, and resource counts. Export takes place in a sibling temporary
-directory. Every blob is size-checked and SHA-256 verified before the directory
-is atomically renamed to the requested destination. An existing destination is
-never merged or overwritten. All bundle files are fsynced before rename and the
-destination parent is fsynced afterward. Export directories are mode `0700` and
-files are mode `0600`; grant broader filesystem access explicitly when a bundle
-is meant to be shared.
+The top-level manifest is written last and records the current EpochDeck export
+format, project, creation time, and resource counts. Export takes place in a
+sibling temporary directory. Every blob is size-checked and SHA-256 verified
+before the directory is atomically renamed to the requested destination. An
+existing destination is never merged or overwritten. All bundle files are
+fsynced before rename and the destination parent is fsynced afterward. Export
+directories are mode `0700` and files are mode `0600`; grant broader filesystem
+access explicitly when a bundle is meant to be shared.
 
 Only referenced CAS content belongs to the portable project: rich values, trace
 payloads, and artifact entries. Orphaned upload objects have no project

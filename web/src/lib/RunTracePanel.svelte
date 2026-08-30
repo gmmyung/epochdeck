@@ -75,6 +75,7 @@
       <label class="search-control">
         <Icon name="search" size={15} />
         <input
+          name="trace-search"
           aria-label="Search traces"
           placeholder="Search traces and messages"
           maxlength="256"

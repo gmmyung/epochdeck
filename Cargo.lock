@@ -527,6 +527,69 @@ dependencies = [
 ]
 
 [[package]]
+name = "epochdeck-catalog"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "epochdeck-protocol",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "epochdeck-protocol"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "epochdeck-server"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "epochdeck-catalog",
+ "epochdeck-protocol",
+ "epochdeck-storage",
+ "fs2",
+ "futures-util",
+ "mime_guess",
+ "roxmltree",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "zip",
+]
+
+[[package]]
+name = "epochdeck-storage"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "epochdeck-protocol",
+ "parquet",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1383,65 +1446,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "runloom-catalog"
-version = "0.1.0"
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
 dependencies = [
- "runloom-protocol",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "tempfile",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "runloom-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "runloom-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "fs2",
- "futures-util",
- "mime_guess",
- "runloom-catalog",
- "runloom-protocol",
- "runloom-storage",
- "rust-embed",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sha2 0.10.9",
- "tempfile",
- "thiserror",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "zip",
-]
-
-[[package]]
-name = "runloom-storage"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "parquet",
- "runloom-protocol",
- "sha2 0.10.9",
- "tempfile",
- "thiserror",
+ "memchr",
 ]
 
 [[package]]

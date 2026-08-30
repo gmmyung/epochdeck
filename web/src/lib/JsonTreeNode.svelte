@@ -1,30 +1,63 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import JsonTreeNode from "./JsonTreeNode.svelte";
-  import { JSON_TREE_PAGE_SIZE, nodeChildCount, visibleChildEntries } from "./json-tree";
+  import {
+    JSON_TREE_PAGE_SIZE,
+    jsonTreeScalarText,
+    normalizeJsonTreeSearch,
+    nodeChildCount,
+    searchJsonTree,
+    visibleChildEntries,
+    type JsonTreeSearchMatch,
+  } from "./json-tree";
 
   export let name: string;
   export let value: unknown;
   export let depth = 0;
   export let root = false;
+  export let searchQuery = "";
+  export let searchResult: JsonTreeSearchMatch | undefined = undefined;
 
-  let expanded = depth < 2 && nodeChildCount(value) <= JSON_TREE_PAGE_SIZE;
+  const initialSearchQuery = normalizeJsonTreeSearch(searchQuery);
+  let expanded =
+    initialSearchQuery.length > 0 || (depth < 2 && nodeChildCount(value) <= JSON_TREE_PAGE_SIZE);
   let childOffset = 0;
   let copyStatus: "idle" | "copied" | "failed" = "idle";
   let observedValue = value;
+  let observedSearchQuery = initialSearchQuery;
 
   $: branch = isBranch(value);
+  $: normalizedSearchQuery = normalizeJsonTreeSearch(searchQuery);
+  $: resolvedSearchResult =
+    normalizedSearchQuery.length > 0
+      ? (searchResult ?? searchJsonTree(value, normalizedSearchQuery, name) ?? undefined)
+      : undefined;
+  $: searchActive = normalizedSearchQuery.length > 0;
   $: if (value !== observedValue) {
     observedValue = value;
     childOffset = 0;
-    expanded = depth < 2 && nodeChildCount(value) <= JSON_TREE_PAGE_SIZE;
+    expanded =
+      normalizedSearchQuery.length > 0 ||
+      (depth < 2 && nodeChildCount(value) <= JSON_TREE_PAGE_SIZE);
+  }
+  $: if (normalizedSearchQuery !== observedSearchQuery) {
+    observedSearchQuery = normalizedSearchQuery;
+    childOffset = 0;
+    expanded =
+      normalizedSearchQuery.length > 0 ||
+      (depth < 2 && nodeChildCount(value) <= JSON_TREE_PAGE_SIZE);
   }
   $: totalChildren = branch ? nodeChildCount(value) : 0;
+  $: displayedChildCount =
+    searchActive && !resolvedSearchResult?.keyMatches
+      ? (resolvedSearchResult?.children.length ?? 0)
+      : totalChildren;
   $: children =
     branch && expanded
-      ? visibleChildEntries(
+      ? childEntries(
           value as Record<string, unknown> | unknown[],
-          JSON_TREE_PAGE_SIZE,
+          resolvedSearchResult,
+          searchActive,
           childOffset,
         )
       : [];
@@ -40,12 +73,33 @@
   }
 
   function leafValue(candidate: unknown): string {
-    if (candidate === null) return "null";
-    if (typeof candidate === "string") return candidate;
-    if (typeof candidate === "number") {
-      return candidate.toLocaleString(undefined, { maximumFractionDigits: 8 });
+    return jsonTreeScalarText(candidate);
+  }
+
+  function childEntries(
+    candidate: Record<string, unknown> | unknown[],
+    match: JsonTreeSearchMatch | undefined,
+    searching: boolean,
+    offset: number,
+  ): Array<{ name: string; value: unknown; searchResult: JsonTreeSearchMatch | undefined }> {
+    if (searching && !match?.keyMatches) {
+      return (match?.children ?? []).slice(offset, offset + JSON_TREE_PAGE_SIZE).map((child) => ({
+        name: child.name,
+        value: child.value,
+        searchResult: child.match,
+      }));
     }
-    return String(candidate);
+
+    const matchingChildren = new Map(
+      (match?.children ?? []).map((child) => [child.name, child.match]),
+    );
+    return visibleChildEntries(candidate, JSON_TREE_PAGE_SIZE, offset).map(
+      ([childName, childValue]) => ({
+        name: childName,
+        value: childValue,
+        searchResult: matchingChildren.get(childName),
+      }),
+    );
   }
 
   async function copyLeaf(): Promise<void> {
@@ -72,15 +126,25 @@
       }}
     >
       <Icon name={expanded ? "chevron-down" : "chevron-right"} size={13} />
-      {#if name}<span class="tree-key">{name}</span>{/if}
+      {#if name}
+        <span class="tree-key" class:tree-search-match={resolvedSearchResult?.keyMatches}
+          >{name}</span
+        >
+      {/if}
       <span class="tree-kind">{kind} · {totalChildren.toLocaleString()}</span>
     </button>
     {#if expanded}
       <div class="tree-children">
-        {#each children as [childName, childValue] (childName)}
-          <JsonTreeNode name={childName} value={childValue} depth={depth + 1} />
+        {#each children as child (child.name)}
+          <JsonTreeNode
+            name={child.name}
+            value={child.value}
+            depth={depth + 1}
+            searchQuery={child.searchResult ? normalizedSearchQuery : ""}
+            searchResult={child.searchResult}
+          />
         {/each}
-        {#if totalChildren > JSON_TREE_PAGE_SIZE}
+        {#if displayedChildCount > JSON_TREE_PAGE_SIZE}
           <nav class="tree-pagination" aria-label={`${name || "Root"} child pages`}>
             <button
               type="button"
@@ -91,12 +155,12 @@
             <span>
               {(childOffset + 1).toLocaleString()}–{Math.min(
                 childOffset + JSON_TREE_PAGE_SIZE,
-                totalChildren,
-              ).toLocaleString()} of {totalChildren.toLocaleString()}
+                displayedChildCount,
+              ).toLocaleString()} of {displayedChildCount.toLocaleString()}
             </span>
             <button
               type="button"
-              disabled={childOffset + JSON_TREE_PAGE_SIZE >= totalChildren}
+              disabled={childOffset + JSON_TREE_PAGE_SIZE >= displayedChildCount}
               onclick={() => (childOffset += JSON_TREE_PAGE_SIZE)}>Next</button
             >
           </nav>
@@ -107,10 +171,11 @@
 {:else}
   <div class="tree-node tree-leaf" style={`--tree-depth: ${depth}`}>
     <span class="tree-spacer"></span>
-    <span class="tree-key">{name}</span>
+    <span class="tree-key" class:tree-search-match={resolvedSearchResult?.keyMatches}>{name}</span>
     <button
       type="button"
       class={`tree-value tree-${kind}`}
+      class:tree-search-match={resolvedSearchResult?.valueMatches}
       aria-label={copyStatus === "copied"
         ? `Copied ${name}`
         : copyStatus === "failed"
@@ -148,5 +213,11 @@
     margin-left: 8px;
     color: var(--muted);
     font-size: 11px;
+  }
+
+  .tree-search-match {
+    background: var(--accent-bg);
+    box-shadow: 0 0 0 2px var(--accent-bg);
+    color: var(--accent-text);
   }
 </style>

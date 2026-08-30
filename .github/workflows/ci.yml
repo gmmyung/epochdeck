@@ -34,13 +34,28 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@e9bfc9148566ca239aef4f5cb968674de15c3c20 # v3.5.2
 
       - name: Test the minimum supported Python
-        run: nix develop --command uv run --project python --python 3.11 pytest
+        run: >-
+          nix develop --command uv run --project python --python 3.11 --locked
+          pytest
+
+      - name: Test the supported W&B SDK contract
+        run: >-
+          nix develop --command uv run --project python --python 3.11 --locked
+          --extra wandb pytest python/tests/test_wandb_sdk_contract.py
 
   rust-minimum-version:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@e9bfc9148566ca239aef4f5cb968674de15c3c20 # v3.5.2
+
+      - name: Build the embedded dashboard
+        run: |
+          nix develop --command pnpm --dir web install --frozen-lockfile
+          nix develop --command just dashboard-build
 
       - name: Install Rust 1.85.0
         run: rustup toolchain install 1.85.0 --profile minimal

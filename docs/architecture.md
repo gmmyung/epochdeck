@@ -2,17 +2,17 @@
 
 ## Product boundary
 
-Runloom is a complete experiment-tracking system: Python library, ingestion
+EpochDeck is a complete experiment-tracking system: Python library, ingestion
 server, query engine, rich-data store, CLI, and dashboard. Its public behavior
 targets W&B compatibility. Trackio parity is the first finite milestone.
 
 The implementation has no dependency on third-party hosting platforms or their
-SDKs. Compatibility adapters translate at the Runloom boundary and do not shape
+SDKs. Compatibility adapters translate at the EpochDeck boundary and do not shape
 the internal storage model.
 
 ## Goals
 
-Runloom targets a single self-hosted machine with a fast SSD and a large HDD or
+EpochDeck targets a single self-hosted machine with a fast SSD and a large HDD or
 ZFS pool. It must:
 
 - retain complete histories without a storage quota;
@@ -85,7 +85,7 @@ catalog transaction makes each segment visible atomically.
 The Python journal is append-only and fsynced before `log` returns. Its byte
 offset advances atomically only after an idempotent server acknowledgement. The
 server writes each batch to an owned temporary Parquet file under
-`RUNLOOM_METRICS_DIR/staging`, syncs it, installs it with an atomic no-replace
+`EPOCHDECK_METRICS_DIR/staging`, syncs it, installs it with an atomic no-replace
 operation, and then commits its SQLite manifest. The staging directory is on
 the same filesystem as final segments, so hard-link installation remains
 atomic. RAII removes temporary files on ordinary errors and cancellation; the
@@ -167,7 +167,7 @@ queries.
 
 ### Python SDK
 
-The Python package provides native Runloom types, a W&B-compatible public API,
+The Python package provides native EpochDeck types, a W&B-compatible public API,
 offline and online modes, a CLI, and importers. Calls enqueue bounded batches,
 and durable offline spooling prevents transient server failures from affecting
 training. Config updates and summary values share the durable run metadata,
@@ -186,18 +186,18 @@ of run workers, and sends deterministic metric batches. One process exclusively
 owns the fsynced checkpoint, which advances only after acknowledgement, allowing
 an ambiguous accepted request to replay under the server's existing idempotency
 contract. Source run files are chunked into ordinary CAS-backed artifacts,
-logged artifacts preserve their canonical W&B `vN` in exact Runloom version
+logged artifacts preserve their canonical W&B `vN` in exact EpochDeck version
 slots, and logged artifacts and history media use fixed transfer windows. Each
 temporary file is uploaded and unlinked before the next is retained. Supported
 media references become deterministic native rich values backed by the same
 CAS. Cooperative cancellation stops queued work; a W&B SDK call already in
 progress is the only non-preemptible unit.
 
-Portable Runloom export traverses only public bounded APIs. It writes raw
+Portable EpochDeck export traverses only public bounded APIs. It writes raw
 full-resolution history pages, metadata JSON Lines, lineage links, and verified
 referenced CAS bytes to a temporary directory, then atomically publishes a
-format-versioned bundle. The exporter never requests dashboard samples or
-buffers complete histories and files.
+portable current-format bundle. The exporter never requests dashboard samples
+or buffers complete histories and files.
 
 ### Sweep scheduler
 
@@ -222,20 +222,24 @@ data.
 
 ### Dashboard
 
-The Svelte dashboard initially loads project, run, report, and metric metadata.
+The Svelte dashboard initially loads the server's immutable branding contract
+alongside project, run, report, and metric metadata. Branding is validated and
+loaded once at server startup; its optional logo is served only through a
+same-origin bounded image endpoint.
 It requests values only for visible charts and selected metrics. Off-screen
 charts use browser content visibility and intersection observers; bounded
 columnar JSON responses render directly with Canvas.
 
 Run data is separated into summary, configuration, metrics, media, traces, and
-artifact tabs. Config and summary documents render as expandable trees. Metric
-keys are searchable, and each chart keeps interaction state locally for
-pan/zoom/selection, manual linear or logarithmic domains, smoothing, hover
-inspection, and line or exact min/max band display. The server re-aggregates the
-settled step viewport after pan, wheel zoom, or region zoom. Exact Parquet step
-statistics prune disjoint row groups; uncertain statistics fall back to reading
-so the aggregate remains lossless. Smoothing applies only to the bucket-last
-center line. Media snapshots are grouped by type and key into step timelines.
+artifact tabs. Config and summary documents render as locally searchable,
+expandable trees. Metric keys are searchable, and each chart keeps interaction
+state locally for pan/zoom/selection, manual linear or logarithmic domains,
+smoothing, hover inspection, and line or exact min/max band display. The server
+re-aggregates the settled step viewport after pan, wheel zoom, or region zoom.
+Exact Parquet step statistics prune disjoint row groups; uncertain statistics
+fall back to reading so the aggregate remains lossless. Smoothing applies only
+to the bucket-last center line. Media snapshots are grouped by type and key into
+step timelines.
 Artifact manifests render as a tabbed file browser; whole ZIP responses are
 produced with fixed buffers on a bounded download worker, and the worker permit
 is retained through terminal stream-error delivery.
@@ -260,17 +264,17 @@ complete histories for chart rendering. See
 ## Storage layout
 
 ```text
-RUNLOOM_DATA_DIR/
+EPOCHDECK_DATA_DIR/
   catalog.sqlite3
-  runloom.lock
+  epochdeck.lock
 
-RUNLOOM_METRICS_DIR/
-  runloom.lock
+EPOCHDECK_METRICS_DIR/
+  epochdeck.lock
   staging/
   projects/<project-id>/runs/<run-id>/segments/*.parquet
 
-RUNLOOM_BLOBS_DIR/
-  runloom.lock
+EPOCHDECK_BLOBS_DIR/
+  epochdeck.lock
   sha256/<prefix>/<digest>
   staging/
 ```
@@ -288,7 +292,7 @@ contain the other. The data root may be a strict ancestor of either root (the
 default layout), but it may not equal or live inside the metric or blob root.
 This prevents staging, segment, CAS, lock, and catalog namespaces from mixing.
 The server resolves the three canonical roots, sorts and deduplicates their
-`runloom.lock` paths, and holds every advisory lock for its complete lifetime.
+`epochdeck.lock` paths, and holds every advisory lock for its complete lifetime.
 Only after acquiring the whole set may it clear metric or blob staging. Thus a
 second instance with a different data root cannot mutate or clean a shared
 external metric/blob root. Physical backup and restore acquire the identical

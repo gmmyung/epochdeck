@@ -2,12 +2,12 @@
 
 ## Product contract
 
-Runloom is a standalone experiment tracker. Trackio feature parity is the first
+EpochDeck is a standalone experiment tracker. Trackio feature parity is the first
 milestone; practical W&B feature parity is the overall contract. Compatibility
 must be observable and tested.
 
 Do not add Gradio, Hugging Face Hub, Datasets, Spaces, Buckets, or related
-runtime dependencies or integrations. Runloom owns its server, dashboard,
+runtime dependencies or integrations. EpochDeck owns its server, dashboard,
 storage, and authentication.
 
 ## Workflow
@@ -40,7 +40,7 @@ storage, and authentication.
 
 ## Pre-alpha change policy
 
-- Treat Runloom's internal catalog and stored pre-alpha data as disposable.
+- Treat EpochDeck's internal catalog and stored pre-alpha data as disposable.
   Keep one current definition without internal schema generations, upgrade
   logic, or shape guards.
 - Do not preserve backward compatibility for the pre-alpha Python API, HTTP

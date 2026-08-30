@@ -62,7 +62,7 @@ describe("comparison state", () => {
 
   it("round-trips repeated run parameters and validates enum values", () => {
     const tabs = new Set(["summary", "metrics"] as const);
-    const written = writeComparisonUrl(new URL("https://runloom.test/?unrelated=kept"), {
+    const written = writeComparisonUrl(new URL("https://epochdeck.test/?unrelated=kept"), {
       project: "robot learning",
       reportId: REPORT,
       runIds: [RUN_B, RUN_A],
@@ -97,7 +97,7 @@ describe("comparison state", () => {
     expect(written.searchParams.get("unrelated")).toBe("kept");
 
     const invalid = readComparisonUrl(
-      new URL("https://runloom.test/?tab=nope&metricMode=nope&alignment=nope"),
+      new URL("https://epochdeck.test/?tab=nope&metricMode=nope&alignment=nope"),
       tabs,
       "summary",
     );
@@ -109,7 +109,7 @@ describe("comparison state", () => {
     expect(invalid.chartMetric).toBeNull();
     expect(invalid.chartViewport).toBeNull();
     expect(
-      readComparisonUrl(new URL("https://runloom.test/?chart=loss&xmin=-1"), tabs, "metrics")
+      readComparisonUrl(new URL("https://epochdeck.test/?chart=loss&xmin=-1"), tabs, "metrics")
         .chartViewport,
     ).toBeNull();
   });
@@ -117,33 +117,36 @@ describe("comparison state", () => {
   it("drops invalid viewports and clears stale viewport parameters", () => {
     const tabs = new Set(["metrics"] as const);
     const invalid = readComparisonUrl(
-      new URL("https://runloom.test/?chart=loss&xmin=20&xmax=10"),
+      new URL("https://epochdeck.test/?chart=loss&xmin=20&xmax=10"),
       tabs,
       "metrics",
     );
     expect(invalid.chartViewport).toBeNull();
 
-    const cleared = writeComparisonUrl(new URL("https://runloom.test/?chart=loss&xmin=1&xmax=2"), {
-      project: "p",
-      reportId: null,
-      runIds: [],
-      runSelectionSpecified: true,
-      primaryRunId: null,
-      tab: "metrics",
-      metricMode: "union",
-      search: "",
-      metricAfter: null,
-      alignment: "step",
-      chartMetric: null,
-      chartViewport: null,
-    });
+    const cleared = writeComparisonUrl(
+      new URL("https://epochdeck.test/?chart=loss&xmin=1&xmax=2"),
+      {
+        project: "p",
+        reportId: null,
+        runIds: [],
+        runSelectionSpecified: true,
+        primaryRunId: null,
+        tab: "metrics",
+        metricMode: "union",
+        search: "",
+        metricAfter: null,
+        alignment: "step",
+        chartMetric: null,
+        chartViewport: null,
+      },
+    );
     expect(cleared.searchParams.has("chart")).toBe(false);
     expect(cleared.searchParams.has("xmin")).toBe(false);
     expect(cleared.searchParams.has("xmax")).toBe(false);
   });
 
   it("bounds and validates untrusted deep-link fields before orchestration", () => {
-    const url = new URL("https://runloom.test/");
+    const url = new URL("https://epochdeck.test/");
     for (let index = 0; index < 30; index += 1) {
       url.searchParams.append("run", `00000000-0000-7000-8000-${String(index).padStart(12, "0")}`);
     }
@@ -179,7 +182,7 @@ describe("comparison state", () => {
       chartMetric: "loss",
       chartViewport: { minimum: 10, maximum: 20 },
     };
-    const rangeA = writeComparisonUrl(new URL("https://runloom.test/"), state);
+    const rangeA = writeComparisonUrl(new URL("https://epochdeck.test/"), state);
     const rangeB = writeComparisonUrl(rangeA, {
       ...state,
       chartViewport: { minimum: 30, maximum: 50 },

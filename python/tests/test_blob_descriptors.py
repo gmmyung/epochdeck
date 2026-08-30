@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from runloom import Artifact, Image
+from epochdeck import Artifact, Image
 
 
 def test_rich_media_rejects_an_unsafe_source_basename_before_spooling(tmp_path: Path) -> None:

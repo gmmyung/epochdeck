@@ -4,9 +4,9 @@ import importlib
 
 import pytest
 
-from runloom.trace import Trace
+from epochdeck.trace import Trace
 
-trace_module = importlib.import_module("runloom.trace")
+trace_module = importlib.import_module("epochdeck.trace")
 
 
 def test_trace_rejects_oversized_inputs_and_attributes_at_construction(monkeypatch) -> None:

@@ -9,16 +9,19 @@
   import { chartPreferenceIdentity } from "./chart-preferences";
   import {
     METRIC_CATALOG_PAGE_SIZE,
-    runStyle,
     type MetricSetMode,
     type RunAlignment,
   } from "./comparison-state";
   import Icon from "./Icon.svelte";
   import MetricChart from "./MetricChart.svelte";
+  import SelectControl from "./SelectControl.svelte";
+  import { resolveRunStyle, type RunStylePreferences } from "./sidebar-preferences";
 
   export let active: boolean;
   export let project: string;
   export let runs: RunListItem[];
+  export let runStylePreferences: RunStylePreferences = {};
+  export let highlightedRunId: string | null = null;
   export let selectedRunCount: number;
   export let catalog: MetricCatalogEntry[];
   export let catalogLoading: boolean;
@@ -52,6 +55,7 @@
     entry: MetricCatalogEntry,
     response: ComparisonChartHistory | undefined,
     currentRuns: RunListItem[],
+    styles: RunStylePreferences,
     loading: boolean,
   ) {
     const historyResolved = response !== undefined;
@@ -60,7 +64,7 @@
       return {
         runId: run.id,
         runName: run.name,
-        ...runStyle(run.id),
+        ...resolveRunStyle(run.id, styles),
         available,
         history: response ? comparisonSeriesHistory(response, run.id, metric) : undefined,
         historyResolved,
@@ -86,6 +90,7 @@
       <Icon name="search" size={15} />
       <input
         type="search"
+        name="metric-search"
         maxlength="256"
         aria-label="Search metrics"
         placeholder="Search metric keys"
@@ -112,16 +117,19 @@
     </div>
     <label class="alignment-control">
       <span>Align x-axis</span>
-      <select
+      <SelectControl
+        ariaLabel="Align x-axis"
+        compact
+        fit
         value={alignment}
-        onchange={(event) => onalignmentchange(event.currentTarget.value as RunAlignment)}
-      >
-        <option value="step">Absolute step</option>
-        <option value="relative-step">Relative step</option>
-        <option value="elapsed-time">Elapsed time</option>
-      </select>
+        options={[
+          { value: "step", label: "Absolute step" },
+          { value: "relative-step", label: "Relative step" },
+          { value: "elapsed-time", label: "Elapsed time" },
+        ]}
+        onvaluechange={(value) => onalignmentchange(value as RunAlignment)}
+      />
     </label>
-    <span class="availability-hint">Availability is shown on each chart.</span>
   </div>
   {#if catalogError}
     <section class="resource-error" role="alert">
@@ -148,16 +156,16 @@
         <MetricChart
           metric={entry.key}
           identity={chartPreferenceIdentity(project, entry.key)}
-          title={selectedRunCount === 1
-            ? entry.key
-            : `${entry.key} · ${entry.run_ids.length}/${selectedRunCount} runs`}
+          title={entry.key}
           series={chartSeries(
             entry.key,
             entry,
             histories[entry.key],
             runs,
+            runStylePreferences,
             loadingMetrics.has(entry.key),
           )}
+          {highlightedRunId}
           parentViewport={viewports[entry.key]
             ? {
                 minimum: viewports[entry.key]!.stepMin,

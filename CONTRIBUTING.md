@@ -19,3 +19,5 @@ record under `docs/adr/`.
 
 Generated databases, Parquet files, Arrow journals, blobs, coverage reports,
 package caches, and build artifacts do not belong in Git.
+
+Release candidates follow the gated process in [docs/releasing.md](docs/releasing.md).

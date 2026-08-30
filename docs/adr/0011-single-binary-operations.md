@@ -11,12 +11,12 @@ a web process, reverse proxy, external database, or an unsafe backup race.
 
 ## Decision
 
-The production Cargo feature embeds the Vite output into `runloom-server`.
+The production Cargo feature embeds the Vite output into `epochdeck-server`.
 Tailscale Serve terminates Tailnet-only HTTPS and proxies to a loopback-only
 listener. A hardened systemd unit owns the process and configured storage roots.
 
 The server canonicalizes the configured data, metric, and blob roots, sorts and
-deduplicates them, then holds an advisory `<canonical-root>/runloom.lock` for
+deduplicates them, then holds an advisory `<canonical-root>/epochdeck.lock` for
 every distinct mutable root for its lifetime. Physical backup and restore
 require the same complete lock set, making stopped-server coordination
 observable rather than conventional. This also prevents two processes with

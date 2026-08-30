@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from runloom.run import create_run
+from epochdeck.run import create_run
 
-run_module = importlib.import_module("runloom.run")
+run_module = importlib.import_module("epochdeck.run")
 
 
 def test_boolean_metrics_are_journaled_and_summarized_as_numbers(tmp_path: Path) -> None:

@@ -25,6 +25,7 @@ export type PreparedMetricSeries = {
   runName: string;
   color: string;
   pattern: SeriesPattern;
+  available: boolean;
   loading: boolean;
   status: "ready" | "loading" | "not-loaded" | "no-data";
   buckets: number[];
@@ -82,6 +83,7 @@ export function prepareMetricSeries(
     runName: input.runName,
     color: input.color,
     pattern: input.pattern ?? stableSeriesPattern(input.runId),
+    available: input.available,
     loading: input.loading ?? false,
     status: hasData
       ? "ready"

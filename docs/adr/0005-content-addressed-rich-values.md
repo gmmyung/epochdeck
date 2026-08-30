@@ -14,7 +14,7 @@ and idempotency guarantees as scalar metrics.
 ## Decision
 
 Rich content uses a SHA-256 content-addressed store rooted at
-`RUNLOOM_BLOBS_DIR`. The SDK hashes and atomically installs content in its local
+`EPOCHDECK_BLOBS_DIR`. The SDK hashes and atomically installs content in its local
 run spool before journaling a rich manifest. A fair background worker streams
 the blob first and then creates the manifest. Retries reuse the digest and
 UUIDv7 manifest identity.
