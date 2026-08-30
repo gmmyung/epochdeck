@@ -16,6 +16,8 @@ describe("chart data transforms", () => {
     expect(smoothSeries([0, 1, 2, 3], [0, 100, null, 0], "ema", 0.5)).toEqual([0, 50, null, 0]);
     expect(smoothSeries([0, 10], [0, 10], "time-ema", 10)[1]).toBeCloseTo(6.3212, 4);
     expect(smoothSeries([0, 1], [0, 10], "time-ema", 10)[1]).toBeCloseTo(0.9516, 4);
+    const longSeries = Array.from({ length: 10_000 }, (_, index) => index);
+    expect(smoothSeries(longSeries, longSeries, "running", 500).at(-1)).toBe(9_749.5);
   });
 
   it("builds linear and logarithmic extents and multiple ticks", () => {

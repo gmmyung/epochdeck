@@ -53,7 +53,7 @@ def doctor_command(
         help="Runloom server base URL.",
     ),
 ) -> None:
-    """Show bounded server, queue, schema, and slow-request diagnostics."""
+    """Show bounded server, queue, storage, and slow-request diagnostics."""
     with RunloomClient(server_url) as client:
         result = client.diagnostics()
     typer.echo(json.dumps(result, sort_keys=True))
@@ -186,7 +186,11 @@ def export_command(
     ),
     timeout: float = typer.Option(300.0, min=0.1, help="Per-request timeout in seconds."),
 ) -> None:
-    """Stream a lossless project export without loading complete histories."""
+    """Export after every selected run is finished and project writers are quiesced.
+
+    The opaque project mutation token is captured before traversal and verified
+    afterward; any project-visible change aborts without publishing.
+    """
     with RunloomClient(server_url, timeout=timeout) as client:
         manifest = export_project(client, project, destination)
     typer.echo(json.dumps(manifest, sort_keys=True))
@@ -203,7 +207,7 @@ def import_wandb_command(
     checkpoint: Annotated[
         Path,
         typer.Option(help="Durable JSON checkpoint used to resume interrupted imports."),
-    ] = "runloom-wandb-checkpoint.json",
+    ] = Path("runloom-wandb-checkpoint.json"),
     workers: int = typer.Option(4, min=1, max=16, help="Runs imported concurrently."),
     max_runs: int | None = typer.Option(
         None,
@@ -223,7 +227,7 @@ def import_wandb_command(
     ),
     timeout: float = typer.Option(300.0, min=0.1, help="Per-request timeout in seconds."),
 ) -> None:
-    """Import W&B runs with bounded parallel workers and exact batch replay."""
+    """Import with exact replay; Ctrl-C stops workers after their active SDK call."""
     try:
         wandb = import_module("wandb")
     except ModuleNotFoundError as error:
@@ -266,7 +270,7 @@ def backup_command(
         typer.Argument(help="New physical backup directory to create."),
     ],
 ) -> None:
-    """Back up catalog, raw metrics, journals, and all CAS bytes while stopped."""
+    """Back up the catalog, raw metrics, and all CAS bytes while stopped."""
     manifest = backup_storage(StorageRoots.from_environment(), destination)
     typer.echo(json.dumps(manifest, sort_keys=True))
 

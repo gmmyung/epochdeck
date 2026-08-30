@@ -1,13 +1,13 @@
-import type { RichValue } from "./api";
+import type { RichValueSummary } from "./api";
 
 export type MediaGroup = {
   id: string;
   key: string;
-  kind: RichValue["kind"];
-  values: RichValue[];
+  kind: RichValueSummary["kind"];
+  values: RichValueSummary[];
 };
 
-export function groupRichValues(values: RichValue[]): MediaGroup[] {
+export function groupRichValues(values: RichValueSummary[]): MediaGroup[] {
   const grouped = new Map<string, MediaGroup>();
   for (const value of values) {
     const id = mediaGroupId(value.kind, value.key);
@@ -24,7 +24,7 @@ export function groupRichValues(values: RichValue[]): MediaGroup[] {
   return groups;
 }
 
-export function mediaGroupId(kind: RichValue["kind"], key: string): string {
+export function mediaGroupId(kind: RichValueSummary["kind"], key: string): string {
   return `${kind}\0${key}`;
 }
 
@@ -36,7 +36,7 @@ export function selectedMediaIndex(group: MediaGroup, selectedId: string | undef
   return Math.max(group.values.length - 1, 0);
 }
 
-function compareRichValues(left: RichValue, right: RichValue): number {
+function compareRichValues(left: RichValueSummary, right: RichValueSummary): number {
   return (
     left.step - right.step ||
     left.timestamp_ms - right.timestamp_ms ||

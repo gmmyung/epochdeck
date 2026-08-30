@@ -19,20 +19,36 @@ Tailnet client -> https://runloom.<tailnet>.ts.net
 Build the Svelte dashboard and embed it into the Rust executable:
 
 ```bash
+nix develop --command just bootstrap
 nix develop --command just single-binary
 sudo install -o root -g root -m 0755 \
   target/release/runloom-server /usr/local/bin/runloom-server
+runloom_uv="$(nix develop --command which uv)"
+sudo env UV_TOOL_DIR=/opt/runloom-cli UV_TOOL_BIN_DIR=/usr/local/bin \
+  "$runloom_uv" tool install --force "$PWD/python"
 ```
+
+Run `just bootstrap` once after a fresh clone and again when a lockfile changes;
+it installs the exact Cargo, uv, and pnpm dependency sets recorded by the
+repository. Ordinary incremental production rebuilds need only
+`nix develop --command just single-binary`.
 
 No `web/dist` directory is needed at runtime. Root and client-side routes are
 served from the executable; missing `/api/v1/...` routes remain API 404s.
+The separately installed `runloom` administration command supplies the doctor,
+backup, and restore operations used below. Install it from the same checkout as
+the server binary. Runloom has one disposable pre-alpha storage definition with
+no internal generation marker: when that definition changes, archive all three
+storage roots together and start the replacement build with empty roots.
 
-Create a dedicated account and storage locations. Keep catalog and metrics on
-SSD, and place only the CAS blob root on the large pool:
+Mount or bind the large pool at `/srv/runloom` first, then create the dedicated
+account and storage locations. Keep catalog and metrics on SSD, and place only
+the CAS blob root on that mounted pool:
 
 ```bash
 sudo useradd --system --home /var/lib/runloom --shell /usr/sbin/nologin runloom
-sudo install -d -o runloom -g runloom -m 0750 /etc/runloom /srv/runloom/blobs
+sudo install -d -o root -g runloom -m 0750 /etc/runloom
+sudo install -d -o runloom -g runloom -m 0750 /srv/runloom/blobs
 sudo install -o root -g root -m 0644 deploy/runloom.service \
   /etc/systemd/system/runloom.service
 sudo install -o root -g runloom -m 0640 deploy/runloom.env.example \
@@ -41,8 +57,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now runloom
 ```
 
-If `/srv/runloom` is a bind mount or ZFS dataset, mount it before starting the
-unit. Adjust `ReadWritePaths` in the unit if the blob root is elsewhere.
+`/srv/runloom` must be a real bind mount or ZFS dataset before the unit starts;
+the unit refuses an ordinary directory so a missing pool cannot silently place
+large blobs on the container root disk. If the blob mount is elsewhere, update
+`RequiresMountsFor`, `ConditionPathIsMountPoint`, and `ReadWritePaths` together.
 
 ## Tailnet-only HTTPS
 

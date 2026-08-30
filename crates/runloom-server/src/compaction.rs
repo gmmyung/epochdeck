@@ -3,17 +3,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use runloom_catalog::{Catalog, CatalogError, SegmentManifest};
-use runloom_storage::{CompactionSource, MetricStore, StorageError};
+use runloom_storage::{CompactionSource, MetricStore, SegmentInstallation, StorageError};
 use thiserror::Error;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, watch};
 
 const DEFAULT_TARGET_ROWS: usize = 16 * 1_024;
 const DEFAULT_MAX_INPUT_SEGMENTS: usize = 16;
 const DEFAULT_RETIREMENT_BATCH: usize = 64;
+const DEFAULT_MAX_CONSECUTIVE_PASSES: usize = 8;
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_TARGET_ROWS: usize = 64 * 1_024;
+const MIN_INPUT_SEGMENTS: usize = 4;
 const MAX_INPUT_SEGMENTS: usize = 64;
 const MAX_RETIREMENT_BATCH: usize = 1_024;
+const MAX_CONSECUTIVE_PASSES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct MetricRuntime {
@@ -49,6 +52,7 @@ pub struct CompactionConfig {
     pub target_rows: usize,
     pub max_input_segments: usize,
     pub retirement_batch: usize,
+    pub max_consecutive_passes: usize,
 }
 
 impl Default for CompactionConfig {
@@ -58,6 +62,7 @@ impl Default for CompactionConfig {
             target_rows: DEFAULT_TARGET_ROWS,
             max_input_segments: DEFAULT_MAX_INPUT_SEGMENTS,
             retirement_batch: DEFAULT_RETIREMENT_BATCH,
+            max_consecutive_passes: DEFAULT_MAX_CONSECUTIVE_PASSES,
         }
     }
 }
@@ -143,12 +148,13 @@ pub(crate) async fn compact_once(
     })
     .await??;
     if cancelled.load(Ordering::Relaxed) {
+        cleanup_unregistered_output(catalog, metrics, &written).await;
         return Err(StorageError::Cancelled.into());
     }
     let replacement = SegmentManifest {
-        id: written.id,
-        signature: written.signature,
-        relative_path: written.relative_path,
+        id: written.id.clone(),
+        signature: written.signature.clone(),
+        relative_path: written.relative_path.clone(),
         first_sequence: written.first_sequence,
         last_sequence: written.last_sequence,
         row_count: written.row_count,
@@ -156,11 +162,19 @@ pub(crate) async fn compact_once(
     };
     let _snapshot = metrics.write_snapshot().await;
     if cancelled.load(Ordering::Relaxed) {
+        cleanup_unregistered_output(catalog, metrics, &written).await;
         return Err(StorageError::Cancelled.into());
     }
-    let retired = catalog
+    let retired = match catalog
         .replace_compacted_segments(candidate.run_id, &candidate.segments, &replacement)
-        .await?;
+        .await
+    {
+        Ok(retired) => retired,
+        Err(error) => {
+            cleanup_unregistered_output(catalog, metrics, &written).await;
+            return Err(error.into());
+        }
+    };
     let (removed, failures) = remove_files(metrics, &retired, Arc::clone(&cancelled)).await?;
     if !removed.is_empty() {
         catalog.acknowledge_retired_segments(&removed).await?;
@@ -172,6 +186,38 @@ pub(crate) async fn compact_once(
         inputs: input_count,
         rows: row_count,
     })
+}
+
+async fn cleanup_unregistered_output(
+    catalog: &Catalog,
+    metrics: &MetricRuntime,
+    written: &runloom_storage::WrittenSegment,
+) {
+    if written.installation != SegmentInstallation::InstalledNew {
+        return;
+    }
+    match catalog
+        .segment_path_is_registered(&written.relative_path)
+        .await
+    {
+        Ok(false) => {
+            let store = metrics.store().clone();
+            let path = written.relative_path.clone();
+            match tokio::task::spawn_blocking(move || store.remove_segment(&path)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "unregistered compaction output could not be removed");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "compaction output cleanup worker failed");
+                }
+            }
+        }
+        Ok(true) => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not verify compaction output ownership for cleanup");
+        }
+    }
 }
 
 async fn remove_files(
@@ -205,6 +251,7 @@ pub async fn run_compaction_worker(
     mut shutdown: watch::Receiver<bool>,
     config: CompactionConfig,
 ) {
+    let mut consecutive_passes = 0usize;
     loop {
         if *shutdown.borrow() {
             return;
@@ -216,13 +263,23 @@ pub async fn run_compaction_worker(
         let mut task = tokio::spawn(async move {
             compact_once(&task_catalog, &task_metrics, config, task_cancelled).await
         });
-        tokio::select! {
+        let sleep_before_next = tokio::select! {
             result = &mut task => match result {
-                Ok(Ok(CompactionOutcome::Idle)) => {}
-                Ok(Ok(outcome)) => tracing::info!(?outcome, "metric compaction pass completed"),
+                Ok(Ok(CompactionOutcome::Idle)) => true,
+                Ok(Ok(outcome)) => {
+                    tracing::info!(?outcome, "metric compaction pass completed");
+                    consecutive_passes = consecutive_passes.saturating_add(1);
+                    consecutive_passes >= config.max_consecutive_passes
+                }
                 Ok(Err(CompactionError::Storage(StorageError::Cancelled))) => return,
-                Ok(Err(error)) => tracing::error!(%error, "metric compaction pass failed"),
-                Err(error) => tracing::error!(%error, "metric compaction task failed"),
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "metric compaction pass failed");
+                    true
+                }
+                Err(error) => {
+                    tracing::error!(%error, "metric compaction task failed");
+                    true
+                }
             },
             changed = shutdown.changed() => {
                 cancelled.store(true, Ordering::Relaxed);
@@ -230,8 +287,14 @@ pub async fn run_compaction_worker(
                 if changed.is_err() || *shutdown.borrow() {
                     return;
                 }
+                true
             }
+        };
+        if !sleep_before_next {
+            tokio::task::yield_now().await;
+            continue;
         }
+        consecutive_passes = 0;
         tokio::select! {
             () = tokio::time::sleep(config.interval) => {}
             changed = shutdown.changed() => {
@@ -251,13 +314,18 @@ fn validate_config(config: CompactionConfig) -> Result<(), CompactionError> {
     }
     if config.target_rows == 0
         || config.target_rows > MAX_TARGET_ROWS
-        || config.max_input_segments < 2
+        || config.max_input_segments < MIN_INPUT_SEGMENTS
         || config.max_input_segments > MAX_INPUT_SEGMENTS
         || config.retirement_batch == 0
         || config.retirement_batch > MAX_RETIREMENT_BATCH
+        || config.max_consecutive_passes == 0
+        || config.max_consecutive_passes > MAX_CONSECUTIVE_PASSES
     {
         return Err(CompactionError::InvalidConfig(format!(
-            "target_rows must be 1..={MAX_TARGET_ROWS}, max_input_segments must be 2..={MAX_INPUT_SEGMENTS}, and retirement_batch must be 1..={MAX_RETIREMENT_BATCH}"
+            "target_rows must be 1..={MAX_TARGET_ROWS}, max_input_segments must be \
+             {MIN_INPUT_SEGMENTS}..={MAX_INPUT_SEGMENTS}, retirement_batch must be \
+             1..={MAX_RETIREMENT_BATCH}, and max_consecutive_passes must be \
+             1..={MAX_CONSECUTIVE_PASSES}"
         )));
     }
     Ok(())

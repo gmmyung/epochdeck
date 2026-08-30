@@ -38,7 +38,6 @@ def test_doctor_returns_bounded_server_diagnostics(monkeypatch) -> None:
     diagnostics = {
         "service": "runloom",
         "version": "0.1.0",
-        "schema_version": 1,
         "requests_total": 12,
         "recent_slow_requests": [],
     }
@@ -108,3 +107,14 @@ def test_runs_command_rejects_untyped_filter_values() -> None:
 
     assert result.exit_code == 2
     assert "invalid JSON" in result.output
+
+
+def test_export_help_states_consistency_preconditions() -> None:
+    result = CliRunner().invoke(app, ["export", "--help"])
+
+    assert result.exit_code == 0
+    help_text = " ".join(result.stdout.split())
+    assert "every selected run is finished and project writers are quiesced" in help_text
+    assert "opaque project mutation token is captured before traversal" in help_text
+    assert "verified afterward" in help_text
+    assert "project-visible change aborts without publishing" in help_text

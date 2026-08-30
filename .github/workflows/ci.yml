@@ -23,3 +23,27 @@ jobs:
 
       - name: Run repository checks
         run: nix develop --command just check
+
+  python-minimum-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@e9bfc9148566ca239aef4f5cb968674de15c3c20 # v3.5.2
+
+      - name: Test the minimum supported Python
+        run: nix develop --command uv run --project python --python 3.11 pytest
+
+  rust-minimum-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust 1.85.0
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Check the minimum supported Rust
+        run: cargo +1.85.0 check --workspace --all-targets --all-features --locked

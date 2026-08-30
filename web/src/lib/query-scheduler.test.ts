@@ -12,7 +12,7 @@ function deferred<T>() {
 
 describe("QueryScheduler", () => {
   it("bounds global concurrency and starts queued work as slots open", async () => {
-    const scheduler = new QueryScheduler(2);
+    const scheduler = new QueryScheduler(2, 4);
     const gates = [deferred<number>(), deferred<number>(), deferred<number>()];
     const starts: number[] = [];
     const publish = vi.fn();
@@ -37,7 +37,7 @@ describe("QueryScheduler", () => {
   });
 
   it("cancels stale work for the same identity and publishes only the latest request", async () => {
-    const scheduler = new QueryScheduler(1);
+    const scheduler = new QueryScheduler(1, 4);
     const oldGate = deferred<string>();
     const newGate = deferred<string>();
     const publish = vi.fn();
@@ -68,7 +68,7 @@ describe("QueryScheduler", () => {
   });
 
   it("keeps an aborted request in its physical slot until the promise settles", async () => {
-    const scheduler = new QueryScheduler(1);
+    const scheduler = new QueryScheduler(1, 4);
     const stale = deferred<string>();
     const replacement = deferred<string>();
     const starts: string[] = [];
@@ -100,7 +100,7 @@ describe("QueryScheduler", () => {
   });
 
   it("does not replace an active identity through an otherwise free slot", async () => {
-    const scheduler = new QueryScheduler(2);
+    const scheduler = new QueryScheduler(2, 4);
     const stale = deferred<string>();
     const replacement = deferred<string>();
     const other = deferred<string>();
@@ -130,7 +130,7 @@ describe("QueryScheduler", () => {
   });
 
   it("queues the same request again when visibility returns before cancellation settles", async () => {
-    const scheduler = new QueryScheduler(1);
+    const scheduler = new QueryScheduler(1, 4);
     const hidden = deferred<string>();
     const visible = deferred<string>();
     const starts: string[] = [];
@@ -161,5 +161,43 @@ describe("QueryScheduler", () => {
     visible.resolve("visible");
     await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce());
     expect(publish).toHaveBeenCalledWith("visible", "same-revision");
+  });
+
+  it("discards the oldest pending query when the explicit queue bound is reached", async () => {
+    const scheduler = new QueryScheduler(1, 2);
+    const active = deferred<string>();
+    const pending = [deferred<string>(), deferred<string>(), deferred<string>()];
+    const starts: string[] = [];
+    const discarded: string[] = [];
+    const publish = vi.fn();
+    scheduler.schedule({
+      identity: "active",
+      requestKey: "r1",
+      request: async () => {
+        starts.push("active");
+        return active.promise;
+      },
+      publish,
+    });
+    pending.forEach((gate, index) =>
+      scheduler.schedule({
+        identity: `pending-${index}`,
+        requestKey: "r1",
+        request: async () => {
+          starts.push(`pending-${index}`);
+          return gate.promise;
+        },
+        publish,
+        discard: () => discarded.push(`pending-${index}`),
+      }),
+    );
+
+    expect(discarded).toEqual(["pending-0"]);
+    active.resolve("active");
+    await vi.waitFor(() => expect(starts).toEqual(["active", "pending-1"]));
+    pending[1].resolve("second");
+    await vi.waitFor(() => expect(starts).toEqual(["active", "pending-1", "pending-2"]));
+    pending[2].resolve("third");
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledTimes(3));
   });
 });

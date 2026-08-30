@@ -6,18 +6,24 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, BinaryIO, TextIO
 
 _FORMAT_VERSION = 1
 _COPY_CHUNK_BYTES = 1024 * 1024
 _MAX_FILES = 10_000_000
 _MAX_TREE_DEPTH = 128
+_MAX_MANIFEST_BYTES = 64 * 1024
+_MAX_INVENTORY_RECORD_BYTES = 16 * 1024
+_MAX_RELATIVE_PATH_BYTES = 4 * 1024
+_NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
 class BackupError(RuntimeError):
@@ -43,17 +49,10 @@ class StorageRoots:
     def catalog(self) -> Path:
         return self.data / "catalog.sqlite3"
 
-    @property
-    def journal(self) -> Path:
-        return self.data / "journal"
-
-    @property
-    def lock(self) -> Path:
-        return self.data / "runloom.lock"
-
 
 def backup_storage(roots: StorageRoots, destination: Path) -> dict[str, Any]:
     """Copy a stopped server's complete physical state into an atomic bundle."""
+    _validate_storage_roots(roots)
     destination = destination.expanduser().resolve()
     _validate_bundle_location(destination, roots)
     if destination.exists():
@@ -62,15 +61,17 @@ def backup_storage(roots: StorageRoots, destination: Path) -> dict[str, Any]:
         raise BackupError(f"Runloom catalog was not found: {roots.catalog}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.parent / f".{destination.name}.partial-{uuid.uuid4()}"
-    temporary.mkdir()
+    temporary.mkdir(mode=0o700)
+    temporary.chmod(0o700)
     try:
         with _storage_lock(roots):
-            for directory in ["journal", "metrics", "blobs"]:
-                (temporary / directory).mkdir()
+            for directory in ["metrics", "blobs"]:
+                (temporary / directory).mkdir(mode=0o700)
             _backup_sqlite(roots.catalog, temporary / "catalog.sqlite3")
             count = 0
             total_bytes = 0
             with (temporary / "files.jsonl").open("w", encoding="utf-8") as inventory:
+                (temporary / "files.jsonl").chmod(0o600)
                 catalog_entry = _inventory_existing(
                     temporary / "catalog.sqlite3", "catalog", "catalog.sqlite3"
                 )
@@ -78,13 +79,12 @@ def backup_storage(roots: StorageRoots, destination: Path) -> dict[str, Any]:
                 count += 1
                 total_bytes += int(catalog_entry["size"])
                 for category, source in [
-                    ("journal", roots.journal),
                     ("metrics", roots.metrics),
                     ("blobs", roots.blobs),
                 ]:
                     if not source.exists():
                         continue
-                    for path, relative in _walk_files(source, skip_staging=category == "blobs"):
+                    for path, relative in _walk_files(source, skip_staging=True):
                         if count >= _MAX_FILES:
                             raise BackupError(f"backup cannot exceed {_MAX_FILES} files")
                         target = temporary / category / relative
@@ -92,6 +92,8 @@ def backup_storage(roots: StorageRoots, destination: Path) -> dict[str, Any]:
                         _write_json_line(inventory, entry)
                         count += 1
                         total_bytes += int(entry["size"])
+                inventory.flush()
+                os.fsync(inventory.fileno())
             manifest = {
                 "format": "runloom-physical-backup",
                 "format_version": _FORMAT_VERSION,
@@ -100,7 +102,9 @@ def backup_storage(roots: StorageRoots, destination: Path) -> dict[str, Any]:
                 "total_bytes": total_bytes,
             }
             _write_json(temporary / "manifest.json", manifest)
+            _fsync_directory_tree(temporary)
         os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
         return manifest
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -109,48 +113,101 @@ def backup_storage(roots: StorageRoots, destination: Path) -> dict[str, Any]:
 
 def restore_storage(bundle: Path, roots: StorageRoots) -> dict[str, Any]:
     """Verify then restore a physical bundle into empty, inactive storage roots."""
+    _validate_storage_roots(roots)
     bundle = bundle.expanduser().resolve()
+    _validate_bundle_location(bundle, roots)
     manifest = _read_manifest(bundle)
     inventory_path = bundle / "files.jsonl"
     with _storage_lock(roots):
         _require_empty_destination(roots)
-        verified_count = 0
-        verified_bytes = 0
-        for entry in _inventory(inventory_path):
-            source = _bundle_file(bundle, entry)
-            size, digest = _digest_file(source)
-            if size != entry["size"] or digest != entry["sha256"]:
-                raise BackupError(f"backup verification failed: {source}")
-            verified_count += 1
-            verified_bytes += size
-        if verified_count != manifest["file_count"] or verified_bytes != manifest["total_bytes"]:
-            raise BackupError("backup inventory totals do not match the manifest")
+        restore_id = str(uuid.uuid4())
+        staging = {
+            "data": roots.data / f".restore-{restore_id}",
+            "metrics": roots.metrics.parent / f".{roots.metrics.name}.restore-{restore_id}",
+            "blobs": roots.blobs.parent / f".{roots.blobs.name}.restore-{restore_id}",
+        }
+        committed: list[Path] = []
+        try:
+            for path in staging.values():
+                path.mkdir(parents=True, mode=0o700)
+                path.chmod(0o700)
+            verified_count = 0
+            verified_bytes = 0
+            for entry in _inventory(inventory_path):
+                destination = _staged_restore_path(staging, entry)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                size = _copy_verified_bundle_file(bundle, entry, destination)
+                verified_count += 1
+                verified_bytes += size
+            if (
+                verified_count != manifest["file_count"]
+                or verified_bytes != manifest["total_bytes"]
+            ):
+                raise BackupError("backup inventory totals do not match the manifest")
+            staged_catalog = staging["data"] / "catalog.sqlite3"
+            _verify_sqlite(staged_catalog)
 
-        for entry in _inventory(inventory_path):
-            source = _bundle_file(bundle, entry)
-            destination = _restore_path(roots, entry)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            partial = destination.with_name(f".{destination.name}.{uuid.uuid4()}.tmp")
-            _copy_plain(source, partial)
-            os.replace(partial, destination)
-        _verify_sqlite(roots.catalog)
+            # Each staging root shares a filesystem with its destination. Syncing
+            # every directory bottom-up makes the complete subtrees durable before
+            # their top-level entries are renamed and the catalog is published.
+            for path in staging.values():
+                _fsync_directory_tree(path)
+
+            for source_root, destination_root in [
+                (staging["metrics"], roots.metrics),
+                (staging["blobs"], roots.blobs),
+            ]:
+                for source in sorted(source_root.iterdir()):
+                    destination = destination_root / source.name
+                    os.replace(source, destination)
+                    committed.append(destination)
+                _fsync_directory(destination_root)
+            os.replace(staged_catalog, roots.catalog)
+            committed.append(roots.catalog)
+            _fsync_directory(roots.catalog.parent)
+            _verify_sqlite(roots.catalog)
+        except BaseException:
+            for destination in reversed(committed):
+                if destination.is_dir():
+                    shutil.rmtree(destination, ignore_errors=True)
+                else:
+                    destination.unlink(missing_ok=True)
+                _fsync_directory(destination.parent)
+            raise
+        finally:
+            for path in staging.values():
+                shutil.rmtree(path, ignore_errors=True)
     return manifest
 
 
 @contextmanager
 def _storage_lock(roots: StorageRoots) -> Iterator[None]:
-    roots.data.mkdir(parents=True, exist_ok=True)
-    with roots.lock.open("a+b") as stream:
-        try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise BackupError(
-                "Runloom storage is active; stop runloom-server before backup or restore"
-            ) from error
+    requested_roots = [roots.data, roots.metrics, roots.blobs]
+    for root in requested_roots:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_paths = sorted(
+        {root.expanduser().resolve() / "runloom.lock" for root in requested_roots},
+        key=os.fspath,
+    )
+    streams: list[BinaryIO] = []
+    try:
+        for lock_path in lock_paths:
+            stream = lock_path.open("a+b")
+            streams.append(stream)
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise BackupError(
+                    "Runloom storage is active; stop runloom-server before backup or restore"
+                ) from error
         try:
             yield
         finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            for acquired_stream in reversed(streams):
+                fcntl.flock(acquired_stream.fileno(), fcntl.LOCK_UN)
+    finally:
+        for acquired_stream in reversed(streams):
+            acquired_stream.close()
 
 
 def _backup_sqlite(source: Path, destination: Path) -> None:
@@ -162,6 +219,7 @@ def _backup_sqlite(source: Path, destination: Path) -> None:
             source_database.backup(destination_database)
     except sqlite3.Error as error:
         raise BackupError(f"failed to snapshot SQLite catalog: {error}") from error
+    destination.chmod(0o600)
     _verify_sqlite(destination)
 
 
@@ -191,7 +249,7 @@ def _walk_files(
             if entry.is_symlink():
                 raise BackupError(f"storage roots cannot contain symbolic links: {path}")
             relative = path.relative_to(root)
-            if depth == 0 and skip_staging and entry.name == "staging":
+            if depth == 0 and skip_staging and entry.name in {"staging", "runloom.lock"}:
                 continue
             if entry.is_dir(follow_symlinks=False):
                 yield from _walk_files(
@@ -215,7 +273,8 @@ def _copy_with_digest(
     destination.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
     size = 0
-    with source.open("rb") as input_stream, destination.open("wb") as output_stream:
+    with _open_regular_file(source) as input_stream, destination.open("wb") as output_stream:
+        destination.chmod(0o600)
         while chunk := input_stream.read(_COPY_CHUNK_BYTES):
             output_stream.write(chunk)
             digest.update(chunk)
@@ -225,12 +284,32 @@ def _copy_with_digest(
     return {"category": category, "path": relative, "size": size, "sha256": digest.hexdigest()}
 
 
-def _copy_plain(source: Path, destination: Path) -> None:
-    with source.open("rb") as input_stream, destination.open("wb") as output_stream:
-        while chunk := input_stream.read(_COPY_CHUNK_BYTES):
-            output_stream.write(chunk)
-        output_stream.flush()
-        os.fsync(output_stream.fileno())
+def _copy_verified_bundle_file(
+    bundle: Path,
+    entry: dict[str, Any],
+    destination: Path,
+) -> int:
+    relative = _bundle_relative_path(entry)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with (
+            _open_bundle_regular_file(bundle, relative) as input_stream,
+            destination.open("xb") as output_stream,
+        ):
+            destination.chmod(0o600)
+            while chunk := input_stream.read(_COPY_CHUNK_BYTES):
+                output_stream.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+    except FileExistsError as error:
+        raise BackupError(f"duplicate backup inventory destination: {destination}") from error
+    if size != entry["size"] or digest.hexdigest() != entry["sha256"]:
+        destination.unlink(missing_ok=True)
+        raise BackupError(f"backup verification failed: {bundle / relative}")
+    return size
 
 
 def _inventory_existing(path: Path, category: str, relative: str) -> dict[str, Any]:
@@ -241,7 +320,7 @@ def _inventory_existing(path: Path, category: str, relative: str) -> dict[str, A
 def _digest_file(path: Path) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
-    with path.open("rb") as stream:
+    with _open_regular_file(path) as stream:
         while chunk := stream.read(_COPY_CHUNK_BYTES):
             digest.update(chunk)
             size += len(chunk)
@@ -249,16 +328,36 @@ def _digest_file(path: Path) -> tuple[int, str]:
 
 
 def _read_manifest(bundle: Path) -> dict[str, Any]:
+    path = bundle / "manifest.json"
     try:
-        manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        manifest = json.loads(_read_bounded_file(path, _MAX_MANIFEST_BYTES))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise BackupError(f"invalid backup manifest: {bundle}") from error
+    expected_fields = {
+        "format",
+        "format_version",
+        "created_at",
+        "file_count",
+        "total_bytes",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != expected_fields:
+        raise BackupError("unsupported or invalid physical backup manifest")
+    file_count = manifest.get("file_count")
+    total_bytes = manifest.get("total_bytes")
+    created_at = manifest.get("created_at")
+    format_version = manifest.get("format_version")
     if (
-        not isinstance(manifest, dict)
-        or manifest.get("format") != "runloom-physical-backup"
-        or manifest.get("format_version") != _FORMAT_VERSION
-        or not isinstance(manifest.get("file_count"), int)
-        or not isinstance(manifest.get("total_bytes"), int)
+        manifest.get("format") != "runloom-physical-backup"
+        or isinstance(format_version, bool)
+        or format_version != _FORMAT_VERSION
+        or isinstance(file_count, bool)
+        or not isinstance(file_count, int)
+        or not 1 <= file_count <= _MAX_FILES
+        or isinstance(total_bytes, bool)
+        or not isinstance(total_bytes, int)
+        or total_bytes < 0
+        or not isinstance(created_at, str)
+        or not created_at
     ):
         raise BackupError("unsupported or invalid physical backup manifest")
     return manifest
@@ -266,13 +365,21 @@ def _read_manifest(bundle: Path) -> dict[str, Any]:
 
 def _inventory(path: Path) -> Iterator[dict[str, Any]]:
     try:
-        with path.open("r", encoding="utf-8") as stream:
-            for line_number, line in enumerate(stream, start=1):
+        with _open_regular_file(path) as stream:
+            line_number = 0
+            while line := stream.readline(_MAX_INVENTORY_RECORD_BYTES + 2):
+                line_number += 1
                 if line_number > _MAX_FILES:
                     raise BackupError(f"backup cannot exceed {_MAX_FILES} files")
+                if len(line) > _MAX_INVENTORY_RECORD_BYTES + 1:
+                    raise BackupError(
+                        f"inventory record exceeds {_MAX_INVENTORY_RECORD_BYTES} bytes"
+                    )
+                if not line.endswith(b"\n"):
+                    raise BackupError(f"incomplete inventory line {line_number}")
                 try:
                     entry = json.loads(line)
-                except json.JSONDecodeError as error:
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
                     raise BackupError(f"invalid inventory line {line_number}") from error
                 if not _valid_entry(entry):
                     raise BackupError(f"invalid inventory entry on line {line_number}")
@@ -282,17 +389,18 @@ def _inventory(path: Path) -> Iterator[dict[str, Any]]:
 
 
 def _valid_entry(value: Any) -> bool:
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or set(value) != {"category", "path", "size", "sha256"}:
         return False
     category = value.get("category")
     path = value.get("path")
     size = value.get("size")
     digest = value.get("sha256")
     return (
-        category in {"catalog", "journal", "metrics", "blobs"}
+        category in {"catalog", "metrics", "blobs"}
         and isinstance(path, str)
         and _safe_relative(path)
         and (category != "catalog" or path == "catalog.sqlite3")
+        and (category == "catalog" or Path(path).parts[0] != "runloom.lock")
         and isinstance(size, int)
         and not isinstance(size, bool)
         and size >= 0
@@ -302,51 +410,199 @@ def _valid_entry(value: Any) -> bool:
     )
 
 
-def _bundle_file(bundle: Path, entry: dict[str, Any]) -> Path:
+def _bundle_relative_path(entry: dict[str, Any]) -> Path:
     if entry["category"] == "catalog":
-        return bundle / "catalog.sqlite3"
-    return bundle / entry["category"] / entry["path"]
+        return Path("catalog.sqlite3")
+    return Path(entry["category"]) / entry["path"]
 
 
-def _restore_path(roots: StorageRoots, entry: dict[str, Any]) -> Path:
+@contextmanager
+def _open_bundle_regular_file(bundle: Path, relative: Path) -> Iterator[BinaryIO]:
+    descriptors: list[int] = []
+    source_descriptor = -1
+    try:
+        try:
+            directory = os.open(bundle, os.O_RDONLY | _DIRECTORY | _NO_FOLLOW)
+            descriptors.append(directory)
+            for component in relative.parts[:-1]:
+                directory = os.open(
+                    component,
+                    os.O_RDONLY | _DIRECTORY | _NO_FOLLOW,
+                    dir_fd=directory,
+                )
+                descriptors.append(directory)
+            source_descriptor = os.open(
+                relative.parts[-1],
+                os.O_RDONLY | _NO_FOLLOW,
+                dir_fd=directory,
+            )
+        except OSError as error:
+            raise BackupError(f"cannot safely read backup source: {bundle / relative}") from error
+        if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+            raise BackupError(f"backup source is not a regular file: {bundle / relative}")
+        with os.fdopen(source_descriptor, "rb") as stream:
+            source_descriptor = -1
+            yield stream
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _staged_restore_path(staging: dict[str, Path], entry: dict[str, Any]) -> Path:
     category = entry["category"]
     relative = entry["path"]
     if category == "catalog":
-        return roots.catalog
-    root = {"journal": roots.journal, "metrics": roots.metrics, "blobs": roots.blobs}[category]
-    return root / relative
+        return staging["data"] / "catalog.sqlite3"
+    return staging[category] / relative
 
 
 def _require_empty_destination(roots: StorageRoots) -> None:
     if roots.catalog.exists():
         raise BackupError(f"restore catalog already exists: {roots.catalog}")
-    for root in [roots.journal, roots.metrics, roots.blobs]:
-        if root.exists() and any(root.iterdir()):
+    for root in [roots.metrics, roots.blobs]:
+        if root.exists() and any(path.name != "runloom.lock" for path in root.iterdir()):
             raise BackupError(f"restore storage root is not empty: {root}")
 
 
 def _validate_bundle_location(destination: Path, roots: StorageRoots) -> None:
     for root in [roots.data, roots.metrics, roots.blobs]:
         resolved = root.resolve()
-        if destination == resolved or destination.is_relative_to(resolved):
-            raise BackupError("backup destination cannot be inside a Runloom storage root")
+        if (
+            destination == resolved
+            or destination.is_relative_to(resolved)
+            or resolved.is_relative_to(destination)
+        ):
+            raise BackupError("backup path and Runloom storage roots must be disjoint")
+
+
+def _validate_storage_roots(roots: StorageRoots) -> None:
+    data = roots.data.expanduser().resolve()
+    metrics = roots.metrics.expanduser().resolve()
+    blobs = roots.blobs.expanduser().resolve()
+    if metrics == blobs or metrics.is_relative_to(blobs) or blobs.is_relative_to(metrics):
+        raise BackupError("metric and blob storage roots must not overlap")
+    if data == metrics or data.is_relative_to(metrics):
+        raise BackupError("data storage root must not equal or be inside the metric storage root")
+    if data == blobs or data.is_relative_to(blobs):
+        raise BackupError("data storage root must not equal or be inside the blob storage root")
 
 
 def _safe_relative(value: str) -> bool:
     path = Path(value)
     return (
         bool(value)
+        and len(value.encode("utf-8")) <= _MAX_RELATIVE_PATH_BYTES
         and not path.is_absolute()
         and all(part not in {"", ".", ".."} for part in path.parts)
+        and not any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value)
     )
 
 
 def _write_json(path: Path, value: Any) -> None:
     with path.open("w", encoding="utf-8") as stream:
+        path.chmod(0o600)
         json.dump(value, stream, allow_nan=False, separators=(",", ":"), sort_keys=True)
         stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _write_json_line(stream: TextIO, value: Any) -> None:
     json.dump(value, stream, allow_nan=False, separators=(",", ":"), sort_keys=True)
     stream.write("\n")
+
+
+def _read_bounded_file(path: Path, maximum: int) -> bytes:
+    with _open_regular_file(path) as stream:
+        data = stream.read(maximum + 1)
+    if len(data) > maximum:
+        raise BackupError(f"backup metadata exceeds {maximum} bytes: {path}")
+    return data
+
+
+@contextmanager
+def _open_regular_file(path: Path) -> Iterator[BinaryIO]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | _NO_FOLLOW)
+    except OSError as error:
+        raise BackupError(f"cannot safely read regular file: {path}") from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise BackupError(f"path is not a regular file: {path}")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            yield stream
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | _DIRECTORY | _NO_FOLLOW)
+    except OSError as error:
+        raise BackupError(f"cannot safely sync directory: {path}") from error
+    try:
+        _fsync_directory_descriptor(descriptor, path)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory_tree(root: Path) -> None:
+    try:
+        descriptor = os.open(root, os.O_RDONLY | _DIRECTORY | _NO_FOLLOW)
+    except OSError as error:
+        raise BackupError(f"cannot safely sync directory tree: {root}") from error
+    try:
+        _fsync_directory_tree_descriptor(descriptor, root, depth=0)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory_tree_descriptor(
+    descriptor: int,
+    current: Path,
+    *,
+    depth: int,
+) -> None:
+    if depth > _MAX_TREE_DEPTH:
+        raise BackupError(f"directory tree exceeds {_MAX_TREE_DEPTH} levels while syncing")
+    try:
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                child = current / entry.name
+                if entry.is_symlink():
+                    raise BackupError(f"directory tree contains a symbolic link: {child}")
+                if entry.is_dir(follow_symlinks=False):
+                    try:
+                        child_descriptor = os.open(
+                            entry.name,
+                            os.O_RDONLY | _DIRECTORY | _NO_FOLLOW,
+                            dir_fd=descriptor,
+                        )
+                    except OSError as error:
+                        raise BackupError(f"cannot safely sync directory tree: {child}") from error
+                    try:
+                        _fsync_directory_tree_descriptor(
+                            child_descriptor,
+                            child,
+                            depth=depth + 1,
+                        )
+                    finally:
+                        os.close(child_descriptor)
+                elif not entry.is_file(follow_symlinks=False):
+                    raise BackupError(f"directory tree contains a non-regular entry: {child}")
+    except BackupError:
+        raise
+    except OSError as error:
+        raise BackupError(f"cannot safely sync directory tree: {current}") from error
+    _fsync_directory_descriptor(descriptor, current)
+
+
+def _fsync_directory_descriptor(descriptor: int, path: Path) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        raise BackupError(f"failed to sync directory: {path}") from error

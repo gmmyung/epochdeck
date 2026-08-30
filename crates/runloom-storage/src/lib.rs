@@ -29,6 +29,7 @@ const STEP_COLUMN: &str = "__step";
 const TIMESTAMP_COLUMN: &str = "__timestamp_ms";
 const METRIC_PREFIX: &str = "metric:";
 const PARQUET_BATCH_SIZE: usize = 1_024;
+pub const STORAGE_LOCK_FILE_NAME: &str = "runloom.lock";
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
@@ -51,6 +52,8 @@ pub enum StorageError {
     InvalidSegment(String),
     #[error("invalid blob: {0}")]
     InvalidBlob(String),
+    #[error("invalid storage layout: {0}")]
+    InvalidLayout(String),
     #[error("storage operation was cancelled")]
     Cancelled,
 }
@@ -65,6 +68,68 @@ pub struct StorageLayout {
 #[derive(Debug, Clone)]
 pub struct BlobStore {
     root: Arc<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct BlobStagingFile {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+#[derive(Debug)]
+struct MetricStagingFile {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobInstallation {
+    InstalledNew,
+    AlreadyPresent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledBlob {
+    pub path: PathBuf,
+    pub installation: BlobInstallation,
+}
+
+impl BlobStagingFile {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn disarm(&mut self) {
+        self.cleanup = false;
+    }
+}
+
+impl Drop for BlobStagingFile {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl MetricStagingFile {
+    #[must_use]
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup = false;
+    }
+}
+
+impl Drop for MetricStagingFile {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 impl BlobStore {
@@ -85,15 +150,44 @@ impl BlobStore {
         Ok(())
     }
 
-    pub fn staging_path(&self) -> Result<PathBuf, StorageError> {
-        self.ensure()?;
-        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        Ok(self
-            .staging_dir()
-            .join(format!("upload-{}-{sequence}.tmp", std::process::id())))
+    pub fn health_check(&self) -> Result<(), StorageError> {
+        check_writable_directory(self.root())
     }
 
-    pub fn install(&self, staging_path: &Path, digest: &str) -> Result<PathBuf, StorageError> {
+    pub fn staging_file(&self) -> Result<BlobStagingFile, StorageError> {
+        self.ensure()?;
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Ok(BlobStagingFile {
+            path: self
+                .staging_dir()
+                .join(format!("upload-{}-{sequence}.tmp", std::process::id())),
+            cleanup: true,
+        })
+    }
+
+    pub fn cleanup_staging(&self) -> Result<(), StorageError> {
+        let staging_dir = self.staging_dir();
+        match std::fs::remove_dir_all(&staging_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(StorageError::Io {
+                    path: staging_dir,
+                    source,
+                });
+            }
+        }
+        std::fs::create_dir_all(&staging_dir).map_err(|source| StorageError::CreateDirectory {
+            path: staging_dir,
+            source,
+        })
+    }
+
+    pub fn install(
+        &self,
+        staging_path: &Path,
+        digest: &str,
+    ) -> Result<InstalledBlob, StorageError> {
         validate_blob_digest(digest)?;
         let final_path = self.path(digest)?;
         let parent = final_path.parent().ok_or_else(|| {
@@ -103,23 +197,28 @@ impl BlobStore {
             path: parent.to_path_buf(),
             source,
         })?;
-        match std::fs::hard_link(staging_path, &final_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        let installation = match std::fs::hard_link(staging_path, &final_path) {
+            Ok(()) => BlobInstallation::InstalledNew,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                BlobInstallation::AlreadyPresent
+            }
             Err(source) => {
                 return Err(StorageError::Io {
                     path: final_path,
                     source,
                 });
             }
-        }
+        };
         std::fs::remove_file(staging_path).map_err(|source| StorageError::Io {
             path: staging_path.to_path_buf(),
             source,
         })?;
         sync_path(&final_path)?;
         sync_path(parent)?;
-        Ok(final_path)
+        Ok(InstalledBlob {
+            path: final_path,
+            installation,
+        })
     }
 
     pub fn path(&self, digest: &str) -> Result<PathBuf, StorageError> {
@@ -194,7 +293,7 @@ impl StorageLayout {
             &self.data_dir,
             &self.metrics_dir,
             &self.blobs_dir,
-            &self.journal_dir(),
+            &self.metric_staging_dir(),
             &self.blob_staging_dir(),
         ] {
             std::fs::create_dir_all(path).map_err(|source| StorageError::CreateDirectory {
@@ -202,7 +301,7 @@ impl StorageLayout {
                 source,
             })?;
         }
-        Ok(())
+        self.validate_roots()
     }
 
     #[must_use]
@@ -212,17 +311,31 @@ impl StorageLayout {
 
     #[must_use]
     pub fn lock_path(&self) -> PathBuf {
-        self.data_dir.join("runloom.lock")
+        self.data_dir.join(STORAGE_LOCK_FILE_NAME)
     }
 
-    #[must_use]
-    pub fn journal_dir(&self) -> PathBuf {
-        self.data_dir.join("journal")
+    pub fn ownership_lock_paths(&self) -> Result<Vec<PathBuf>, StorageError> {
+        let mut paths = [
+            canonical_storage_root(&self.data_dir)?,
+            canonical_storage_root(&self.metrics_dir)?,
+            canonical_storage_root(&self.blobs_dir)?,
+        ]
+        .into_iter()
+        .map(|root| root.join(STORAGE_LOCK_FILE_NAME))
+        .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 
     #[must_use]
     pub fn metrics_dir(&self) -> &Path {
         &self.metrics_dir
+    }
+
+    #[must_use]
+    pub fn metric_staging_dir(&self) -> PathBuf {
+        self.metrics_dir.join("staging")
     }
 
     #[must_use]
@@ -233,6 +346,30 @@ impl StorageLayout {
     #[must_use]
     pub fn blob_staging_dir(&self) -> PathBuf {
         self.blobs_dir.join("staging")
+    }
+
+    fn validate_roots(&self) -> Result<(), StorageError> {
+        let data = canonical_storage_root(&self.data_dir)?;
+        let metrics = canonical_storage_root(&self.metrics_dir)?;
+        let blobs = canonical_storage_root(&self.blobs_dir)?;
+
+        if metrics == blobs || metrics.starts_with(&blobs) || blobs.starts_with(&metrics) {
+            return Err(StorageError::InvalidLayout(format!(
+                "metric and blob roots must be disjoint after resolving symlinks: metrics={}, blobs={}",
+                metrics.display(),
+                blobs.display()
+            )));
+        }
+        for (kind, root) in [("metric", &metrics), ("blob", &blobs)] {
+            if data == *root || data.starts_with(root) {
+                return Err(StorageError::InvalidLayout(format!(
+                    "data root may contain the {kind} root but must not equal it or be nested inside it: data={}, {kind}s={}",
+                    data.display(),
+                    root.display()
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -245,6 +382,13 @@ pub struct WrittenSegment {
     pub last_sequence: u64,
     pub row_count: usize,
     pub byte_size: u64,
+    pub installation: SegmentInstallation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentInstallation {
+    InstalledNew,
+    AlreadyPresent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,9 +566,21 @@ impl MinMaxHistorySampler {
         store: &MetricStore,
         segments: &[SegmentSource],
     ) -> Result<(), StorageError> {
+        self.read_segments_cancelable(store, segments, &AtomicBool::new(false))
+    }
+
+    pub fn read_segments_cancelable(
+        &mut self,
+        store: &MetricStore,
+        segments: &[SegmentSource],
+        cancelled: &AtomicBool,
+    ) -> Result<(), StorageError> {
         for segment in segments {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(StorageError::Cancelled);
+            }
             let path = store.resolve_segment(&segment.relative_path)?;
-            read_segment_sampled(&path, self)?;
+            read_segment_sampled(&path, self, cancelled)?;
         }
         Ok(())
     }
@@ -968,6 +1124,38 @@ impl MetricStore {
         &self.root
     }
 
+    pub fn ensure(&self) -> Result<(), StorageError> {
+        for path in [self.root.as_path(), &self.staging_dir()] {
+            std::fs::create_dir_all(path).map_err(|source| StorageError::CreateDirectory {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn cleanup_staging(&self) -> Result<(), StorageError> {
+        let staging_dir = self.staging_dir();
+        match std::fs::remove_dir_all(&staging_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(StorageError::Io {
+                    path: staging_dir,
+                    source,
+                });
+            }
+        }
+        std::fs::create_dir_all(&staging_dir).map_err(|source| StorageError::CreateDirectory {
+            path: staging_dir,
+            source,
+        })
+    }
+
+    pub fn health_check(&self) -> Result<(), StorageError> {
+        check_writable_directory(self.root())
+    }
+
     pub fn write_batch(
         &self,
         project_id: ProjectId,
@@ -1010,13 +1198,16 @@ impl MetricStore {
             source,
         })?;
 
-        if !final_path.exists() {
-            let temporary_path = temporary_path(&final_path)?;
-            let result = write_parquet(&temporary_path, request, &metric_keys)
-                .and_then(|()| install_file(&temporary_path, &final_path));
-            let _ = std::fs::remove_file(&temporary_path);
-            result?;
-        }
+        let installation = if final_path.exists() {
+            SegmentInstallation::AlreadyPresent
+        } else {
+            let mut staging = self.staging_file()?;
+            write_parquet(staging.path(), request, &metric_keys)?;
+            let installation = install_file(staging.path(), &final_path)?;
+            remove_staging_file(staging.path())?;
+            staging.disarm();
+            installation
+        };
 
         sync_path(&final_path)?;
         sync_path(parent)?;
@@ -1035,6 +1226,7 @@ impl MetricStore {
             last_sequence,
             row_count: request.points.len(),
             byte_size,
+            installation,
         })
     }
 
@@ -1045,6 +1237,25 @@ impl MetricStore {
         keys: &[String],
         after_sequence: Option<u64>,
         limit: usize,
+    ) -> Result<HistoryResponse, StorageError> {
+        self.read_history_cancelable(
+            run_id,
+            segments,
+            keys,
+            after_sequence,
+            limit,
+            &AtomicBool::new(false),
+        )
+    }
+
+    pub fn read_history_cancelable(
+        &self,
+        run_id: RunId,
+        segments: &[SegmentSource],
+        keys: &[String],
+        after_sequence: Option<u64>,
+        limit: usize,
+        cancelled: &AtomicBool,
     ) -> Result<HistoryResponse, StorageError> {
         let mut response = HistoryResponse {
             run_id,
@@ -1063,11 +1274,14 @@ impl MetricStore {
         };
 
         for segment in segments {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(StorageError::Cancelled);
+            }
             if response.sequence.len() >= limit {
                 break;
             }
             let path = self.resolve_segment(&segment.relative_path)?;
-            read_segment(&path, keys, after_sequence, limit, &mut response)?;
+            read_segment(&path, keys, after_sequence, limit, &mut response, cancelled)?;
         }
         if response.sequence.len() == limit {
             response.next_after = response.sequence.last().copied();
@@ -1187,24 +1401,24 @@ impl MetricStore {
             source,
         })?;
 
-        if !final_path.exists() {
-            let temporary_path = temporary_path(&final_path)?;
-            let result = write_compacted_parquet(
+        let installation = if final_path.exists() {
+            SegmentInstallation::AlreadyPresent
+        } else {
+            let mut staging = self.staging_file()?;
+            write_compacted_parquet(
                 self,
-                &temporary_path,
+                staging.path(),
                 sources,
                 first_sequence,
                 last_sequence,
                 row_count,
                 cancelled,
-            )
-            .and_then(|()| install_file(&temporary_path, &final_path));
-            let _ = std::fs::remove_file(&temporary_path);
-            result?;
-        }
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(StorageError::Cancelled);
-        }
+            )?;
+            let installation = install_file(staging.path(), &final_path)?;
+            remove_staging_file(staging.path())?;
+            staging.disarm();
+            installation
+        };
         sync_path(&final_path)?;
         sync_path(parent)?;
         let byte_size = std::fs::metadata(&final_path)
@@ -1221,6 +1435,7 @@ impl MetricStore {
             last_sequence,
             row_count,
             byte_size,
+            installation,
         })
     }
 
@@ -1231,6 +1446,21 @@ impl MetricStore {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(source) => Err(StorageError::Io { path, source }),
         }
+    }
+
+    fn staging_file(&self) -> Result<MetricStagingFile, StorageError> {
+        self.ensure()?;
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Ok(MetricStagingFile {
+            path: self
+                .staging_dir()
+                .join(format!("segment-{}-{sequence}.tmp", std::process::id())),
+            cleanup: true,
+        })
+    }
+
+    fn staging_dir(&self) -> PathBuf {
+        self.root.join("staging")
     }
 
     fn resolve_segment(&self, relative_path: &str) -> Result<PathBuf, StorageError> {
@@ -1427,15 +1657,27 @@ fn writer_properties() -> WriterProperties {
         .build()
 }
 
-fn install_file(temporary_path: &Path, final_path: &Path) -> Result<(), StorageError> {
-    match std::fs::rename(temporary_path, final_path) {
-        Ok(()) => Ok(()),
-        Err(_) if final_path.exists() => Ok(()),
+fn install_file(
+    temporary_path: &Path,
+    final_path: &Path,
+) -> Result<SegmentInstallation, StorageError> {
+    match std::fs::hard_link(temporary_path, final_path) {
+        Ok(()) => Ok(SegmentInstallation::InstalledNew),
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(SegmentInstallation::AlreadyPresent)
+        }
         Err(source) => Err(StorageError::Io {
             path: final_path.to_path_buf(),
             source,
         }),
     }
+}
+
+fn remove_staging_file(path: &Path) -> Result<(), StorageError> {
+    std::fs::remove_file(path).map_err(|source| StorageError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn sync_path(path: &Path) -> Result<(), StorageError> {
@@ -1447,16 +1689,55 @@ fn sync_path(path: &Path) -> Result<(), StorageError> {
         })
 }
 
+fn check_writable_directory(path: &Path) -> Result<(), StorageError> {
+    let metadata = std::fs::metadata(path).map_err(|source| StorageError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_dir() {
+        return Err(StorageError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "storage root is not a directory",
+            ),
+        });
+    }
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let probe = path.join(format!(
+        ".runloom-health-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let result = File::options().write(true).create_new(true).open(&probe);
+    match result {
+        Ok(file) => {
+            drop(file);
+            std::fs::remove_file(&probe).map_err(|source| StorageError::Io {
+                path: probe,
+                source,
+            })
+        }
+        Err(source) => Err(StorageError::Io {
+            path: probe,
+            source,
+        }),
+    }
+}
+
 fn read_segment(
     path: &Path,
     keys: &[String],
     after_sequence: Option<u64>,
     limit: usize,
     response: &mut HistoryResponse,
+    cancelled: &AtomicBool,
 ) -> Result<(), StorageError> {
     let reader = projected_reader(path, keys, PARQUET_BATCH_SIZE.min(limit))?;
 
     for batch in reader {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(StorageError::Cancelled);
+        }
         let batch = batch?;
         let sequence = required_array::<UInt64Array>(&batch, SEQUENCE_COLUMN)?;
         let step = required_array::<UInt64Array>(&batch, STEP_COLUMN)?;
@@ -1497,10 +1778,14 @@ fn read_segment(
 fn read_segment_sampled(
     path: &Path,
     sampler: &mut MinMaxHistorySampler,
+    cancelled: &AtomicBool,
 ) -> Result<(), StorageError> {
     let reader = projected_reader(path, &sampler.keys, PARQUET_BATCH_SIZE)?;
 
     for batch in reader {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(StorageError::Cancelled);
+        }
         let batch = batch?;
         let sequence = required_array::<UInt64Array>(&batch, SEQUENCE_COLUMN)?;
         let step = required_array::<UInt64Array>(&batch, STEP_COLUMN)?;
@@ -1843,16 +2128,11 @@ fn hex_digest(bytes: &[u8]) -> String {
     )
 }
 
-fn temporary_path(final_path: &Path) -> Result<PathBuf, StorageError> {
-    let file_name = final_path
-        .file_name()
-        .ok_or_else(|| StorageError::InvalidSegment("segment path has no file name".to_owned()))?;
-    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    Ok(final_path.with_file_name(format!(
-        ".{}.{}.{sequence}.tmp",
-        file_name.to_string_lossy(),
-        std::process::id()
-    )))
+fn canonical_storage_root(path: &Path) -> Result<PathBuf, StorageError> {
+    std::fs::canonicalize(path).map_err(|source| StorageError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn environment_path(name: &str, default: &str) -> PathBuf {
@@ -1872,9 +2152,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        BlobStore, ChartAxisExtent, ChartAxisExtentScanner, ChartCoordinate, ChartHistorySampler,
-        ChartSamplingSpec, ChartStepExtent, ChartStepExtentScanner, CompactionSource, MetricStore,
-        MinMaxHistorySampler, SegmentSource, StorageLayout, row_group_may_overlap_step_range,
+        BlobInstallation, BlobStore, ChartAxisExtent, ChartAxisExtentScanner, ChartCoordinate,
+        ChartHistorySampler, ChartSamplingSpec, ChartStepExtent, ChartStepExtentScanner,
+        CompactionSource, MetricStore, MinMaxHistorySampler, SegmentInstallation, SegmentSource,
+        StorageError, StorageLayout, row_group_may_overlap_step_range,
     };
 
     #[test]
@@ -1899,21 +2180,139 @@ mod tests {
     }
 
     #[test]
+    fn accepts_data_as_parent_of_disjoint_metric_and_blob_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let data = directory.path().join("data");
+        let layout = StorageLayout::new(&data, data.join("metrics"), data.join("blobs"));
+        layout.ensure()?;
+        let lock_paths = layout.ownership_lock_paths()?;
+        assert_eq!(lock_paths.len(), 3);
+        assert!(lock_paths.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(lock_paths.iter().all(|path| {
+            path.file_name()
+                .is_some_and(|name| name == super::STORAGE_LOCK_FILE_NAME)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_overlapping_storage_roots() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let metric_parent = directory.path().join("metric-parent");
+        let overlapping = StorageLayout::new(
+            directory.path().join("data"),
+            &metric_parent,
+            metric_parent.join("blobs"),
+        );
+        assert!(matches!(
+            overlapping.ensure(),
+            Err(StorageError::InvalidLayout(message))
+                if message.contains("metric and blob roots must be disjoint")
+        ));
+
+        let metrics = directory.path().join("contains-data");
+        let nested_data = StorageLayout::new(
+            metrics.join("data"),
+            &metrics,
+            directory.path().join("separate-blobs"),
+        );
+        assert!(matches!(
+            nested_data.ensure(),
+            Err(StorageError::InvalidLayout(message))
+                if message.contains("data root may contain the metric root")
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_storage_roots_that_alias_through_symlinks() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir()?;
+        let shared = directory.path().join("shared");
+        std::fs::create_dir(&shared)?;
+        let metrics = directory.path().join("metrics-link");
+        let blobs = directory.path().join("blobs-link");
+        symlink(&shared, &metrics)?;
+        symlink(&shared, &blobs)?;
+        let layout = StorageLayout::new(directory.path().join("data"), metrics, blobs);
+        assert!(matches!(
+            layout.ensure(),
+            Err(StorageError::InvalidLayout(message))
+                if message.contains("metric and blob roots must be disjoint")
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn installs_content_addressed_blobs_idempotently() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let store = BlobStore::new(directory.path());
         let digest = format!("{:x}", Sha256::digest(b"blob-content"));
-        let first = store.staging_path()?;
-        std::fs::write(&first, b"blob-content")?;
-        let installed = store.install(&first, &digest)?;
-        let replay = store.staging_path()?;
-        std::fs::write(&replay, b"blob-content")?;
-        assert_eq!(store.install(&replay, &digest)?, installed);
+        let mut first = store.staging_file()?;
+        std::fs::write(first.path(), b"blob-content")?;
+        let first_path = first.path().to_path_buf();
+        let installed = store.install(first.path(), &digest)?;
+        first.disarm();
+        let mut replay = store.staging_file()?;
+        std::fs::write(replay.path(), b"blob-content")?;
+        let replay_path = replay.path().to_path_buf();
+        let replayed = store.install(replay.path(), &digest)?;
+        replay.disarm();
 
+        assert_eq!(installed.installation, BlobInstallation::InstalledNew);
+        assert_eq!(replayed.installation, BlobInstallation::AlreadyPresent);
+        assert_eq!(replayed.path, installed.path);
         assert_eq!(store.size(&digest)?, Some(12));
-        assert_eq!(std::fs::read(installed)?, b"blob-content");
-        assert!(!first.exists());
-        assert!(!replay.exists());
+        assert_eq!(std::fs::read(installed.path)?, b"blob-content");
+        assert!(!first_path.exists());
+        assert!(!replay_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn staging_files_are_owned_and_startup_cleanup_removes_orphans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let store = BlobStore::new(directory.path());
+        let staging = store.staging_file()?;
+        let cancelled_path = staging.path().to_path_buf();
+        std::fs::write(&cancelled_path, b"partial")?;
+        drop(staging);
+        assert!(!cancelled_path.exists());
+
+        let mut orphan = store.staging_file()?;
+        let orphan_path = orphan.path().to_path_buf();
+        std::fs::write(&orphan_path, b"interrupted")?;
+        orphan.disarm();
+        drop(orphan);
+        store.cleanup_staging()?;
+        assert!(!orphan_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn metric_staging_files_are_owned_and_startup_cleanup_removes_orphans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let store = MetricStore::new(directory.path());
+        let staging = store.staging_file()?;
+        let cancelled_path = staging.path().to_path_buf();
+        std::fs::write(&cancelled_path, b"partial parquet")?;
+        drop(staging);
+        assert!(!cancelled_path.exists());
+
+        let mut orphan = store.staging_file()?;
+        let orphan_path = orphan.path().to_path_buf();
+        std::fs::write(&orphan_path, b"interrupted parquet")?;
+        orphan.disarm();
+        drop(orphan);
+        store.cleanup_staging()?;
+        assert!(!orphan_path.exists());
+        assert!(directory.path().join("staging").is_dir());
         Ok(())
     }
 
@@ -1942,6 +2341,9 @@ mod tests {
             ],
         };
         let segment = store.write_batch(project_id, run_id, &"a".repeat(64), &request)?;
+        assert_eq!(segment.installation, SegmentInstallation::InstalledNew);
+        let replay = store.write_batch(project_id, run_id, &"a".repeat(64), &request)?;
+        assert_eq!(replay.installation, SegmentInstallation::AlreadyPresent);
         let history = store.read_history(
             run_id,
             &[SegmentSource {
@@ -2091,7 +2493,14 @@ mod tests {
         assert_eq!(compacted.first_sequence, 1);
         assert_eq!(compacted.last_sequence, 6);
         assert_eq!(compacted.row_count, 6);
-        assert_eq!(replayed, compacted);
+        assert_eq!(compacted.installation, SegmentInstallation::InstalledNew);
+        assert_eq!(
+            replayed,
+            super::WrittenSegment {
+                installation: SegmentInstallation::AlreadyPresent,
+                ..compacted.clone()
+            }
+        );
         assert_eq!(
             store.read_segment_tail(&compacted.relative_path)?,
             super::SegmentTail {

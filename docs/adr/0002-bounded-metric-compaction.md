@@ -17,7 +17,12 @@ swapping manifests, and deleting replaced files.
 
 ## Decision
 
-Runloom runs one cancellable background compaction worker. Each default pass:
+Runloom runs one cancellable background compaction worker. A candidate contains
+at least four adjacent segments with the same metric-schema signature, and its
+largest input has at most twice as many rows as its smallest input. This
+size-tiered rule lets a live run accumulate a cohort before rewriting it instead
+of repeatedly merging a growing head segment with every newly arrived batch.
+Each default pass:
 
 - selects at most 16 adjacent segments with the same metric-schema signature;
 - caps the replacement at 16,384 rows;
@@ -44,6 +49,11 @@ configured pass at 64 input segments and 65,536 rows.
 Compaction reduces file-open overhead without changing history values, ordering,
 pagination, sampling, summaries, or cache revisions. Raw samples remain
 lossless; only their physical grouping changes.
+
+For a steady stream of similarly sized batches, four-way size tiers bound the
+number of rewrites per row logarithmically rather than rewriting the complete
+active prefix after each batch. A partial cohort remains as immutable source
+segments until enough comparable neighbors arrive.
 
 Schema changes form compaction boundaries. This avoids constructing a very wide
 union schema and keeps merge memory proportional to one known metric signature.

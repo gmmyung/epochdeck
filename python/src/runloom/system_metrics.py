@@ -24,7 +24,7 @@ class SystemSampler:
 
     def sample(self) -> dict[str, float]:
         memory = psutil.virtual_memory()
-        disk = psutil.disk_usage(self._disk_path)
+        disk = psutil.disk_usage(str(self._disk_path))
         network = psutil.net_io_counters()
         process_memory = self._process.memory_info()
         metrics = {
@@ -53,17 +53,21 @@ class SystemSampler:
     def _gpu_metrics(self) -> dict[str, float]:
         if self._nvidia_smi is None:
             return {}
-        result = subprocess.run(
-            [
-                self._nvidia_smi,
-                "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_GPU_QUERY_TIMEOUT_SECONDS,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    self._nvidia_smi,
+                    "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_GPU_QUERY_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            self._nvidia_smi = None
+            return {}
         if result.returncode != 0:
             return {}
         metrics: dict[str, float] = {}

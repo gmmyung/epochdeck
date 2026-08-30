@@ -11,6 +11,7 @@ import pytest
 
 import runloom
 from runloom import DeliveryError
+from runloom._summary import merge_metric_preview
 from runloom.run import create_run, sync_spool
 
 FIXTURE = json.loads(
@@ -67,7 +68,7 @@ class ContractServer:
                 return httpx.Response(200, json={"run": self._response_run(run)})
             if path.endswith("/summary"):
                 run = self.runs[run_id]
-                run["summary"].update(body["updates"])
+                run["explicit_summary"].update(body["updates"])
                 return httpx.Response(200, json={"run": self._response_run(run)})
             if path.endswith("/finish"):
                 return self._finish(request, run_id, body["summary"])
@@ -128,7 +129,11 @@ class ContractServer:
         if not duplicate:
             run["batches"][sequence] = deepcopy(body)
             for point in body["points"]:
-                run["summary"].update(point["metrics"])
+                run["metric_summary"], run["summary_truncated"] = merge_metric_preview(
+                    run["metric_summary"],
+                    point["metrics"],
+                    truncated=run["summary_truncated"],
+                )
                 run["last_sequence"] = point["sequence"]
                 run["last_step"] = point["step"]
         self.batch_requests.append(deepcopy(body))
@@ -144,6 +149,7 @@ class ContractServer:
                 "accepted_points": len(body["points"]),
                 "duplicate": duplicate,
                 "metric_revision": len(run["batches"]),
+                "stop_requested": False,
             },
         )
 
@@ -155,10 +161,10 @@ class ContractServer:
     ) -> httpx.Response:
         run = self.runs[run_id]
         if run["state"] == "finished":
-            if any(run["summary"].get(key) != value for key, value in summary.items()):
+            if any(run["explicit_summary"].get(key) != value for key, value in summary.items()):
                 return self._error(409, "conflict", "finished summary changed")
             return httpx.Response(200, json={"run": self._response_run(run)})
-        run["summary"].update(summary)
+        run["explicit_summary"].update(summary)
         run["state"] = "finished"
         if self.lose_first_finish_response and not self._lost_finish_response:
             self._lost_finish_response = True
@@ -180,7 +186,9 @@ class ContractServer:
             "name": name,
             "state": "running",
             "config": deepcopy(config),
-            "summary": deepcopy(summary or {}),
+            "explicit_summary": {},
+            "metric_summary": deepcopy(summary or {}),
+            "summary_truncated": False,
             "last_sequence": last_sequence,
             "last_step": last_step,
             "batches": {},
@@ -188,12 +196,17 @@ class ContractServer:
 
     @staticmethod
     def _response_run(run: dict[str, Any]) -> dict[str, Any]:
+        explicit = deepcopy(run["explicit_summary"])
+        metric = deepcopy(run["metric_summary"])
         return {
             "id": run["id"],
             "name": run["name"],
             "state": run["state"],
             "config": deepcopy(run["config"]),
-            "summary": deepcopy(run["summary"]),
+            "explicit_summary": explicit,
+            "metric_summary": metric,
+            "summary": {**metric, **explicit},
+            "summary_truncated": run["summary_truncated"],
         }
 
     @staticmethod
@@ -225,7 +238,10 @@ def test_online_scalar_lifecycle_matches_golden_contract(tmp_path) -> None:
     assert [point["sequence"] for point in points] == expected["sequence"]
     assert [point["step"] for point in points] == expected["step"]
     assert sorted({key for point in points for key in point["metrics"]}) == expected["metric_keys"]
-    assert server.runs[run.id]["summary"] == expected["summary"]
+    assert {
+        **server.runs[run.id]["metric_summary"],
+        **server.runs[run.id]["explicit_summary"],
+    } == expected["summary"]
     assert server.runs[run.id]["config"] == {"optimizer": "adam", "seed": 42}
 
 
@@ -269,7 +285,7 @@ def test_offline_restart_restores_spool_state_and_policies(tmp_path) -> None:
     expected = FIXTURE["offline_restart"]
     assert [event["sequence"] for event in events] == expected["sequence"]
     assert [event["step"] for event in events] == expected["step"]
-    assert metadata["summary"] == expected["summary"]
+    assert {**metadata["metric_summary"], **metadata["explicit_summary"]} == expected["summary"]
     with pytest.raises(DeliveryError, match="finished run spool"):
         create_run(
             project="contract",

@@ -1,12 +1,15 @@
 #![forbid(unsafe_code)]
 
 mod compaction;
+mod diagnostics;
+mod discovery;
 
 pub use compaction::{CompactionConfig, MetricRuntime, run_compaction_worker};
 #[cfg(test)]
-use compaction::{CompactionOutcome, compact_once};
+use compaction::{CompactionError, CompactionOutcome, compact_once};
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -37,42 +40,55 @@ use runloom_protocol::{
     CreateReportResponse, CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest,
     CreateRunResponse, CreateSweepRequest, CreateSweepResponse, CreateTraceSpanRequest,
     CreateTraceSpanResponse, DiagnosticsResponse, FinishRunRequest, FinishRunResponse,
-    HealthResponse, HistoryResponse, IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES,
-    MAX_ALERT_TITLE_BYTES, MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS,
-    MAX_CHART_BUCKET_CELLS, MAX_CHART_BUCKETS, MAX_CHART_QUERY_CELLS, MAX_CHART_QUERY_RUNS,
-    MAX_CHART_QUERY_SERIES, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS, MAX_HISTORY_POINTS,
-    MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES,
-    MAX_TRACE_METADATA_BYTES, MetricKeyListResponse, ProjectListResponse, ReportId, ReportLayout,
-    ReportListResponse, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId, RichValueKind,
-    RichValueListResponse, RunArtifactListResponse, RunId, RunListResponse, RunQueryRequest,
-    RunQueryResponse, RunRecord, RunState, RunUpdateResponse, SlowRequestRecord,
-    SummaryUpdateRequest, SweepId, SweepListResponse, SweepTrialId, SweepTrialListResponse,
-    SweepTrialRecord, SweepTrialState, TraceSpanId, TraceSpanListResponse, UpdateReportRequest,
-    UseArtifactRequest,
+    HealthResponse, HeartbeatSweepTrialRequest, HistoryResponse, IngestBatchRequest,
+    IngestBatchResponse, MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES, MAX_ARTIFACT_ENTRIES,
+    MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS, MAX_CHART_BUCKET_CELLS, MAX_CHART_BUCKETS,
+    MAX_CHART_QUERY_CELLS, MAX_CHART_QUERY_RUNS, MAX_CHART_QUERY_SERIES, MAX_CONFIG_BYTES,
+    MAX_HISTORY_KEYS, MAX_HISTORY_POINTS, MAX_JSON_SAFE_INTEGER, MAX_METRICS_PER_POINT,
+    MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES, MAX_TRACE_METADATA_BYTES,
+    ReportId, ReportLayout, ReportListResponse, ReportPanelKind, ReportRecord, ResumePolicy,
+    RichValueId, RichValueKeyListResponse, RichValueKind, RichValueListResponse,
+    RunArtifactListResponse, RunId, RunQueryRequest, RunState, RunUpdateResponse,
+    SlowRequestRecord, SummaryUpdateRequest, SweepId, SweepListResponse, SweepTrialId,
+    SweepTrialListResponse, SweepTrialRecord, SweepTrialState, TraceSpanId, TraceSpanListResponse,
+    UpdateReportRequest, UseArtifactRequest,
 };
 use runloom_storage::{
-    BlobStore, ChartAxisExtent, ChartAxisExtentScanner, ChartCoordinate, ChartHistorySampler,
-    ChartSamplingSpec, ChartStepExtent, ChartStepExtentScanner, MetricStore, MinMaxHistorySampler,
-    SegmentSource, SegmentTail, StorageError,
+    BlobInstallation, BlobStore, ChartAxisExtent, ChartAxisExtentScanner, ChartCoordinate,
+    ChartHistorySampler, ChartSamplingSpec, ChartStepExtent, ChartStepExtentScanner, MetricStore,
+    MinMaxHistorySampler, SegmentInstallation, SegmentSource, SegmentTail, StorageError,
 };
 #[cfg(feature = "embedded-dashboard")]
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedSemaphorePermit, Semaphore,
+    mpsc,
+};
 use tower::ServiceExt;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeFile;
 use tower_http::trace::TraceLayer;
+
+use diagnostics::collect_storage_root_diagnostics;
+use discovery::{
+    get_project, get_run, list_projects, list_runs, metric_keys, query_project_metrics, query_runs,
+};
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROJECT_NAME_BYTES: usize = 128;
 const MAX_RUN_NAME_BYTES: usize = 256;
 const MAX_METRIC_KEY_BYTES: usize = 256;
 const INGEST_WORKERS: usize = 2;
+const BLOB_UPLOAD_WORKERS: usize = 8;
+const REQUEST_ADMISSION_LIMIT: usize = 64;
+const HEALTH_ADMISSION_LIMIT: usize = 2;
+const DOWNLOAD_STREAM_LIMIT: usize = 16;
+const MUTATION_LOCKS: usize = 256;
 const QUERY_WORKERS: usize = 4;
-const ARTIFACT_DOWNLOAD_WORKERS: usize = 4;
+const ARTIFACT_IO_WORKERS: usize = 4;
 const MAX_LIST_ITEMS: usize = 200;
 const MAX_MIME_TYPE_BYTES: usize = 256;
 const MAX_FILE_NAME_BYTES: usize = 512;
@@ -108,12 +124,48 @@ struct AppState {
     catalog: Catalog,
     metrics: MetricRuntime,
     blobs: BlobStore,
+    request_admission: Arc<Semaphore>,
+    health_admission: Arc<Semaphore>,
     ingest_permits: Arc<Semaphore>,
+    blob_upload_permits: Arc<Semaphore>,
+    mutation_locks: Arc<Vec<Arc<AsyncMutex<()>>>>,
     query_permits: Arc<Semaphore>,
-    artifact_download_permits: Arc<Semaphore>,
+    artifact_io_permits: Arc<Semaphore>,
+    download_stream_permits: Arc<Semaphore>,
     chart_series_cache: Arc<Mutex<ChartSeriesCache>>,
     chart_axis_extent_cache: Arc<Mutex<ChartAxisExtentCache>>,
     telemetry: Arc<RequestTelemetry>,
+}
+
+impl AppState {
+    fn new(
+        catalog: Catalog,
+        metrics: MetricRuntime,
+        blobs: BlobStore,
+        chart_axis_extent_cache: Arc<Mutex<ChartAxisExtentCache>>,
+        telemetry: Arc<RequestTelemetry>,
+    ) -> Self {
+        Self {
+            catalog,
+            metrics,
+            blobs,
+            request_admission: Arc::new(Semaphore::new(REQUEST_ADMISSION_LIMIT)),
+            health_admission: Arc::new(Semaphore::new(HEALTH_ADMISSION_LIMIT)),
+            ingest_permits: Arc::new(Semaphore::new(INGEST_WORKERS)),
+            blob_upload_permits: Arc::new(Semaphore::new(BLOB_UPLOAD_WORKERS)),
+            mutation_locks: Arc::new(
+                (0..MUTATION_LOCKS)
+                    .map(|_| Arc::new(AsyncMutex::new(())))
+                    .collect(),
+            ),
+            query_permits: Arc::new(Semaphore::new(QUERY_WORKERS)),
+            artifact_io_permits: Arc::new(Semaphore::new(ARTIFACT_IO_WORKERS)),
+            download_stream_permits: Arc::new(Semaphore::new(DOWNLOAD_STREAM_LIMIT)),
+            chart_series_cache: Arc::new(Mutex::new(ChartSeriesCache::default())),
+            chart_axis_extent_cache,
+            telemetry,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -338,6 +390,7 @@ struct RequestTelemetry {
     slow_threshold: Duration,
     requests_total: AtomicU64,
     requests_active: AtomicU64,
+    requests_rejected_total: AtomicU64,
     server_errors_total: AtomicU64,
     slow_requests_total: AtomicU64,
     history_queries_total: AtomicU64,
@@ -362,6 +415,7 @@ impl RequestTelemetry {
             slow_threshold,
             requests_total: AtomicU64::new(0),
             requests_active: AtomicU64::new(0),
+            requests_rejected_total: AtomicU64::new(0),
             server_errors_total: AtomicU64::new(0),
             slow_requests_total: AtomicU64::new(0),
             history_queries_total: AtomicU64::new(0),
@@ -415,10 +469,23 @@ fn app_with_axis_extent_cache(
     chart_axis_extent_cache: Arc<Mutex<ChartAxisExtentCache>>,
 ) -> Router {
     let telemetry = Arc::new(RequestTelemetry::from_environment());
+    let state = AppState::new(
+        catalog,
+        metrics,
+        blobs,
+        chart_axis_extent_cache,
+        Arc::clone(&telemetry),
+    );
+    let admission_state = state.clone();
     let router = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/diagnostics", get(diagnostics))
         .route("/api/v1/projects", get(list_projects))
+        .route("/api/v1/projects/{project}", get(get_project))
+        .route(
+            "/api/v1/projects/{project}/metrics/query",
+            post(query_project_metrics),
+        )
         .route("/api/v1/query/runs", post(query_runs))
         .route(
             "/api/v1/projects/{project}/sweeps",
@@ -435,9 +502,14 @@ fn app_with_axis_extent_cache(
         .route("/api/v1/sweeps/{sweep_id}", get(get_sweep))
         .route("/api/v1/sweeps/{sweep_id}/claim", post(claim_sweep_trial))
         .route("/api/v1/sweeps/{sweep_id}/trials", get(list_sweep_trials))
+        .route("/api/v1/sweep-trials/{trial_id}", get(get_sweep_trial))
         .route(
             "/api/v1/sweep-trials/{trial_id}/complete",
             post(complete_sweep_trial),
+        )
+        .route(
+            "/api/v1/sweep-trials/{trial_id}/heartbeat",
+            post(heartbeat_sweep_trial),
         )
         .route(
             "/api/v1/projects/{project}/runs",
@@ -457,6 +529,11 @@ fn app_with_axis_extent_cache(
             "/api/v1/runs/{run_id}/rich-values",
             post(create_rich_value).get(list_rich_values),
         )
+        .route(
+            "/api/v1/runs/{run_id}/rich-values/keys",
+            get(list_rich_value_keys),
+        )
+        .route("/api/v1/rich-values/{value_id}", get(get_rich_value))
         .route(
             "/api/v1/runs/{run_id}/artifacts",
             post(create_artifact).get(list_run_artifacts),
@@ -495,24 +572,59 @@ fn app_with_axis_extent_cache(
             "/api/v1/projects/{project}/chart-history/query",
             post(query_chart_history),
         )
-        .with_state(AppState {
-            catalog,
-            metrics,
-            blobs,
-            ingest_permits: Arc::new(Semaphore::new(INGEST_WORKERS)),
-            query_permits: Arc::new(Semaphore::new(QUERY_WORKERS)),
-            artifact_download_permits: Arc::new(Semaphore::new(ARTIFACT_DOWNLOAD_WORKERS)),
-            chart_series_cache: Arc::new(Mutex::new(ChartSeriesCache::default())),
-            chart_axis_extent_cache,
-            telemetry: Arc::clone(&telemetry),
-        })
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
-        .layer(middleware::from_fn_with_state(telemetry, record_request));
+        .with_state(state);
     #[cfg(feature = "embedded-dashboard")]
     let router = router.fallback(embedded_dashboard);
     router
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        .layer(CompressionLayer::new())
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            admission_state,
+            admit_api_request,
+        ))
+        .layer(middleware::from_fn(add_security_headers))
+        .layer(middleware::from_fn_with_state(telemetry, record_request))
+}
+
+async fn admit_api_request(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if !path.starts_with("/api/v1/") {
+        return next.run(request).await;
+    }
+    let admission = if path == "/api/v1/health" {
+        &state.health_admission
+    } else {
+        &state.request_admission
+    };
+    let Ok(permit) = Arc::clone(admission).try_acquire_owned() else {
+        state
+            .telemetry
+            .requests_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+        return HttpError::busy("server request capacity is exhausted; retry later")
+            .into_response();
+    };
+    retain_response_permit(next.run(request).await, permit)
+}
+
+async fn add_security_headers(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; connect-src 'self'",
+        ),
+    );
+    response
 }
 
 #[cfg(feature = "embedded-dashboard")]
@@ -648,13 +760,22 @@ async fn diagnostics(
         .lock()
         .map(|recent| recent.iter().cloned().collect())
         .unwrap_or_default();
+    let catalog_path = state.catalog.path().to_path_buf();
+    let metrics_path = state.metrics.store().root().to_path_buf();
+    let blobs_path = state.blobs.root().to_path_buf();
+    let storage_roots = tokio::task::spawn_blocking(move || {
+        collect_storage_root_diagnostics(&catalog_path, &metrics_path, &blobs_path)
+    })
+    .await
+    .map_err(|error| HttpError::internal(format!("storage diagnostics worker failed: {error}")))?
+    .map_err(|error| HttpError::internal(format!("storage diagnostics failed: {error}")))?;
     Ok(Json(DiagnosticsResponse {
         service: "runloom".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        schema_version: state.catalog.schema_version().await?,
         uptime_seconds: telemetry.started_at.elapsed().as_secs(),
         requests_total: telemetry.requests_total.load(Ordering::Relaxed),
         requests_active: telemetry.requests_active.load(Ordering::Relaxed),
+        requests_rejected_total: telemetry.requests_rejected_total.load(Ordering::Relaxed),
         server_errors_total: telemetry.server_errors_total.load(Ordering::Relaxed),
         slow_requests_total: telemetry.slow_requests_total.load(Ordering::Relaxed),
         slow_request_threshold_ms: telemetry
@@ -668,19 +789,23 @@ async fn diagnostics(
         history_query_duration_ms_max: telemetry
             .history_query_duration_ms_max
             .load(Ordering::Relaxed),
+        request_admission_limit: REQUEST_ADMISSION_LIMIT,
+        request_admission_permits_available: state.request_admission.available_permits(),
+        health_admission_limit: HEALTH_ADMISSION_LIMIT,
+        health_admission_permits_available: state.health_admission.available_permits(),
         ingest_permits_available: state.ingest_permits.available_permits(),
+        blob_upload_permits_available: state.blob_upload_permits.available_permits(),
+        artifact_io_permits_available: state.artifact_io_permits.available_permits(),
+        download_stream_limit: DOWNLOAD_STREAM_LIMIT,
+        download_stream_permits_available: state.download_stream_permits.available_permits(),
         query_permits_available: state.query_permits.available_permits(),
+        storage_roots,
         recent_slow_requests,
     }))
 }
 
 #[derive(Debug, Deserialize)]
-struct ListQuery {
-    #[serde(default = "default_list_limit")]
-    limit: usize,
-}
-
-#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SweepListQuery {
     before: Option<SweepId>,
     #[serde(default = "default_list_limit")]
@@ -688,6 +813,7 @@ struct SweepListQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SweepTrialListQuery {
     before: Option<SweepTrialId>,
     #[serde(default = "default_list_limit")]
@@ -695,53 +821,23 @@ struct SweepTrialListQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReportListQuery {
     before: Option<ReportId>,
     #[serde(default = "default_list_limit")]
     limit: usize,
 }
 
-async fn list_projects(
-    State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-) -> Result<Json<ProjectListResponse>, HttpError> {
-    validate_list_limit(query.limit)?;
-    let projects = state.catalog.list_projects(query.limit).await?;
-    Ok(Json(ProjectListResponse { projects }))
-}
-
-async fn list_runs(
-    State(state): State<AppState>,
-    Path(project): Path<String>,
-    Query(query): Query<ListQuery>,
-) -> Result<Json<RunListResponse>, HttpError> {
-    validate_project_name(&project)?;
-    validate_list_limit(query.limit)?;
-    let runs = state.catalog.list_runs(&project, query.limit).await?;
-    Ok(Json(RunListResponse { runs }))
-}
-
-async fn query_runs(
-    State(state): State<AppState>,
-    Json(request): Json<RunQueryRequest>,
-) -> Result<Json<RunQueryResponse>, HttpError> {
-    validate_run_query(&request)?;
-    let runs = state.catalog.query_runs(&request).await?;
-    let next_before = if runs.len() == request.limit {
-        runs.last().map(|run| run.id)
-    } else {
-        None
-    };
-    Ok(Json(RunQueryResponse { runs, next_before }))
-}
-
 async fn create_sweep(
     State(state): State<AppState>,
     Path(project): Path<String>,
-    Json(request): Json<CreateSweepRequest>,
+    Json(mut request): Json<CreateSweepRequest>,
 ) -> Result<(StatusCode, Json<CreateSweepResponse>), HttpError> {
+    let sweep_id = request.id.unwrap_or_default();
+    request.id = Some(sweep_id);
     validate_project_name(&project)?;
     validate_sweep(&request)?;
+    let _mutation = acquire_mutation_locks(&state, vec![mutation_lock_index(&sweep_id)]).await;
     let (sweep, duplicate) = state.catalog.create_sweep(&project, &request).await?;
     let status = if duplicate {
         StatusCode::OK
@@ -765,15 +861,15 @@ async fn list_sweeps(
 ) -> Result<Json<SweepListResponse>, HttpError> {
     validate_project_name(&project)?;
     validate_list_limit(query.limit)?;
-    let sweeps = state
+    let mut sweeps = state
         .catalog
-        .list_sweeps(&project, query.before, query.limit)
+        .list_sweeps(&project, query.before, page_limit(query.limit))
         .await?;
-    let next_before = if sweeps.len() == query.limit {
-        sweeps.last().map(|sweep| sweep.id)
-    } else {
-        None
-    };
+    let has_more = sweeps.len() > query.limit;
+    sweeps.truncate(query.limit);
+    let next_before = has_more
+        .then(|| sweeps.last().map(|sweep| sweep.id))
+        .flatten();
     Ok(Json(SweepListResponse {
         sweeps,
         next_before,
@@ -786,6 +882,7 @@ async fn claim_sweep_trial(
     Json(request): Json<ClaimSweepTrialRequest>,
 ) -> Result<Json<ClaimSweepTrialResponse>, HttpError> {
     validate_agent_id(&request.agent_id)?;
+    let _mutation = acquire_mutation_locks(&state, vec![mutation_lock_index(&sweep_id)]).await;
     let (sweep, trial) = state
         .catalog
         .claim_sweep_trial(sweep_id, &request.agent_id)
@@ -799,19 +896,26 @@ async fn list_sweep_trials(
     Query(query): Query<SweepTrialListQuery>,
 ) -> Result<Json<SweepTrialListResponse>, HttpError> {
     validate_list_limit(query.limit)?;
-    let trials = state
+    let mut trials = state
         .catalog
-        .list_sweep_trials(sweep_id, query.before, query.limit)
+        .list_sweep_trials(sweep_id, query.before, page_limit(query.limit))
         .await?;
-    let next_before = if trials.len() == query.limit {
-        trials.last().map(|trial| trial.id)
-    } else {
-        None
-    };
+    let has_more = trials.len() > query.limit;
+    trials.truncate(query.limit);
+    let next_before = has_more
+        .then(|| trials.last().map(|trial| trial.id))
+        .flatten();
     Ok(Json(SweepTrialListResponse {
         trials,
         next_before,
     }))
+}
+
+async fn get_sweep_trial(
+    State(state): State<AppState>,
+    Path(trial_id): Path<SweepTrialId>,
+) -> Result<Json<SweepTrialRecord>, HttpError> {
+    Ok(Json(state.catalog.get_sweep_trial(trial_id).await?))
 }
 
 async fn complete_sweep_trial(
@@ -819,6 +923,7 @@ async fn complete_sweep_trial(
     Path(trial_id): Path<SweepTrialId>,
     Json(request): Json<CompleteSweepTrialRequest>,
 ) -> Result<Json<SweepTrialRecord>, HttpError> {
+    validate_agent_id(&request.agent_id)?;
     if !matches!(
         request.state,
         SweepTrialState::Completed | SweepTrialState::Failed | SweepTrialState::Stopped
@@ -830,6 +935,7 @@ async fn complete_sweep_trial(
     if request.metric.is_some_and(|metric| !metric.is_finite()) {
         return Err(HttpError::invalid("sweep trial metric must be finite"));
     }
+    let _mutation = acquire_mutation_locks(&state, vec![mutation_lock_index(&trial_id)]).await;
     Ok(Json(
         state
             .catalog
@@ -838,17 +944,35 @@ async fn complete_sweep_trial(
     ))
 }
 
+async fn heartbeat_sweep_trial(
+    State(state): State<AppState>,
+    Path(trial_id): Path<SweepTrialId>,
+    Json(request): Json<HeartbeatSweepTrialRequest>,
+) -> Result<Json<SweepTrialRecord>, HttpError> {
+    validate_agent_id(&request.agent_id)?;
+    let _mutation = acquire_mutation_locks(&state, vec![mutation_lock_index(&trial_id)]).await;
+    Ok(Json(
+        state
+            .catalog
+            .heartbeat_sweep_trial(trial_id, &request.agent_id)
+            .await?,
+    ))
+}
+
 async fn create_report(
     State(state): State<AppState>,
     Path(project): Path<String>,
-    Json(request): Json<CreateReportRequest>,
+    Json(mut request): Json<CreateReportRequest>,
 ) -> Result<(StatusCode, Json<CreateReportResponse>), HttpError> {
+    let report_id = request.id.unwrap_or_default();
+    request.id = Some(report_id);
     validate_project_name(&project)?;
     validate_report(
         &request.name,
         request.description.as_deref(),
         &request.layout,
     )?;
+    let _mutation = acquire_mutation_locks(&state, vec![mutation_lock_index(&report_id)]).await;
     let (report, duplicate) = state.catalog.create_report(&project, &request).await?;
     let status = if duplicate {
         StatusCode::OK
@@ -865,15 +989,15 @@ async fn list_reports(
 ) -> Result<Json<ReportListResponse>, HttpError> {
     validate_project_name(&project)?;
     validate_list_limit(query.limit)?;
-    let reports = state
+    let mut reports = state
         .catalog
-        .list_reports(&project, query.before, query.limit)
+        .list_reports(&project, query.before, page_limit(query.limit))
         .await?;
-    let next_before = if reports.len() == query.limit {
-        reports.last().map(|report| report.id)
-    } else {
-        None
-    };
+    let has_more = reports.len() > query.limit;
+    reports.truncate(query.limit);
+    let next_before = has_more
+        .then(|| reports.last().map(|report| report.id))
+        .flatten();
     Ok(Json(ReportListResponse {
         reports,
         next_before,
@@ -897,6 +1021,7 @@ async fn update_report(
         request.description.as_deref(),
         &request.layout,
     )?;
+    let _mutation = acquire_mutation_locks(&state, vec![mutation_lock_index(&report_id)]).await;
     Ok(Json(
         state.catalog.update_report(report_id, &request).await?,
     ))
@@ -906,30 +1031,61 @@ async fn delete_report(
     State(state): State<AppState>,
     Path(report_id): Path<ReportId>,
 ) -> Result<Json<ReportRecord>, HttpError> {
+    let _mutation = acquire_mutation_locks(&state, vec![mutation_lock_index(&report_id)]).await;
     Ok(Json(state.catalog.delete_report(report_id).await?))
 }
 
 async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
     let version = env!("CARGO_PKG_VERSION");
-    match state.catalog.health_check().await {
-        Ok(()) => (StatusCode::OK, Json(HealthResponse::healthy(version))),
+    let catalog_healthy = match state.catalog.health_check().await {
+        Ok(()) => true,
         Err(error) => {
             tracing::error!(%error, "catalog health check failed");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(HealthResponse::unhealthy(version)),
-            )
+            false
         }
+    };
+    let metrics = state.metrics.store().clone();
+    let blobs = state.blobs.clone();
+    let storage_healthy = match tokio::task::spawn_blocking(move || {
+        metrics.health_check()?;
+        blobs.health_check()
+    })
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::error!(%error, "storage root health check failed");
+            false
+        }
+        Err(error) => {
+            tracing::error!(%error, "storage root health worker failed");
+            false
+        }
+    };
+    if catalog_healthy && storage_healthy {
+        (StatusCode::OK, Json(HealthResponse::healthy(version)))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse::unhealthy(version)),
+        )
     }
 }
 
 async fn create_run(
     State(state): State<AppState>,
     Path(project): Path<String>,
-    Json(request): Json<CreateRunRequest>,
+    Json(mut request): Json<CreateRunRequest>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), HttpError> {
+    let run_id = request.id.unwrap_or_default();
+    request.id = Some(run_id);
     validate_project_name(&project)?;
     validate_create_run(&request)?;
+    let mut mutation_indices = vec![mutation_lock_index(&run_id)];
+    if let Some(trial_id) = request.sweep_trial_id {
+        mutation_indices.push(mutation_lock_index(&trial_id));
+    }
+    let _mutation = acquire_mutation_locks(&state, mutation_indices).await;
     let (run, resumed) = state
         .catalog
         .create_or_resume_run(&project, &request)
@@ -988,19 +1144,13 @@ fn next_position(tail: SegmentTail) -> Result<(u64, u64), HttpError> {
     Ok((next_sequence, next_step))
 }
 
-async fn get_run(
-    State(state): State<AppState>,
-    Path(run_id): Path<RunId>,
-) -> Result<Json<RunRecord>, HttpError> {
-    Ok(Json(state.catalog.get_run(run_id).await?))
-}
-
 async fn update_config(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
     Json(request): Json<ConfigUpdateRequest>,
 ) -> Result<Json<RunUpdateResponse>, HttpError> {
     validate_document_updates(&request.updates, "config", MAX_CONFIG_BYTES)?;
+    let _run_mutation = acquire_mutation_locks(&state, vec![mutation_lock_index(&run_id)]).await;
     let run = state
         .catalog
         .update_config(run_id, &request.updates, request.allow_val_change)
@@ -1014,19 +1164,12 @@ async fn update_summary(
     Json(request): Json<SummaryUpdateRequest>,
 ) -> Result<Json<RunUpdateResponse>, HttpError> {
     validate_document_updates(&request.updates, "summary", MAX_SUMMARY_BYTES)?;
+    let _run_mutation = acquire_mutation_locks(&state, vec![mutation_lock_index(&run_id)]).await;
     let run = state
         .catalog
         .update_summary(run_id, &request.updates)
         .await?;
     Ok(Json(RunUpdateResponse { run }))
-}
-
-async fn metric_keys(
-    State(state): State<AppState>,
-    Path(run_id): Path<RunId>,
-) -> Result<Json<MetricKeyListResponse>, HttpError> {
-    let keys = state.catalog.metric_keys(run_id).await?;
-    Ok(Json(MetricKeyListResponse { run_id, keys }))
 }
 
 async fn ingest_batch(
@@ -1035,6 +1178,20 @@ async fn ingest_batch(
     Json(request): Json<IngestBatchRequest>,
 ) -> Result<(StatusCode, Json<IngestBatchResponse>), HttpError> {
     validate_batch(&request)?;
+    let run_mutation = Arc::clone(&state.mutation_locks[mutation_lock_index(&run_id)])
+        .lock_owned()
+        .await;
+    tokio::spawn(process_ingest_batch(state, run_id, request, run_mutation))
+        .await
+        .map_err(|error| HttpError::internal(format!("ingestion task failed: {error}")))?
+}
+
+async fn process_ingest_batch(
+    state: AppState,
+    run_id: RunId,
+    request: IngestBatchRequest,
+    _run_mutation: OwnedMutexGuard<()>,
+) -> Result<(StatusCode, Json<IngestBatchResponse>), HttpError> {
     let digest = batch_digest(&request)?;
     if let BatchStatus::Duplicate { metric_revision } = state
         .catalog
@@ -1076,11 +1233,12 @@ async fn ingest_batch(
     let accepted_points = request.points.len();
     let metrics = state.metrics.store().clone();
     let digest_for_write = digest.clone();
-    let _permit = Arc::clone(&state.ingest_permits)
+    let permit = Arc::clone(&state.ingest_permits)
         .acquire_owned()
         .await
         .map_err(|_| HttpError::internal("ingestion worker pool is unavailable"))?;
     let written = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         metrics.write_batch(location.project_id, run_id, &digest_for_write, &request)
     })
     .await
@@ -1107,12 +1265,26 @@ async fn ingest_batch(
             (StatusCode::OK, true, metric_revision)
         }
         Err(error) => {
-            if let Err(cleanup_error) = state
-                .metrics
-                .store()
-                .remove_segment(&manifest.relative_path)
-            {
-                tracing::error!(%cleanup_error, "failed to clean up unregistered metric segment");
+            if written.installation == SegmentInstallation::InstalledNew {
+                match state
+                    .catalog
+                    .segment_path_is_registered(&manifest.relative_path)
+                    .await
+                {
+                    Ok(false) => {
+                        if let Err(cleanup_error) = state
+                            .metrics
+                            .store()
+                            .remove_segment(&manifest.relative_path)
+                        {
+                            tracing::error!(%cleanup_error, "failed to clean up unregistered metric segment");
+                        }
+                    }
+                    Ok(true) => {}
+                    Err(verification_error) => {
+                        tracing::warn!(%verification_error, "could not verify metric segment ownership for cleanup");
+                    }
+                }
             }
             return Err(error.into());
         }
@@ -1144,16 +1316,45 @@ async fn finish_run(
     Json(request): Json<FinishRunRequest>,
 ) -> Result<Json<FinishRunResponse>, HttpError> {
     validate_document_size(&request.summary, "summary", MAX_SUMMARY_BYTES)?;
+    let _run_mutation = Arc::clone(&state.mutation_locks[mutation_lock_index(&run_id)])
+        .lock_owned()
+        .await;
     let run = state.catalog.finish_run(run_id, &request.summary).await?;
     Ok(Json(FinishRunResponse { run }))
+}
+
+fn mutation_lock_index(value: &impl Hash) -> usize {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    (hasher.finish() as usize) % MUTATION_LOCKS
+}
+
+async fn acquire_mutation_locks(
+    state: &AppState,
+    mut indices: Vec<usize>,
+) -> Vec<OwnedMutexGuard<()>> {
+    indices.sort_unstable();
+    indices.dedup();
+    let mut guards = Vec::with_capacity(indices.len());
+    for index in indices {
+        guards.push(Arc::clone(&state.mutation_locks[index]).lock_owned().await);
+    }
+    guards
 }
 
 async fn create_alert(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
-    Json(request): Json<CreateAlertRequest>,
+    Json(mut request): Json<CreateAlertRequest>,
 ) -> Result<(StatusCode, Json<CreateAlertResponse>), HttpError> {
+    let alert_id = request.id.unwrap_or_default();
+    request.id = Some(alert_id);
     validate_alert(&request)?;
+    let _mutation = acquire_mutation_locks(
+        &state,
+        vec![mutation_lock_index(&run_id), mutation_lock_index(&alert_id)],
+    )
+    .await;
     let (alert, duplicate) = state.catalog.create_alert(run_id, &request).await?;
     let status = if duplicate {
         StatusCode::OK
@@ -1164,6 +1365,7 @@ async fn create_alert(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AlertListQuery {
     before: Option<AlertId>,
     #[serde(default = "default_list_limit")]
@@ -1176,15 +1378,15 @@ async fn list_alerts(
     Query(query): Query<AlertListQuery>,
 ) -> Result<Json<AlertListResponse>, HttpError> {
     validate_list_limit(query.limit)?;
-    let alerts = state
+    let mut alerts = state
         .catalog
-        .list_alerts(run_id, query.before, query.limit)
+        .list_alerts(run_id, query.before, page_limit(query.limit))
         .await?;
-    let next_before = if alerts.len() == query.limit {
-        alerts.last().map(|alert| alert.id)
-    } else {
-        None
-    };
+    let has_more = alerts.len() > query.limit;
+    alerts.truncate(query.limit);
+    let next_before = has_more
+        .then(|| alerts.last().map(|alert| alert.id))
+        .flatten();
     Ok(Json(AlertListResponse {
         alerts,
         next_before,
@@ -1194,8 +1396,10 @@ async fn list_alerts(
 async fn create_rich_value(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
-    Json(request): Json<CreateRichValueRequest>,
+    Json(mut request): Json<CreateRichValueRequest>,
 ) -> Result<(StatusCode, Json<CreateRichValueResponse>), HttpError> {
+    let value_id = request.id.unwrap_or_default();
+    request.id = Some(value_id);
     validate_rich_value(&request)?;
     if let Some(blob) = &request.blob {
         let actual_size = state
@@ -1209,6 +1413,11 @@ async fn create_rich_value(
             ));
         }
     }
+    let _mutation = acquire_mutation_locks(
+        &state,
+        vec![mutation_lock_index(&run_id), mutation_lock_index(&value_id)],
+    )
+    .await;
     let (value, duplicate) = state.catalog.create_rich_value(run_id, &request).await?;
     let status = if duplicate {
         StatusCode::OK
@@ -1219,10 +1428,41 @@ async fn create_rich_value(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RichValueListQuery {
+    key: String,
     before: Option<RichValueId>,
     #[serde(default = "default_list_limit")]
     limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RichValueKeyListQuery {
+    after: Option<String>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+async fn list_rich_value_keys(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+    Query(query): Query<RichValueKeyListQuery>,
+) -> Result<Json<RichValueKeyListResponse>, HttpError> {
+    validate_list_limit(query.limit)?;
+    if let Some(after) = &query.after {
+        validate_rich_key(after)?;
+    }
+    let mut keys = state
+        .catalog
+        .list_rich_value_keys(run_id, query.after.as_deref(), page_limit(query.limit))
+        .await?;
+    let has_more = keys.len() > query.limit;
+    keys.truncate(query.limit);
+    let next_after = has_more
+        .then(|| keys.last().map(|summary| summary.key.clone()))
+        .flatten();
+    Ok(Json(RichValueKeyListResponse { keys, next_after }))
 }
 
 async fn list_rich_values(
@@ -1231,34 +1471,60 @@ async fn list_rich_values(
     Query(query): Query<RichValueListQuery>,
 ) -> Result<Json<RichValueListResponse>, HttpError> {
     validate_list_limit(query.limit)?;
-    let values = state
+    validate_rich_key(&query.key)?;
+    let mut values = state
         .catalog
-        .list_rich_values(run_id, query.before, query.limit)
+        .list_rich_values(run_id, &query.key, query.before, page_limit(query.limit))
         .await?;
-    let next_before = if values.len() == query.limit {
-        values.last().map(|value| value.id)
-    } else {
-        None
-    };
+    let has_more = values.len() > query.limit;
+    values.truncate(query.limit);
+    let next_before = has_more
+        .then(|| values.last().map(|value| value.id))
+        .flatten();
     Ok(Json(RichValueListResponse {
         values,
         next_before,
     }))
 }
 
+async fn get_rich_value(
+    State(state): State<AppState>,
+    Path(value_id): Path<RichValueId>,
+) -> Result<Json<runloom_protocol::RichValueRecord>, HttpError> {
+    Ok(Json(state.catalog.get_rich_value(value_id).await?))
+}
+
 async fn create_artifact(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
-    Json(request): Json<CreateArtifactRequest>,
+    Json(mut request): Json<CreateArtifactRequest>,
 ) -> Result<(StatusCode, Json<CreateArtifactResponse>), HttpError> {
+    let artifact_id = request.id.unwrap_or_default();
+    request.id = Some(artifact_id);
     validate_artifact(&request)?;
+    let permit = Arc::clone(&state.artifact_io_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| HttpError::internal("artifact I/O worker pool is unavailable"))?;
     let entries = request.entries.clone();
     let blobs = state.blobs.clone();
-    tokio::task::spawn_blocking(move || verify_artifact_blobs(&blobs, &entries))
-        .await
-        .map_err(|error| {
-            HttpError::internal(format!("artifact verification worker failed: {error}"))
-        })??;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_artifact_blobs(&blobs, &entries)
+    })
+    .await
+    .map_err(|error| {
+        HttpError::internal(format!("artifact verification worker failed: {error}"))
+    })??;
+    let _mutation = acquire_mutation_locks(
+        &state,
+        vec![
+            mutation_lock_index(&run_id),
+            mutation_lock_index(&artifact_id),
+            mutation_lock_index(&request.name),
+        ],
+    )
+    .await;
     let (artifact, duplicate) = state.catalog.create_artifact(run_id, &request).await?;
     let status = if duplicate {
         StatusCode::OK
@@ -1279,6 +1545,14 @@ async fn use_artifact(
     Path(run_id): Path<RunId>,
     Json(request): Json<UseArtifactRequest>,
 ) -> Result<Json<ArtifactRecord>, HttpError> {
+    let _mutation = acquire_mutation_locks(
+        &state,
+        vec![
+            mutation_lock_index(&run_id),
+            mutation_lock_index(&request.artifact_id),
+        ],
+    )
+    .await;
     Ok(Json(
         state
             .catalog
@@ -1310,8 +1584,18 @@ async fn resolve_artifact(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArtifactListQuery {
     before: Option<ArtifactId>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunArtifactListQuery {
+    before: Option<ArtifactId>,
+    before_relation: Option<ArtifactRelation>,
     #[serde(default = "default_list_limit")]
     limit: usize,
 }
@@ -1323,15 +1607,15 @@ async fn list_project_artifacts(
 ) -> Result<Json<ArtifactListResponse>, HttpError> {
     validate_project_name(&project)?;
     validate_list_limit(query.limit)?;
-    let artifacts = state
+    let mut artifacts = state
         .catalog
-        .list_project_artifacts(&project, query.before, query.limit)
+        .list_project_artifacts(&project, query.before, page_limit(query.limit))
         .await?;
-    let next_before = if artifacts.len() == query.limit {
-        artifacts.last().map(|artifact| artifact.id)
-    } else {
-        None
-    };
+    let has_more = artifacts.len() > query.limit;
+    artifacts.truncate(query.limit);
+    let next_before = has_more
+        .then(|| artifacts.last().map(|artifact| artifact.id))
+        .flatten();
     Ok(Json(ArtifactListResponse {
         artifacts,
         next_before,
@@ -1341,41 +1625,70 @@ async fn list_project_artifacts(
 async fn list_run_artifacts(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
-    Query(query): Query<ArtifactListQuery>,
+    Query(query): Query<RunArtifactListQuery>,
 ) -> Result<Json<RunArtifactListResponse>, HttpError> {
     validate_list_limit(query.limit)?;
-    let artifacts = state
+    if query.before.is_some() != query.before_relation.is_some() {
+        return Err(HttpError::invalid(
+            "run artifact cursors require both 'before' and 'before_relation'",
+        ));
+    }
+    let mut artifacts = state
         .catalog
-        .list_run_artifacts(run_id, query.before, query.limit)
+        .list_run_artifacts(
+            run_id,
+            query.before,
+            query.before_relation,
+            page_limit(query.limit),
+        )
         .await?;
-    let next_before = if artifacts.len() == query.limit {
-        artifacts.last().map(|linked| linked.artifact.id)
-    } else {
-        None
-    };
+    let has_more = artifacts.len() > query.limit;
+    artifacts.truncate(query.limit);
+    let next_before = has_more
+        .then(|| artifacts.last().map(|linked| linked.artifact.id))
+        .flatten();
+    let next_before_relation = has_more
+        .then(|| artifacts.last().map(|linked| linked.relation))
+        .flatten();
     Ok(Json(RunArtifactListResponse {
         artifacts,
         next_before,
+        next_before_relation,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactLineageQuery {
+    relation: ArtifactRelation,
+    before: Option<RunId>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
 }
 
 async fn get_artifact_lineage(
     State(state): State<AppState>,
     Path(artifact_id): Path<ArtifactId>,
+    Query(query): Query<ArtifactLineageQuery>,
 ) -> Result<Json<ArtifactLineageResponse>, HttpError> {
-    let artifact = state.catalog.get_artifact(artifact_id).await?;
-    let (input_runs, output_runs) = tokio::try_join!(
-        state
-            .catalog
-            .artifact_lineage(artifact_id, ArtifactRelation::Input, MAX_LIST_ITEMS),
-        state
-            .catalog
-            .artifact_lineage(artifact_id, ArtifactRelation::Output, MAX_LIST_ITEMS),
-    )?;
+    validate_list_limit(query.limit)?;
+    let mut runs = state
+        .catalog
+        .artifact_lineage(
+            artifact_id,
+            query.relation,
+            query.before,
+            page_limit(query.limit),
+        )
+        .await?;
+    let has_more = runs.len() > query.limit;
+    runs.truncate(query.limit);
+    let next_before = has_more.then(|| runs.last().map(|run| run.id)).flatten();
     Ok(Json(ArtifactLineageResponse {
-        artifact,
-        input_runs,
-        output_runs,
+        artifact_id,
+        relation: query.relation,
+        runs,
+        next_before,
     }))
 }
 
@@ -1442,10 +1755,10 @@ async fn download_artifact(
     Path(artifact_id): Path<ArtifactId>,
 ) -> Result<Response, HttpError> {
     let artifact = state.catalog.get_artifact(artifact_id).await?;
-    let permit = Arc::clone(&state.artifact_download_permits)
+    let permit = Arc::clone(&state.artifact_io_permits)
         .acquire_owned()
         .await
-        .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
+        .map_err(|_| HttpError::internal("artifact I/O worker pool is unavailable"))?;
     let blobs = state.blobs.clone();
     let manifest_entries = artifact.entries.clone();
     let (entries, permit) = tokio::task::spawn_blocking(move || {
@@ -1640,6 +1953,7 @@ async fn get_artifact_file(
         .ok_or_else(|| HttpError::not_found(format!("artifact file {artifact_path}")))?;
     serve_blob(
         &state.blobs,
+        &state.download_stream_permits,
         &entry.blob.digest,
         Some(&entry.blob.mime_type),
         request,
@@ -1650,8 +1964,10 @@ async fn get_artifact_file(
 async fn create_trace_span(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
-    Json(request): Json<CreateTraceSpanRequest>,
+    Json(mut request): Json<CreateTraceSpanRequest>,
 ) -> Result<(StatusCode, Json<CreateTraceSpanResponse>), HttpError> {
+    let span_id = request.id.unwrap_or_default();
+    request.id = Some(span_id);
     validate_trace_span(&request)?;
     if let Some(payload) = &request.payload {
         let actual_size = state
@@ -1665,6 +1981,11 @@ async fn create_trace_span(
             ));
         }
     }
+    let _mutation = acquire_mutation_locks(
+        &state,
+        vec![mutation_lock_index(&run_id), mutation_lock_index(&span_id)],
+    )
+    .await;
     let (span, duplicate) = state.catalog.create_trace_span(run_id, &request).await?;
     let status = if duplicate {
         StatusCode::OK
@@ -1675,6 +1996,7 @@ async fn create_trace_span(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TraceListQuery {
     before: Option<TraceSpanId>,
     q: Option<String>,
@@ -1695,15 +2017,18 @@ async fn list_trace_spans(
             "trace search cannot exceed {MAX_TRACE_SEARCH_BYTES} non-control bytes"
         )));
     }
-    let spans = state
+    let mut spans = state
         .catalog
-        .list_trace_spans(run_id, query.before, query.q.as_deref(), query.limit)
+        .list_trace_spans(
+            run_id,
+            query.before,
+            query.q.as_deref(),
+            page_limit(query.limit),
+        )
         .await?;
-    let next_before = if spans.len() == query.limit {
-        spans.last().map(|span| span.id)
-    } else {
-        None
-    };
+    let has_more = spans.len() > query.limit;
+    spans.truncate(query.limit);
+    let next_before = has_more.then(|| spans.last().map(|span| span.id)).flatten();
     Ok(Json(TraceSpanListResponse { spans, next_before }))
 }
 
@@ -1724,9 +2049,19 @@ async fn upload_blob(
         .unwrap_or("application/octet-stream")
         .to_owned();
     validate_mime_type(&mime_type)?;
-    let file_name = header_text(&headers, "x-runloom-file-name")
-        .map(str::to_owned)
-        .filter(|value| !value.is_empty());
+    let file_name = match headers.get("x-runloom-file-name") {
+        None => None,
+        Some(value) => {
+            let encoded = value.to_str().map_err(|_| {
+                HttpError::invalid("x-runloom-file-name must be percent-encoded UTF-8")
+            })?;
+            if encoded.is_empty() {
+                None
+            } else {
+                Some(percent_decode_utf8(encoded, "x-runloom-file-name")?)
+            }
+        }
+    };
     validate_file_name(file_name.as_deref())?;
     let declared_size = headers
         .get("content-length")
@@ -1758,29 +2093,37 @@ async fn upload_blob(
         ));
     }
 
-    let staging_path = state.blobs.staging_path().map_err(HttpError::from)?;
-    let result = stream_blob(&staging_path, body).await;
-    let (actual_digest, size) = match result {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&staging_path).await;
-            return Err(error);
-        }
-    };
+    let permit = Arc::clone(&state.blob_upload_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| HttpError::internal("blob upload worker pool is unavailable"))?;
+    let staging = state.blobs.staging_file().map_err(HttpError::from)?;
+    let (actual_digest, size) = stream_blob(staging.path(), body).await?;
     if actual_digest != digest {
-        let _ = tokio::fs::remove_file(&staging_path).await;
         return Err(HttpError::invalid(format!(
             "blob digest mismatch: expected {digest}, received {actual_digest}"
         )));
     }
     let blobs = state.blobs.clone();
-    let install_path = staging_path.clone();
     let install_digest = digest.clone();
-    tokio::task::spawn_blocking(move || blobs.install(&install_path, &install_digest))
-        .await
-        .map_err(|error| HttpError::internal(format!("blob install worker failed: {error}")))??;
+    let installed = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut staging = staging;
+        let installed = blobs.install(staging.path(), &install_digest);
+        if installed.is_ok() {
+            staging.disarm();
+        }
+        installed
+    })
+    .await
+    .map_err(|error| HttpError::internal(format!("blob install worker failed: {error}")))??;
+    let duplicate = installed.installation == BlobInstallation::AlreadyPresent;
     Ok((
-        StatusCode::CREATED,
+        if duplicate {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
         Json(BlobUploadResponse {
             blob: BlobRef {
                 digest,
@@ -1788,12 +2131,13 @@ async fn upload_blob(
                 mime_type,
                 file_name,
             },
-            duplicate: false,
+            duplicate,
         }),
     ))
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BlobQuery {
     mime: Option<String>,
 }
@@ -1807,11 +2151,19 @@ async fn get_blob(
     if let Some(mime_type) = &query.mime {
         validate_mime_type(mime_type)?;
     }
-    serve_blob(&state.blobs, &digest, query.mime.as_deref(), request).await
+    serve_blob(
+        &state.blobs,
+        &state.download_stream_permits,
+        &digest,
+        query.mime.as_deref(),
+        request,
+    )
+    .await
 }
 
 async fn serve_blob(
     blobs: &BlobStore,
+    download_stream_permits: &Arc<Semaphore>,
     digest: &str,
     mime_type: Option<&str>,
     request: Request<Body>,
@@ -1822,18 +2174,86 @@ async fn serve_blob(
     if !path.is_file() {
         return Err(HttpError::not_found(format!("blob {digest}")));
     }
+    let etag_text = format!("\"sha256:{digest}\"");
+    let etag = HeaderValue::from_str(&etag_text)
+        .map_err(|_| HttpError::internal("failed to construct blob ETag"))?;
+    let not_modified = request
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').map(str::trim).any(|candidate| {
+                candidate == "*"
+                    || candidate == etag_text
+                    || candidate.strip_prefix("W/") == Some(etag_text.as_str())
+            })
+        });
+    if not_modified {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        response.headers_mut().insert(header::ETAG, etag);
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+        return Ok(response);
+    }
+    let permit = Arc::clone(download_stream_permits)
+        .try_acquire_owned()
+        .map_err(|_| HttpError::busy("download stream capacity is exhausted; retry later"))?;
     let response = match ServeFile::new(path).oneshot(request).await {
         Ok(response) => response,
         Err(error) => match error {},
     };
     let mut response = response.map(Body::new);
-    if let Some(mime_type) = mime_type {
+    response.headers_mut().insert(header::ETAG, etag);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    if let Some(mime_type) = mime_type.filter(|value| is_safe_inline_mime_type(value)) {
         let value = mime_type
             .parse()
             .map_err(|_| HttpError::invalid("invalid blob MIME type"))?;
         response.headers_mut().insert("content-type", value);
+    } else {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        response.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
     }
-    Ok(response)
+    Ok(retain_response_permit(response, permit))
+}
+
+fn retain_response_permit(response: Response, permit: OwnedSemaphorePermit) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = body
+        .into_data_stream()
+        .scan(permit, |_permit, item| std::future::ready(Some(item)));
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn is_safe_inline_mime_type(value: &str) -> bool {
+    matches!(
+        value.split(';').next().map(str::trim).unwrap_or_default(),
+        "audio/aac"
+            | "audio/flac"
+            | "audio/mpeg"
+            | "audio/ogg"
+            | "audio/wav"
+            | "image/avif"
+            | "image/gif"
+            | "image/jpeg"
+            | "image/png"
+            | "image/webp"
+            | "video/mp4"
+            | "video/ogg"
+            | "video/webm"
+    )
 }
 
 async fn stream_blob(path: &std::path::Path, body: Body) -> Result<(String, u64), HttpError> {
@@ -1866,9 +2286,9 @@ async fn stream_blob(path: &std::path::Path, body: Body) -> Result<(String, u64)
     Ok((format!("{:x}", digest.finalize()), size))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct HistoryQuery {
-    keys: String,
+    keys: Vec<String>,
     after: Option<u64>,
     limit: Option<usize>,
     max_points: Option<usize>,
@@ -1891,14 +2311,14 @@ struct ChartRunQueryPlan {
     axis_extent: Option<ChartAxisExtent>,
 }
 
-struct ChartQueryLease {
+struct MetricQueryLease {
     _snapshot: OwnedRwLockReadGuard<()>,
     _permit: OwnedSemaphorePermit,
 }
 
-struct CancelChartQueryOnDrop(Arc<AtomicBool>);
+struct CancelMetricQueryOnDrop(Arc<AtomicBool>);
 
-impl Drop for CancelChartQueryOnDrop {
+impl Drop for CancelMetricQueryOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
     }
@@ -1933,12 +2353,12 @@ async fn chart_history(
         return Ok(Json(response));
     };
 
-    let mut lease = ChartQueryLease {
+    let mut lease = MetricQueryLease {
         _snapshot: snapshot,
         _permit: permit,
     };
     let cancelled = Arc::new(AtomicBool::new(false));
-    let _cancel_on_drop = CancelChartQueryOnDrop(Arc::clone(&cancelled));
+    let _cancel_on_drop = CancelMetricQueryOnDrop(Arc::clone(&cancelled));
     let viewport = match requested_viewport {
         Some(viewport) => Some(viewport),
         None => {
@@ -2021,12 +2441,12 @@ async fn query_chart_history(
         .await
         .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
     let snapshot = state.metrics.read_snapshot().await;
-    let mut lease = ChartQueryLease {
+    let mut lease = MetricQueryLease {
         _snapshot: snapshot,
         _permit: permit,
     };
     let cancelled = Arc::new(AtomicBool::new(false));
-    let _cancel_on_drop = CancelChartQueryOnDrop(Arc::clone(&cancelled));
+    let _cancel_on_drop = CancelMetricQueryOnDrop(Arc::clone(&cancelled));
     let needs_axis_extent = request.viewport.is_none()
         || matches!(
             request.alignment,
@@ -2346,9 +2766,9 @@ async fn scan_chart_axis_extent(
     run_id: RunId,
     source_last_sequence: u64,
     mut scanner: ChartAxisExtentScanner,
-    mut lease: ChartQueryLease,
+    mut lease: MetricQueryLease,
     cancelled: Arc<AtomicBool>,
-) -> Result<(ChartAxisExtentScanner, ChartQueryLease), HttpError> {
+) -> Result<(ChartAxisExtentScanner, MetricQueryLease), HttpError> {
     #[cfg(test)]
     state
         .chart_axis_extent_cache
@@ -2394,9 +2814,9 @@ async fn scan_chart_step_extent(
     run_id: RunId,
     source_last_sequence: u64,
     mut scanner: ChartStepExtentScanner,
-    mut lease: ChartQueryLease,
+    mut lease: MetricQueryLease,
     cancelled: Arc<AtomicBool>,
-) -> Result<(ChartStepExtentScanner, ChartQueryLease), HttpError> {
+) -> Result<(ChartStepExtentScanner, MetricQueryLease), HttpError> {
     let mut segment_cursor = None;
     loop {
         let records = state.catalog.list_segments(run_id, segment_cursor).await?;
@@ -2436,9 +2856,9 @@ async fn sample_chart_history(
     run_id: RunId,
     source_last_sequence: u64,
     mut sampler: ChartHistorySampler,
-    mut lease: ChartQueryLease,
+    mut lease: MetricQueryLease,
     cancelled: Arc<AtomicBool>,
-) -> Result<(ChartHistorySampler, ChartQueryLease), HttpError> {
+) -> Result<(ChartHistorySampler, MetricQueryLease), HttpError> {
     let mut segment_cursor = None;
     loop {
         let records = state.catalog.list_segments(run_id, segment_cursor).await?;
@@ -2516,9 +2936,10 @@ fn empty_chart_history_in_viewport(
 async fn history(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
-    Query(query): Query<HistoryQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<HistoryResponse>, HttpError> {
-    let keys = parse_history_keys(&query.keys)?;
+    let query = parse_history_query(raw_query.as_deref())?;
+    let keys = query.keys;
     if query.limit.is_some() && query.max_points.is_some() {
         return Err(HttpError::invalid(
             "history queries cannot combine limit and max_points",
@@ -2537,11 +2958,11 @@ async fn history(
             "history limit must be between 1 and {MAX_HISTORY_POINTS}"
         )));
     }
-    let _permit = Arc::clone(&state.query_permits)
+    let permit = Arc::clone(&state.query_permits)
         .acquire_owned()
         .await
         .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
-    let _snapshot = state.metrics.read_snapshot().await;
+    let snapshot = state.metrics.read_snapshot().await;
     let segments = state
         .catalog
         .list_segments(run_id, query.after)
@@ -2554,8 +2975,15 @@ async fn history(
     let segment_page_full = segments.len() == MAX_SEGMENTS_PER_QUERY;
     let metrics = state.metrics.store().clone();
     let after = query.after;
+    let lease = MetricQueryLease {
+        _snapshot: snapshot,
+        _permit: permit,
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelMetricQueryOnDrop(Arc::clone(&cancelled));
     let mut response = tokio::task::spawn_blocking(move || {
-        metrics.read_history(run_id, &segments, &keys, after, limit)
+        let _lease = lease;
+        metrics.read_history_cancelable(run_id, &segments, &keys, after, limit, &cancelled)
     })
     .await
     .map_err(|error| HttpError::internal(format!("query worker failed: {error}")))??;
@@ -2572,11 +3000,11 @@ async fn sampled_history(
     after: Option<u64>,
     max_points: usize,
 ) -> Result<HistoryResponse, HttpError> {
-    let _permit = Arc::clone(&state.query_permits)
+    let permit = Arc::clone(&state.query_permits)
         .acquire_owned()
         .await
         .map_err(|_| HttpError::internal("query worker pool is unavailable"))?;
-    let _snapshot = state.metrics.read_snapshot().await;
+    let snapshot = state.metrics.read_snapshot().await;
     let Some(extent) = state.catalog.metric_extent(run_id, after).await? else {
         return Ok(HistoryResponse {
             run_id,
@@ -2597,6 +3025,12 @@ async fn sampled_history(
         extent.last_sequence,
         max_points,
     )?;
+    let mut lease = MetricQueryLease {
+        _snapshot: snapshot,
+        _permit: permit,
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelMetricQueryOnDrop(Arc::clone(&cancelled));
     let mut segment_cursor = after;
     loop {
         let records = state.catalog.list_segments(run_id, segment_cursor).await?;
@@ -2611,13 +3045,17 @@ async fn sampled_history(
             })
             .collect::<Vec<_>>();
         let metrics = state.metrics.store().clone();
-        sampler =
-            tokio::task::spawn_blocking(move || -> Result<MinMaxHistorySampler, StorageError> {
-                sampler.read_segments(&metrics, &segments)?;
-                Ok(sampler)
-            })
-            .await
-            .map_err(|error| HttpError::internal(format!("query worker failed: {error}")))??;
+        let cancelled_for_read = Arc::clone(&cancelled);
+        let (returned_sampler, returned_lease) = tokio::task::spawn_blocking(
+            move || -> Result<(MinMaxHistorySampler, MetricQueryLease), StorageError> {
+                sampler.read_segments_cancelable(&metrics, &segments, &cancelled_for_read)?;
+                Ok((sampler, lease))
+            },
+        )
+        .await
+        .map_err(|error| HttpError::internal(format!("query worker failed: {error}")))??;
+        sampler = returned_sampler;
+        lease = returned_lease;
         if page_last >= extent.last_sequence || !page_full {
             break;
         }
@@ -2628,6 +3066,7 @@ async fn sampled_history(
         }
         segment_cursor = Some(page_last);
     }
+    drop(lease);
     Ok(sampler.finish())
 }
 
@@ -2657,26 +3096,17 @@ fn validate_alert(request: &CreateAlertRequest) -> Result<(), HttpError> {
             "alert text cannot exceed {MAX_ALERT_TEXT_BYTES} bytes"
         )));
     }
-    if request.timestamp_ms < 0 {
-        return Err(HttpError::invalid("alert timestamp cannot be negative"));
+    validate_json_safe_timestamp(request.timestamp_ms, "alert timestamp")?;
+    if let Some(step) = request.step {
+        validate_json_safe_unsigned(step, "alert step")?;
     }
     Ok(())
 }
 
 fn validate_rich_value(request: &CreateRichValueRequest) -> Result<(), HttpError> {
-    if request.key.is_empty()
-        || request.key.len() > MAX_RICH_KEY_BYTES
-        || request.key.chars().any(char::is_control)
-    {
-        return Err(HttpError::invalid(format!(
-            "rich value keys must contain 1 to {MAX_RICH_KEY_BYTES} non-control bytes"
-        )));
-    }
-    if request.timestamp_ms < 0 {
-        return Err(HttpError::invalid(
-            "rich value timestamp cannot be negative",
-        ));
-    }
+    validate_rich_key(&request.key)?;
+    validate_json_safe_unsigned(request.step, "rich value step")?;
+    validate_json_safe_timestamp(request.timestamp_ms, "rich value timestamp")?;
     if matches!(
         request.kind,
         RichValueKind::Image | RichValueKind::Audio | RichValueKind::Video | RichValueKind::Table
@@ -2694,6 +3124,15 @@ fn validate_rich_value(request: &CreateRichValueRequest) -> Result<(), HttpError
     validate_document_size(&request.metadata, "rich metadata", MAX_RICH_METADATA_BYTES)
 }
 
+fn validate_rich_key(key: &str) -> Result<(), HttpError> {
+    if key.is_empty() || key.len() > MAX_RICH_KEY_BYTES || key.chars().any(char::is_control) {
+        return Err(HttpError::invalid(format!(
+            "rich value keys must contain 1 to {MAX_RICH_KEY_BYTES} non-control bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_artifact(request: &CreateArtifactRequest) -> Result<(), HttpError> {
     validate_artifact_component(&request.name, "artifact name", MAX_ARTIFACT_NAME_BYTES)?;
     validate_artifact_component(
@@ -2701,6 +3140,9 @@ fn validate_artifact(request: &CreateArtifactRequest) -> Result<(), HttpError> {
         "artifact type",
         MAX_ARTIFACT_TYPE_BYTES,
     )?;
+    if let Some(version) = request.version {
+        validate_json_safe_unsigned(version, "artifact version")?;
+    }
     if request
         .description
         .as_ref()
@@ -2823,13 +3265,15 @@ fn validate_trace_span(request: &CreateTraceSpanRequest) -> Result<(), HttpError
             "trace name must contain 1 to {MAX_TRACE_NAME_BYTES} non-control bytes"
         )));
     }
-    if request.start_time_ms < 0
-        || request.end_time_ms < 0
-        || request.end_time_ms < request.start_time_ms
-    {
+    validate_json_safe_timestamp(request.start_time_ms, "trace start timestamp")?;
+    validate_json_safe_timestamp(request.end_time_ms, "trace end timestamp")?;
+    if request.end_time_ms < request.start_time_ms {
         return Err(HttpError::invalid(
-            "trace timestamps must be non-negative and end at or after start",
+            "trace end timestamp must be at or after start",
         ));
+    }
+    if let Some(step) = request.step {
+        validate_json_safe_unsigned(step, "trace step")?;
     }
     validate_document_size(
         &request.attributes,
@@ -2859,10 +3303,13 @@ fn validate_mime_type(value: &str) -> Result<(), HttpError> {
 
 fn validate_file_name(value: Option<&str>) -> Result<(), HttpError> {
     if value.is_some_and(|name| {
-        name.is_empty() || name.len() > MAX_FILE_NAME_BYTES || name.chars().any(char::is_control)
+        name.is_empty()
+            || name.len() > MAX_FILE_NAME_BYTES
+            || name.chars().any(char::is_control)
+            || name.contains(['/', '\\'])
     }) {
         return Err(HttpError::invalid(format!(
-            "file name must contain 1 to {MAX_FILE_NAME_BYTES} non-control bytes"
+            "file name must be a 1 to {MAX_FILE_NAME_BYTES} byte non-control basename"
         )));
     }
     Ok(())
@@ -2872,19 +3319,55 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+fn percent_decode_utf8(value: &str, name: &str) -> Result<String, HttpError> {
+    let source = value.as_bytes();
+    let mut decoded = Vec::with_capacity(source.len());
+    let mut index = 0;
+    while index < source.len() {
+        if source[index] != b'%' {
+            decoded.push(source[index]);
+            index += 1;
+            continue;
+        }
+        let Some(encoded) = source.get(index + 1..index + 3) else {
+            return Err(HttpError::invalid(format!(
+                "{name} contains an incomplete percent escape"
+            )));
+        };
+        let high = decode_hex_digit(encoded[0]);
+        let low = decode_hex_digit(encoded[1]);
+        let (Some(high), Some(low)) = (high, low) else {
+            return Err(HttpError::invalid(format!(
+                "{name} contains an invalid percent escape"
+            )));
+        };
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| HttpError::invalid(format!("{name} is not valid percent-encoded UTF-8")))
+}
+
+fn decode_hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn validate_create_run(request: &CreateRunRequest) -> Result<(), HttpError> {
     if request.resume == ResumePolicy::Must && request.id.is_none() {
         return Err(HttpError::invalid(
             "resume='must' requires an explicit run ID",
         ));
     }
-    if request
-        .name
-        .as_ref()
-        .is_some_and(|name| name.is_empty() || name.len() > MAX_RUN_NAME_BYTES)
-    {
+    if request.name.as_ref().is_some_and(|name| {
+        name.is_empty() || name.len() > MAX_RUN_NAME_BYTES || name.chars().any(char::is_control)
+    }) {
         return Err(HttpError::invalid(format!(
-            "run name must contain 1 to {MAX_RUN_NAME_BYTES} bytes"
+            "run name must contain 1 to {MAX_RUN_NAME_BYTES} non-control bytes"
         )));
     }
     validate_document_size(&request.config, "config", MAX_CONFIG_BYTES)?;
@@ -2917,6 +3400,35 @@ fn validate_document_size(
             "serialized {name} exceeds {max_bytes} bytes"
         )));
     }
+    validate_json_safe_integers(document.values(), name)?;
+    Ok(())
+}
+
+fn validate_json_safe_integers<'a>(
+    values: impl IntoIterator<Item = &'a serde_json::Value>,
+    name: &str,
+) -> Result<(), HttpError> {
+    let mut pending = values.into_iter().collect::<Vec<_>>();
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Array(values) => pending.extend(values),
+            serde_json::Value::Object(values) => pending.extend(values.values()),
+            serde_json::Value::Number(value) => {
+                let outside_safe_range = value.as_i64().is_some_and(|value| {
+                    value < -(MAX_JSON_SAFE_INTEGER as i64) || value > MAX_JSON_SAFE_INTEGER as i64
+                }) || value
+                    .as_u64()
+                    .is_some_and(|value| value > MAX_JSON_SAFE_INTEGER);
+                if outside_safe_range {
+                    return Err(HttpError::invalid(format!(
+                        "{name} contains an integer outside the JSON-safe range -{MAX_JSON_SAFE_INTEGER} to {MAX_JSON_SAFE_INTEGER}"
+                    )));
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_) => {
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2926,8 +3438,12 @@ fn validate_batch(request: &IngestBatchRequest) -> Result<(), HttpError> {
             "metric batches must contain 1 to {MAX_BATCH_POINTS} points"
         )));
     }
+    validate_json_safe_unsigned(request.batch_sequence, "batch sequence")?;
     let mut previous_sequence = None;
     for point in &request.points {
+        validate_json_safe_unsigned(point.sequence, "metric sequence")?;
+        validate_json_safe_unsigned(point.step, "metric step")?;
+        validate_json_safe_timestamp(point.timestamp_ms, "metric timestamp")?;
         if previous_sequence.is_some_and(|previous| point.sequence != previous + 1) {
             return Err(HttpError::invalid(
                 "point sequences must be strictly consecutive within a batch",
@@ -2958,22 +3474,70 @@ fn validate_batch(request: &IngestBatchRequest) -> Result<(), HttpError> {
     Ok(())
 }
 
-fn parse_history_keys(value: &str) -> Result<Vec<String>, HttpError> {
-    let keys: BTreeSet<String> = value
-        .split(',')
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(str::to_owned)
-        .collect();
+fn parse_history_query(value: Option<&str>) -> Result<HistoryQuery, HttpError> {
+    let pairs = serde_urlencoded::from_str::<Vec<(String, String)>>(value.unwrap_or_default())
+        .map_err(|error| HttpError::invalid(format!("invalid history query: {error}")))?;
+    let mut keys = BTreeSet::new();
+    let mut after = None;
+    let mut limit = None;
+    let mut max_points = None;
+    for (name, value) in pairs {
+        match name.as_str() {
+            "key" => {
+                if value.is_empty()
+                    || value.len() > MAX_METRIC_KEY_BYTES
+                    || value.chars().any(char::is_control)
+                {
+                    return Err(HttpError::invalid(format!(
+                        "history metric keys must contain 1 to {MAX_METRIC_KEY_BYTES} non-control bytes"
+                    )));
+                }
+                keys.insert(value);
+            }
+            "after" => parse_history_unsigned_parameter(&mut after, &name, &value)?,
+            "limit" => parse_history_unsigned_parameter(&mut limit, &name, &value)?,
+            "max_points" => {
+                parse_history_unsigned_parameter(&mut max_points, &name, &value)?;
+            }
+            _ => {
+                return Err(HttpError::invalid(format!(
+                    "unknown history query parameter '{name}'"
+                )));
+            }
+        }
+    }
     if keys.is_empty() || keys.len() > MAX_HISTORY_KEYS {
         return Err(HttpError::invalid(format!(
             "history queries must request 1 to {MAX_HISTORY_KEYS} metric keys"
         )));
     }
-    if keys.iter().any(|key| key.len() > MAX_METRIC_KEY_BYTES) {
-        return Err(HttpError::invalid("history metric key is too long"));
+    if let Some(after) = after {
+        validate_json_safe_unsigned(after, "history cursor")?;
     }
-    Ok(keys.into_iter().collect())
+    Ok(HistoryQuery {
+        keys: keys.into_iter().collect(),
+        after,
+        limit,
+        max_points,
+    })
+}
+
+fn parse_history_unsigned_parameter<T: FromStr>(
+    target: &mut Option<T>,
+    name: &str,
+    value: &str,
+) -> Result<(), HttpError> {
+    if target.is_some() {
+        return Err(HttpError::invalid(format!(
+            "history query parameter '{name}' cannot be repeated"
+        )));
+    }
+    *target = Some(value.parse().map_err(|_| {
+        HttpError::invalid(format!(
+            "history query parameter '{name}' must be an unsigned integer"
+        ))
+    })?);
+    Ok(())
 }
 
 fn parse_chart_history_query(value: Option<&str>) -> Result<SingleRunChartHistoryQuery, HttpError> {
@@ -3001,7 +3565,11 @@ fn parse_chart_history_query(value: Option<&str>) -> Result<SingleRunChartHistor
             }
             "step_min" => parse_unique_unsigned_parameter(&mut step_min, &name, &value)?,
             "step_max" => parse_unique_unsigned_parameter(&mut step_max, &name, &value)?,
-            _ => {}
+            _ => {
+                return Err(HttpError::invalid(format!(
+                    "unknown chart history query parameter '{name}'"
+                )));
+            }
         }
     }
     if keys.is_empty() || keys.len() > MAX_HISTORY_KEYS {
@@ -3103,6 +3671,10 @@ fn validate_chart_history_request(request: &ChartHistoryQueryRequest) -> Result<
             "chart history viewport minimum must not exceed maximum",
         ));
     }
+    if let Some(viewport) = request.viewport {
+        validate_json_safe_unsigned(viewport.minimum, "chart viewport minimum")?;
+        validate_json_safe_unsigned(viewport.maximum, "chart viewport maximum")?;
+    }
     Ok(())
 }
 
@@ -3123,6 +3695,12 @@ fn validate_chart_viewport(
     step_min: Option<u64>,
     step_max: Option<u64>,
 ) -> Result<Option<ChartStepExtent>, HttpError> {
+    if let Some(minimum) = step_min {
+        validate_json_safe_unsigned(minimum, "chart step_min")?;
+    }
+    if let Some(maximum) = step_max {
+        validate_json_safe_unsigned(maximum, "chart step_max")?;
+    }
     match (step_min, step_max) {
         (None, None) => Ok(None),
         (Some(minimum), Some(maximum)) if minimum <= maximum => {
@@ -3135,6 +3713,24 @@ fn validate_chart_viewport(
             "chart history step_min and step_max must be provided together",
         )),
     }
+}
+
+fn validate_json_safe_unsigned(value: u64, name: &str) -> Result<(), HttpError> {
+    if value > MAX_JSON_SAFE_INTEGER {
+        return Err(HttpError::invalid(format!(
+            "{name} cannot exceed {MAX_JSON_SAFE_INTEGER}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_json_safe_timestamp(value: i64, name: &str) -> Result<(), HttpError> {
+    if value < 0 || value as u64 > MAX_JSON_SAFE_INTEGER {
+        return Err(HttpError::invalid(format!(
+            "{name} must be between 0 and {MAX_JSON_SAFE_INTEGER}"
+        )));
+    }
+    Ok(())
 }
 
 fn default_list_limit() -> usize {
@@ -3150,8 +3746,61 @@ fn validate_list_limit(limit: usize) -> Result<(), HttpError> {
     Ok(())
 }
 
+fn page_limit(limit: usize) -> usize {
+    limit.saturating_add(1)
+}
+
+fn validate_search(value: Option<&str>, name: &str) -> Result<(), HttpError> {
+    if value.is_some_and(|value| {
+        value.is_empty() || value.len() > MAX_RUN_NAME_BYTES || value.chars().any(char::is_control)
+    }) {
+        return Err(HttpError::invalid(format!(
+            "{name} must contain 1 to {MAX_RUN_NAME_BYTES} non-control bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_metric_catalog_text(value: Option<&str>, name: &str) -> Result<(), HttpError> {
+    if value.is_some_and(|value| {
+        value.is_empty()
+            || value.len() > MAX_METRIC_KEY_BYTES
+            || value.chars().any(char::is_control)
+    }) {
+        return Err(HttpError::invalid(format!(
+            "{name} must contain 1 to {MAX_METRIC_KEY_BYTES} non-control bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_run_query(request: &RunQueryRequest) -> Result<(), HttpError> {
     validate_list_limit(request.limit)?;
+    if request.run_ids.len() > MAX_CHART_QUERY_RUNS {
+        return Err(HttpError::invalid(format!(
+            "run queries cannot contain more than {MAX_CHART_QUERY_RUNS} run IDs"
+        )));
+    }
+    if request
+        .run_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>()
+        .len()
+        != request.run_ids.len()
+    {
+        return Err(HttpError::invalid("run query run IDs must be unique"));
+    }
+    if !request.run_ids.is_empty() && request.before.is_some() {
+        return Err(HttpError::invalid(
+            "run_ids and before cannot be used together",
+        ));
+    }
+    if !request.run_ids.is_empty() && request.limit < request.run_ids.len() {
+        return Err(HttpError::invalid(
+            "run query limit must include every requested run ID",
+        ));
+    }
     if let Some(project) = &request.project {
         validate_project_name(project)?;
     }
@@ -3250,6 +3899,13 @@ fn validate_sweep(request: &CreateSweepRequest) -> Result<(), HttpError> {
             "serialized sweep parameters exceed {MAX_CONFIG_BYTES} bytes"
         )));
     }
+    validate_json_safe_integers(
+        request
+            .parameters
+            .values()
+            .flat_map(|parameter| parameter.values.iter()),
+        "sweep parameters",
+    )?;
     Ok(())
 }
 
@@ -3398,6 +4054,13 @@ impl HttpError {
         }
     }
 
+    fn busy(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: ApiError::new("server_busy", message),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         let message = message.into();
         tracing::error!(%message, "request failed");
@@ -3410,7 +4073,14 @@ impl HttpError {
 
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
+        let status = self.status;
+        let mut response = (status, Json(self.body)).into_response();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
@@ -3425,11 +4095,11 @@ impl From<CatalogError> for HttpError {
                 status: StatusCode::CONFLICT,
                 body: ApiError::new("conflict", error.to_string()),
             },
+            CatalogError::Busy(_) => Self::busy(error.to_string()),
             CatalogError::Limit(_) => Self::invalid(error.to_string()),
             CatalogError::CreateDirectory { .. }
             | CatalogError::Database(_)
-            | CatalogError::InvalidData(_)
-            | CatalogError::SchemaVersion { .. } => Self::internal(error.to_string()),
+            | CatalogError::InvalidData(_) => Self::internal(error.to_string()),
         }
     }
 }
@@ -3444,42 +4114,49 @@ impl From<StorageError> for HttpError {
 mod tests {
     use std::collections::BTreeMap;
     use std::io::{Cursor, Read};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode};
-    use runloom_catalog::Catalog;
+    use axum::body::{Body, Bytes, to_bytes};
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use runloom_catalog::{BatchStatus, Catalog, CatalogError, SegmentManifest};
     use runloom_protocol::{
-        AlertId, AlertLevel, AlertListResponse, ArtifactEntry, ArtifactListResponse, BlobRef,
-        BlobUploadResponse, ChartAlignment, ChartHistoryQueryRequest, ChartHistoryQueryResponse,
-        ChartHistoryResponse, ChartMetricHistory, ChartSeriesRequest, ChartViewport,
-        ClaimSweepTrialRequest, ClaimSweepTrialResponse, CompleteSweepTrialRequest,
+        AlertId, AlertLevel, AlertListResponse, ApiError, ArtifactEntry, ArtifactListResponse,
+        ArtifactRelation, BlobRef, BlobUploadResponse, ChartAlignment, ChartHistoryQueryRequest,
+        ChartHistoryQueryResponse, ChartHistoryResponse, ChartMetricHistory, ChartSeriesRequest,
+        ChartViewport, ClaimSweepTrialRequest, ClaimSweepTrialResponse, CompleteSweepTrialRequest,
         ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse, CreateArtifactRequest,
         CreateArtifactResponse, CreateReportRequest, CreateReportResponse, CreateRichValueRequest,
         CreateRichValueResponse, CreateRunRequest, CreateRunResponse, CreateSweepRequest,
         CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse, DiagnosticsResponse,
         EarlyTerminateConfig, FinishRunRequest, FinishRunResponse, HealthResponse, HealthStatus,
-        HistoryResponse, IngestBatchRequest, IngestBatchResponse, MetricGoal,
-        MetricKeyListResponse, MetricPoint, ProjectListResponse, ReportLayout, ReportListResponse,
-        ReportPanel, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId, RichValueKind,
-        RichValueListResponse, RunArtifactListResponse, RunId, RunListResponse, RunQueryRequest,
-        RunQueryResponse, RunState, RunUpdateResponse, SummaryUpdateRequest, SweepMethod,
-        SweepMetric, SweepParameter, SweepTrialListResponse, SweepTrialState, TraceKind,
-        TraceSpanId, TraceSpanListResponse, TraceSpanRecord, TraceStatus, UpdateReportRequest,
-        UseArtifactRequest,
+        HeartbeatSweepTrialRequest, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
+        MetricCatalogMode, MetricGoal, MetricKeyListResponse, MetricPoint, ProjectListResponse,
+        ProjectMetricCatalogRequest, ProjectMetricCatalogResponse, ProjectSummary, ReportLayout,
+        ReportListResponse, ReportPanel, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId,
+        RichValueKeyListResponse, RichValueKind, RichValueListResponse, RunArtifactListResponse,
+        RunId, RunListResponse, RunQueryRequest, RunQueryResponse, RunState, RunUpdateResponse,
+        SummaryUpdateRequest, SweepMethod, SweepMetric, SweepParameter, SweepTrialListResponse,
+        SweepTrialState, TraceKind, TraceSpanId, TraceSpanListResponse, TraceSpanRecord,
+        TraceStatus, UpdateReportRequest, UseArtifactRequest,
     };
-    use runloom_storage::{BlobStore, ChartAxisExtent, MetricStore};
+    use runloom_storage::{BlobStore, ChartAxisExtent, MetricStore, StorageError};
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
     use tower::ServiceExt;
 
     use super::{
-        CHART_AXIS_EXTENT_CACHE_MAX_ENTRIES, CHART_SERIES_CACHE_MAX_ENTRIES, CachedChartOrigin,
-        ChartAxisExtentCache, ChartAxisExtentCacheKey, ChartSeriesCache, ChartSeriesCacheKey,
-        CompactionConfig, CompactionOutcome, MetricRuntime, app, app_with_axis_extent_cache,
-        app_with_runtime, compact_once,
+        AppState, BLOB_UPLOAD_WORKERS, CHART_AXIS_EXTENT_CACHE_MAX_ENTRIES,
+        CHART_SERIES_CACHE_MAX_ENTRIES, CachedChartOrigin, ChartAxisExtentCache,
+        ChartAxisExtentCacheKey, ChartSeriesCache, ChartSeriesCacheKey, CompactionConfig,
+        CompactionError, CompactionOutcome, MetricRuntime, RequestTelemetry, app,
+        app_with_axis_extent_cache, app_with_runtime, compact_once, create_artifact, ingest_batch,
+        mutation_lock_index, process_ingest_batch, upload_blob,
     };
 
     #[test]
@@ -3558,11 +4235,286 @@ mod tests {
         );
     }
 
+    #[test]
+    fn json_number_contract_rejects_values_beyond_browser_precision() {
+        let unsafe_value = runloom_protocol::MAX_JSON_SAFE_INTEGER + 1;
+        let batch = IngestBatchRequest {
+            batch_sequence: unsafe_value,
+            points: vec![MetricPoint {
+                sequence: 1,
+                step: 0,
+                timestamp_ms: 0,
+                metrics: BTreeMap::from([("loss".to_owned(), 1.0)]),
+            }],
+        };
+        assert!(super::validate_batch(&batch).is_err());
+        assert!(super::validate_chart_viewport(Some(0), Some(unsafe_value)).is_err());
+        assert!(super::validate_json_safe_timestamp(unsafe_value as i64, "timestamp").is_err());
+        assert!(super::validate_json_safe_unsigned(unsafe_value, "step").is_err());
+    }
+
+    #[test]
+    fn arbitrary_json_boundaries_share_the_safe_integer_contract() {
+        let maximum = runloom_protocol::MAX_JSON_SAFE_INTEGER;
+        let safe_document = BTreeMap::from([(
+            "nested".to_owned(),
+            serde_json::json!([-(maximum as i64), maximum]),
+        )]);
+        assert!(
+            super::validate_document_size(
+                &safe_document,
+                "safe document",
+                runloom_protocol::MAX_CONFIG_BYTES,
+            )
+            .is_ok()
+        );
+
+        for unsafe_integer in [
+            serde_json::json!(maximum + 1),
+            serde_json::json!(-(maximum as i64) - 1),
+        ] {
+            let document = BTreeMap::from([(
+                "nested".to_owned(),
+                serde_json::json!({"array": [unsafe_integer]}),
+            )]);
+            assert!(
+                super::validate_create_run(&CreateRunRequest {
+                    id: None,
+                    name: None,
+                    config: document.clone(),
+                    resume: ResumePolicy::Never,
+                    sweep_trial_id: None,
+                })
+                .is_err()
+            );
+            assert!(
+                super::validate_document_updates(
+                    &document,
+                    "summary",
+                    runloom_protocol::MAX_SUMMARY_BYTES,
+                )
+                .is_err()
+            );
+            assert!(
+                super::validate_rich_value(&CreateRichValueRequest {
+                    id: None,
+                    key: "histogram".to_owned(),
+                    kind: RichValueKind::Histogram,
+                    step: 0,
+                    timestamp_ms: 0,
+                    blob: None,
+                    metadata: document.clone(),
+                })
+                .is_err()
+            );
+            assert!(
+                super::validate_artifact(&CreateArtifactRequest {
+                    id: None,
+                    name: "checkpoint".to_owned(),
+                    artifact_type: "model".to_owned(),
+                    version: None,
+                    description: None,
+                    metadata: document.clone(),
+                    aliases: Vec::new(),
+                    entries: Vec::new(),
+                })
+                .is_err()
+            );
+            for (attributes, preview) in [
+                (document.clone(), BTreeMap::new()),
+                (BTreeMap::new(), document.clone()),
+            ] {
+                assert!(
+                    super::validate_trace_span(&CreateTraceSpanRequest {
+                        id: None,
+                        trace_id: "trace".to_owned(),
+                        parent_span_id: None,
+                        name: "span".to_owned(),
+                        kind: TraceKind::Span,
+                        status: TraceStatus::Ok,
+                        start_time_ms: 0,
+                        end_time_ms: 0,
+                        step: None,
+                        attributes,
+                        preview,
+                        payload: None,
+                    })
+                    .is_err()
+                );
+            }
+            for (config_equals, summary_equals) in [
+                (document.clone(), BTreeMap::new()),
+                (BTreeMap::new(), document.clone()),
+            ] {
+                assert!(
+                    super::validate_run_query(&RunQueryRequest {
+                        project: None,
+                        run_ids: Vec::new(),
+                        state: None,
+                        name: None,
+                        name_contains: None,
+                        config_equals,
+                        summary_equals,
+                        before: None,
+                        limit: 1,
+                    })
+                    .is_err()
+                );
+            }
+            assert!(
+                super::validate_sweep(&CreateSweepRequest {
+                    id: None,
+                    name: None,
+                    method: SweepMethod::Grid,
+                    metric: SweepMetric {
+                        name: "loss".to_owned(),
+                        goal: MetricGoal::Minimize,
+                    },
+                    parameters: BTreeMap::from([(
+                        "seed".to_owned(),
+                        SweepParameter {
+                            values: document.values().cloned().collect(),
+                        },
+                    )]),
+                    max_runs: 1,
+                    early_terminate: None,
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_http_json_documents_preserve_only_safe_integer_edges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let maximum = runloom_protocol::MAX_JSON_SAFE_INTEGER;
+        let safe_response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/projects/json-integers/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"config":{{"nested":[-{},{}]}}}}"#,
+                        maximum, maximum
+                    )))?,
+            )
+            .await?;
+        assert_eq!(safe_response.status(), StatusCode::CREATED);
+        let created: CreateRunResponse = response_json(safe_response).await?;
+        assert_eq!(
+            created.run.config["nested"],
+            serde_json::json!([-(maximum as i64), maximum])
+        );
+
+        for (project, integer) in [
+            ("too-large", (maximum + 1).to_string()),
+            ("too-small", format!("-{}", maximum + 1)),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/v1/projects/{project}/runs"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"config":{{"nested":[{integer}]}}}}"#
+                        )))?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn run_and_blob_names_reject_controls_and_path_separators() {
+        let request = CreateRunRequest {
+            id: None,
+            name: Some("invalid\nname".to_owned()),
+            config: BTreeMap::new(),
+            resume: ResumePolicy::Never,
+            sweep_trial_id: None,
+        };
+        assert!(super::validate_create_run(&request).is_err());
+        assert!(super::validate_file_name(Some("nested/file.mp4")).is_err());
+        assert!(super::validate_file_name(Some("nested\\file.mp4")).is_err());
+        assert!(super::validate_file_name(Some("file.mp4")).is_ok());
+        assert_eq!(
+            super::percent_decode_utf8("policy_%EC%A0%95%EC%B1%85.bin", "file name")
+                .expect("valid percent-encoded UTF-8"),
+            "policy_정책.bin"
+        );
+        for invalid in ["broken%", "%GG", "%FF"] {
+            assert!(super::percent_decode_utf8(invalid, "file name").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn metric_ingest_accepts_boolean_scalars_as_zero_or_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let created: CreateRunResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/boolean-metrics/runs",
+                    &CreateRunRequest {
+                        id: None,
+                        name: None,
+                        config: BTreeMap::new(),
+                        resume: ResumePolicy::Never,
+                        sweep_trial_id: None,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/runs/{}/batches", created.run.id))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                "batch_sequence": 1,
+                "points": [{
+                    "sequence": 1,
+                    "step": 0,
+                    "timestamp_ms": 1,
+                    "metrics": {"disabled": false, "enabled": true}
+                }]
+            }))?))?;
+        let response = router.clone().oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let history: HistoryResponse = response_json(
+            router
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/runs/{}/history?key=disabled&key=enabled&limit=10",
+                        created.run.id
+                    ))
+                    .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(history.metrics["disabled"], vec![Some(0.0)]);
+        assert_eq!(history.metrics["enabled"], vec![Some(1.0)]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn health_checks_the_catalog() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let metrics_root = directory.path().join("metrics");
+        std::fs::create_dir_all(&metrics_root)?;
+        std::fs::create_dir_all(directory.path().join("blobs"))?;
+        let router = app(catalog, MetricStore::new(metrics_root));
         let response = router
             .clone()
             .oneshot(Request::get("/api/v1/health").body(Body::empty())?)
@@ -3574,14 +4526,64 @@ mod tests {
         assert_eq!(health.status, HealthStatus::Healthy);
         let diagnostics: DiagnosticsResponse = response_json(
             router
+                .clone()
                 .oneshot(Request::get("/api/v1/diagnostics").body(Body::empty())?)
                 .await?,
         )
         .await?;
-        assert_eq!(diagnostics.schema_version, 1);
         assert_eq!(diagnostics.requests_total, 2);
         assert_eq!(diagnostics.requests_active, 1);
+        assert_eq!(diagnostics.requests_rejected_total, 0);
+        assert_eq!(
+            diagnostics.request_admission_limit,
+            super::REQUEST_ADMISSION_LIMIT
+        );
+        assert_eq!(
+            diagnostics.request_admission_permits_available,
+            super::REQUEST_ADMISSION_LIMIT - 1
+        );
+        assert_eq!(
+            diagnostics.health_admission_limit,
+            super::HEALTH_ADMISSION_LIMIT
+        );
+        assert_eq!(
+            diagnostics.health_admission_permits_available,
+            super::HEALTH_ADMISSION_LIMIT
+        );
+        assert_eq!(
+            diagnostics.blob_upload_permits_available,
+            BLOB_UPLOAD_WORKERS
+        );
+        assert_eq!(
+            diagnostics.artifact_io_permits_available,
+            super::ARTIFACT_IO_WORKERS
+        );
+        assert_eq!(
+            diagnostics.download_stream_limit,
+            super::DOWNLOAD_STREAM_LIMIT
+        );
+        assert_eq!(
+            diagnostics.download_stream_permits_available,
+            super::DOWNLOAD_STREAM_LIMIT
+        );
         assert_eq!(diagnostics.query_permits_available, super::QUERY_WORKERS);
+        assert_eq!(diagnostics.storage_roots.len(), 3);
+        assert!(diagnostics.storage_roots.iter().all(|root| {
+            !root.path.is_empty()
+                && root.total_bytes >= root.free_bytes
+                && root.free_bytes >= root.available_bytes
+        }));
+        #[cfg(unix)]
+        assert!(diagnostics.storage_roots.iter().all(|root| {
+            root.device_id
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+        }));
+        std::fs::remove_dir_all(directory.path().join("blobs"))?;
+        let unhealthy = router
+            .oneshot(Request::get("/api/v1/health").body(Body::empty())?)
+            .await?;
+        assert_eq!(unhealthy.status(), StatusCode::SERVICE_UNAVAILABLE);
         Ok(())
     }
 
@@ -3605,6 +4607,14 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 Some("no-cache")
             );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-content-type-options")
+                    .and_then(|value| value.to_str().ok()),
+                Some("nosniff")
+            );
+            assert!(response.headers().contains_key("content-security-policy"));
             let body = to_bytes(response.into_body(), 1024 * 1024).await?;
             assert!(String::from_utf8_lossy(&body).contains("<title>Runloom</title>"));
         }
@@ -3617,6 +4627,97 @@ mod tests {
             .oneshot(Request::get("/api/v1/missing").body(Body::empty())?)
             .await?;
         assert_eq!(missing_api.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn api_and_health_admission_shed_without_reading_bodies_and_exempt_static()
+    -> Result<(), Box<dyn std::error::Error>> {
+        async fn parse_json(Json(_): Json<serde_json::Value>) -> StatusCode {
+            StatusCode::OK
+        }
+
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let state = AppState::new(
+            catalog,
+            MetricRuntime::new(MetricStore::new(directory.path().join("metrics"))),
+            BlobStore::new(directory.path().join("blobs")),
+            Arc::new(Mutex::new(ChartAxisExtentCache::default())),
+            Arc::new(RequestTelemetry::from_environment()),
+        );
+        let router = Router::new()
+            .route("/api/v1/heavy", post(parse_json))
+            .route("/api/v1/health", get(|| async { StatusCode::OK }))
+            .route("/dashboard.js", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                super::admit_api_request,
+            ));
+        let held = Arc::clone(&state.request_admission)
+            .acquire_many_owned(super::REQUEST_ADMISSION_LIMIT as u32)
+            .await?;
+
+        let pending_body =
+            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+        let rejected = tokio::time::timeout(
+            Duration::from_millis(100),
+            router.clone().oneshot(
+                Request::post("/api/v1/heavy")
+                    .header("content-type", "application/json")
+                    .body(pending_body)?,
+            ),
+        )
+        .await??;
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            rejected.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        let error: runloom_protocol::ApiError = response_json(rejected).await?;
+        assert_eq!(error.code, "server_busy");
+        for path in ["/api/v1/health", "/dashboard.js"] {
+            let response = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let held_health = Arc::clone(&state.health_admission)
+            .acquire_many_owned(super::HEALTH_ADMISSION_LIMIT as u32)
+            .await?;
+        let rejected_health = router
+            .clone()
+            .oneshot(Request::get("/api/v1/health").body(Body::empty())?)
+            .await?;
+        assert_eq!(rejected_health.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            state
+                .telemetry
+                .requests_rejected_total
+                .load(Ordering::Relaxed),
+            2
+        );
+
+        drop(held_health);
+        drop(held);
+        let accepted = router
+            .oneshot(
+                Request::post("/api/v1/heavy")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(
+            state.request_admission.available_permits(),
+            super::REQUEST_ADMISSION_LIMIT - 1
+        );
+        drop(accepted);
+        assert_eq!(
+            state.request_admission.available_permits(),
+            super::REQUEST_ADMISSION_LIMIT
+        );
         Ok(())
     }
 
@@ -3677,6 +4778,17 @@ mod tests {
         let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
         let mut created_ids = Vec::new();
         for (name, seed) in [("alpha", 1), ("beta", 2), ("beta-eval", 2)] {
+            let mut config = BTreeMap::from([
+                ("seed".to_owned(), seed.into()),
+                ("nullable".to_owned(), serde_json::Value::Null),
+            ]);
+            if name == "alpha" {
+                config.extend([
+                    ("literal.dot".to_owned(), "dot".into()),
+                    ("literal\"quote".to_owned(), "quote".into()),
+                    ("literal\\slash".to_owned(), "slash".into()),
+                ]);
+            }
             let created: CreateRunResponse = response_json(
                 router
                     .clone()
@@ -3686,10 +4798,7 @@ mod tests {
                         &CreateRunRequest {
                             id: None,
                             name: Some(name.to_owned()),
-                            config: BTreeMap::from([
-                                ("seed".to_owned(), seed.into()),
-                                ("nullable".to_owned(), serde_json::Value::Null),
-                            ]),
+                            config,
                             resume: ResumePolicy::Never,
                             sweep_trial_id: None,
                         },
@@ -3700,6 +4809,130 @@ mod tests {
             created_ids.push(created.run.id);
         }
 
+        let special_metrics = BTreeMap::from([
+            ("summary.dot".to_owned(), 1.0),
+            ("summary\"quote".to_owned(), 2.0),
+            ("summary\\slash".to_owned(), 3.0),
+            ("shadow\\key".to_owned(), 4.0),
+        ]);
+        let metric_response = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{}/batches", created_ids[0]),
+                &IngestBatchRequest {
+                    batch_sequence: 1,
+                    points: vec![MetricPoint {
+                        sequence: 1,
+                        step: 0,
+                        timestamp_ms: 1,
+                        metrics: special_metrics,
+                    }],
+                },
+            )?)
+            .await?;
+        assert_eq!(metric_response.status(), StatusCode::CREATED);
+        let summary_response = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/api/v1/runs/{}/summary", created_ids[0]),
+                &SummaryUpdateRequest {
+                    updates: BTreeMap::from([
+                        ("summary.dot".to_owned(), "dot".into()),
+                        ("summary\"quote".to_owned(), "quote".into()),
+                        ("summary\\slash".to_owned(), "slash".into()),
+                        ("shadow\\key".to_owned(), "explicit".into()),
+                    ]),
+                },
+            )?)
+            .await?;
+        assert_eq!(summary_response.status(), StatusCode::OK);
+
+        for (label, config_equals, summary_equals) in [
+            (
+                "config dot",
+                BTreeMap::from([("literal.dot".to_owned(), "dot".into())]),
+                BTreeMap::new(),
+            ),
+            (
+                "config quote",
+                BTreeMap::from([("literal\"quote".to_owned(), "quote".into())]),
+                BTreeMap::new(),
+            ),
+            (
+                "config backslash",
+                BTreeMap::from([("literal\\slash".to_owned(), "slash".into())]),
+                BTreeMap::new(),
+            ),
+            (
+                "summary dot",
+                BTreeMap::new(),
+                BTreeMap::from([("summary.dot".to_owned(), "dot".into())]),
+            ),
+            (
+                "summary quote",
+                BTreeMap::new(),
+                BTreeMap::from([("summary\"quote".to_owned(), "quote".into())]),
+            ),
+            (
+                "summary backslash",
+                BTreeMap::new(),
+                BTreeMap::from([("summary\\slash".to_owned(), "slash".into())]),
+            ),
+            (
+                "explicit precedence",
+                BTreeMap::new(),
+                BTreeMap::from([("shadow\\key".to_owned(), "explicit".into())]),
+            ),
+        ] {
+            let special: RunQueryResponse = response_json(
+                router
+                    .clone()
+                    .oneshot(json_request(
+                        "POST",
+                        "/api/v1/query/runs",
+                        &RunQueryRequest {
+                            project: Some("query-demo".to_owned()),
+                            run_ids: Vec::new(),
+                            state: None,
+                            name: None,
+                            name_contains: None,
+                            config_equals,
+                            summary_equals,
+                            before: None,
+                            limit: 10,
+                        },
+                    )?)
+                    .await?,
+            )
+            .await?;
+            assert_eq!(special.runs.len(), 1, "failed {label}");
+            assert_eq!(special.runs[0].id, created_ids[0], "failed {label}");
+        }
+        let shadowed: RunQueryResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/query/runs",
+                    &RunQueryRequest {
+                        project: Some("query-demo".to_owned()),
+                        run_ids: Vec::new(),
+                        state: None,
+                        name: None,
+                        name_contains: None,
+                        config_equals: BTreeMap::new(),
+                        summary_equals: BTreeMap::from([("shadow\\key".to_owned(), 4.0.into())]),
+                        before: None,
+                        limit: 10,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert!(shadowed.runs.is_empty());
+
         let filtered: RunQueryResponse = response_json(
             router
                 .clone()
@@ -3708,6 +4941,7 @@ mod tests {
                     "/api/v1/query/runs",
                     &RunQueryRequest {
                         project: Some("query-demo".to_owned()),
+                        run_ids: Vec::new(),
                         state: Some(RunState::Running),
                         name: None,
                         name_contains: Some("beta".to_owned()),
@@ -3734,6 +4968,7 @@ mod tests {
                     "/api/v1/query/runs",
                     &RunQueryRequest {
                         project: Some("query-demo".to_owned()),
+                        run_ids: Vec::new(),
                         state: None,
                         name: None,
                         name_contains: None,
@@ -3756,6 +4991,7 @@ mod tests {
                     "/api/v1/query/runs",
                     &RunQueryRequest {
                         project: Some("query-demo".to_owned()),
+                        run_ids: Vec::new(),
                         state: None,
                         name: None,
                         name_contains: None,
@@ -3776,6 +5012,964 @@ mod tests {
                 .all(|run| !second_page.runs.iter().any(|other| other.id == run.id))
         );
         assert_eq!(created_ids.len(), 3);
+
+        let exact: RunQueryResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/query/runs",
+                    &RunQueryRequest {
+                        project: Some("query-demo".to_owned()),
+                        run_ids: vec![created_ids[0], created_ids[2]],
+                        state: None,
+                        name: None,
+                        name_contains: None,
+                        config_equals: BTreeMap::new(),
+                        summary_equals: BTreeMap::new(),
+                        before: None,
+                        limit: 2,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(exact.runs.len(), 2);
+        assert_eq!(exact.next_before, None);
+        assert!(
+            exact
+                .runs
+                .iter()
+                .all(|run| run.id == created_ids[0] || run.id == created_ids[2])
+        );
+
+        let invalid_cursor = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/v1/query/runs",
+                &RunQueryRequest {
+                    project: Some("query-demo".to_owned()),
+                    run_ids: vec![created_ids[0]],
+                    state: None,
+                    name: None,
+                    name_contains: None,
+                    config_equals: BTreeMap::new(),
+                    summary_equals: BTreeMap::new(),
+                    before: Some(created_ids[1]),
+                    limit: 1,
+                },
+            )?)
+            .await?;
+        assert_eq!(invalid_cursor.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_metric_catalog_is_searchable_and_limit_plus_one_paginated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let mut runs = Vec::new();
+        for name in ["first", "second"] {
+            let created: CreateRunResponse = response_json(
+                router
+                    .clone()
+                    .oneshot(json_request(
+                        "POST",
+                        "/api/v1/projects/metric-catalog/runs",
+                        &CreateRunRequest {
+                            id: None,
+                            name: Some(name.to_owned()),
+                            config: BTreeMap::new(),
+                            resume: ResumePolicy::Never,
+                            sweep_trial_id: None,
+                        },
+                    )?)
+                    .await?,
+            )
+            .await?;
+            runs.push(created.run.id);
+        }
+        for (run_id, metrics) in [
+            (
+                runs[0],
+                BTreeMap::from([("loss".to_owned(), 1.0), ("reward".to_owned(), 2.0)]),
+            ),
+            (
+                runs[1],
+                BTreeMap::from([("loss".to_owned(), 3.0), ("throughput".to_owned(), 4.0)]),
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("/api/v1/runs/{run_id}/batches"),
+                    &IngestBatchRequest {
+                        batch_sequence: 1,
+                        points: vec![MetricPoint {
+                            sequence: 1,
+                            step: 0,
+                            timestamp_ms: 1,
+                            metrics,
+                        }],
+                    },
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let first: ProjectMetricCatalogResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/metric-catalog/metrics/query",
+                    &ProjectMetricCatalogRequest {
+                        run_ids: runs.clone(),
+                        mode: MetricCatalogMode::Union,
+                        search: None,
+                        after: None,
+                        limit: 1,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(first.keys.len(), 1);
+        assert_eq!(first.keys[0].key, "loss");
+        assert_eq!(first.keys[0].run_ids.len(), 2);
+        assert_eq!(first.next_after.as_deref(), Some("loss"));
+
+        let second: ProjectMetricCatalogResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/metric-catalog/metrics/query",
+                    &ProjectMetricCatalogRequest {
+                        run_ids: runs.clone(),
+                        mode: MetricCatalogMode::Union,
+                        search: None,
+                        after: first.next_after,
+                        limit: 2,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(
+            second
+                .keys
+                .iter()
+                .map(|summary| summary.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reward", "throughput"]
+        );
+        assert_eq!(second.next_after, None);
+
+        let intersection: ProjectMetricCatalogResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/metric-catalog/metrics/query",
+                    &ProjectMetricCatalogRequest {
+                        run_ids: runs.clone(),
+                        mode: MetricCatalogMode::Intersection,
+                        search: Some("LOSS".to_owned()),
+                        after: None,
+                        limit: 10,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(intersection.keys.len(), 1);
+        assert_eq!(intersection.keys[0].key, "loss");
+
+        let foreign_cursor = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/v1/projects/metric-catalog/metrics/query",
+                &ProjectMetricCatalogRequest {
+                    run_ids: runs,
+                    mode: MetricCatalogMode::Union,
+                    search: None,
+                    after: Some("unknown".to_owned()),
+                    limit: 10,
+                },
+            )?)
+            .await?;
+        assert_eq!(foreign_cursor.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_inputs_reject_unknown_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let unknown_body = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/projects/strict/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"strict","unsupported_resume_alias":true}"#,
+                    ))?,
+            )
+            .await?;
+        assert!(unknown_body.status().is_client_error());
+
+        let unknown_query = router
+            .oneshot(Request::get("/api/v1/projects?unbounded=true").body(Body::empty())?)
+            .await?;
+        assert!(unknown_query.status().is_client_error());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_stable_run_and_artifact_creates_are_deterministic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+
+        let stable_id = RunId::new();
+        let stable_request = CreateRunRequest {
+            id: Some(stable_id),
+            name: Some("stable".to_owned()),
+            config: BTreeMap::new(),
+            resume: ResumePolicy::Allow,
+            sweep_trial_id: None,
+        };
+        let create_a = router.clone().oneshot(json_request(
+            "POST",
+            "/api/v1/projects/concurrent-create/runs",
+            &stable_request,
+        )?);
+        let create_b = router.clone().oneshot(json_request(
+            "POST",
+            "/api/v1/projects/concurrent-create/runs",
+            &stable_request,
+        )?);
+        let (response_a, response_b) = tokio::join!(create_a, create_b);
+        let response_a = response_a?;
+        let response_b = response_b?;
+        assert!(
+            (response_a.status() == StatusCode::CREATED && response_b.status() == StatusCode::OK)
+                || (response_b.status() == StatusCode::CREATED
+                    && response_a.status() == StatusCode::OK)
+        );
+        let created_a: CreateRunResponse = response_json(response_a).await?;
+        let created_b: CreateRunResponse = response_json(response_b).await?;
+        assert_eq!(created_a.run.id, stable_id);
+        assert_eq!(created_b.run.id, stable_id);
+        let project: ProjectSummary = response_json(
+            router
+                .clone()
+                .oneshot(Request::get("/api/v1/projects/concurrent-create").body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(project.run_count, 1);
+
+        let mut artifact_runs = Vec::new();
+        for name in ["producer-a", "producer-b"] {
+            let created: CreateRunResponse = response_json(
+                router
+                    .clone()
+                    .oneshot(json_request(
+                        "POST",
+                        "/api/v1/projects/artifact-race/runs",
+                        &CreateRunRequest {
+                            id: None,
+                            name: Some(name.to_owned()),
+                            config: BTreeMap::new(),
+                            resume: ResumePolicy::Never,
+                            sweep_trial_id: None,
+                        },
+                    )?)
+                    .await?,
+            )
+            .await?;
+            artifact_runs.push(created.run.id);
+        }
+        let artifact_a = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            name: "policy".to_owned(),
+            artifact_type: "model".to_owned(),
+            version: None,
+            description: None,
+            metadata: BTreeMap::new(),
+            aliases: Vec::new(),
+            entries: Vec::new(),
+        };
+        let artifact_b = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            ..artifact_a.clone()
+        };
+        let create_a = router.clone().oneshot(json_request(
+            "POST",
+            &format!("/api/v1/runs/{}/artifacts", artifact_runs[0]),
+            &artifact_a,
+        )?);
+        let create_b = router.clone().oneshot(json_request(
+            "POST",
+            &format!("/api/v1/runs/{}/artifacts", artifact_runs[1]),
+            &artifact_b,
+        )?);
+        let (response_a, response_b) = tokio::join!(create_a, create_b);
+        let response_a = response_a?;
+        let response_b = response_b?;
+        assert_eq!(response_a.status(), StatusCode::CREATED);
+        assert_eq!(response_b.status(), StatusCode::CREATED);
+        let created_a: CreateArtifactResponse = response_json(response_a).await?;
+        let created_b: CreateArtifactResponse = response_json(response_b).await?;
+        let mut versions = vec![created_a.artifact.version, created_b.artifact.version];
+        versions.sort_unstable();
+        assert_eq!(versions, vec![0, 1]);
+
+        let model = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            name: "checkpoint".to_owned(),
+            artifact_type: "model".to_owned(),
+            version: None,
+            description: None,
+            metadata: BTreeMap::new(),
+            aliases: Vec::new(),
+            entries: Vec::new(),
+        };
+        let dataset = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            artifact_type: "dataset".to_owned(),
+            ..model.clone()
+        };
+        let create_model = router.clone().oneshot(json_request(
+            "POST",
+            &format!("/api/v1/runs/{}/artifacts", artifact_runs[0]),
+            &model,
+        )?);
+        let create_dataset = router.clone().oneshot(json_request(
+            "POST",
+            &format!("/api/v1/runs/{}/artifacts", artifact_runs[1]),
+            &dataset,
+        )?);
+        let (create_model, create_dataset) = tokio::join!(create_model, create_dataset);
+        let mut statuses = [create_model?.status(), create_dataset?.status()];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::CREATED, StatusCode::CONFLICT]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_artifact_versions_are_exact_and_aliases_never_regress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let mut run_ids = Vec::new();
+        for name in ["producer-a", "producer-b"] {
+            let (run, _) = catalog
+                .create_or_resume_run(
+                    "artifact-backfill",
+                    &CreateRunRequest {
+                        id: None,
+                        name: Some(name.to_owned()),
+                        config: BTreeMap::new(),
+                        resume: ResumePolicy::Never,
+                        sweep_trial_id: None,
+                    },
+                )
+                .await?;
+            run_ids.push(run.id);
+        }
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let path_a = format!("/api/v1/runs/{}/artifacts", run_ids[0]);
+        let path_b = format!("/api/v1/runs/{}/artifacts", run_ids[1]);
+
+        let newer = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            name: "policy".to_owned(),
+            artifact_type: "model".to_owned(),
+            version: Some(9),
+            description: None,
+            metadata: BTreeMap::new(),
+            aliases: vec!["latest".to_owned()],
+            entries: Vec::new(),
+        };
+        let response = router
+            .clone()
+            .oneshot(json_request("POST", &path_a, &newer)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created_newer: CreateArtifactResponse = response_json(response).await?;
+        assert_eq!(created_newer.artifact.version, 9);
+
+        let older = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            version: Some(3),
+            ..newer.clone()
+        };
+        let response = router
+            .clone()
+            .oneshot(json_request("POST", &path_b, &older)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created_older: CreateArtifactResponse = response_json(response).await?;
+        assert_eq!(created_older.artifact.version, 3);
+        assert!(created_older.artifact.aliases.is_empty());
+
+        let alias_path = "/api/v1/projects/artifact-backfill/artifacts/policy/aliases/latest";
+        let resolved: runloom_protocol::ArtifactRecord = response_json(
+            router
+                .clone()
+                .oneshot(Request::get(alias_path).body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(resolved.id, created_newer.artifact.id);
+
+        let replay = router
+            .clone()
+            .oneshot(json_request("POST", &path_b, &older)?)
+            .await?;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert!(
+            response_json::<CreateArtifactResponse>(replay)
+                .await?
+                .duplicate
+        );
+
+        let occupied = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            ..older.clone()
+        };
+        let response = router
+            .clone()
+            .oneshot(json_request("POST", &path_a, &occupied)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let changed_replay = CreateArtifactRequest {
+            version: Some(10),
+            ..newer.clone()
+        };
+        let response = router
+            .clone()
+            .oneshot(json_request("POST", &path_a, &changed_replay)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let automatic = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            version: None,
+            ..newer.clone()
+        };
+        let response = router
+            .clone()
+            .oneshot(json_request("POST", &path_a, &automatic)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created_automatic: CreateArtifactResponse = response_json(response).await?;
+        assert_eq!(created_automatic.artifact.version, 10);
+        let resolved: runloom_protocol::ArtifactRecord = response_json(
+            router
+                .clone()
+                .oneshot(Request::get(alias_path).body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(resolved.id, created_automatic.artifact.id);
+
+        let low = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            name: "concurrent-policy".to_owned(),
+            version: Some(2),
+            ..newer.clone()
+        };
+        let high = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            version: Some(7),
+            ..low.clone()
+        };
+        let create_low = router.clone().oneshot(json_request("POST", &path_a, &low)?);
+        let create_high = router
+            .clone()
+            .oneshot(json_request("POST", &path_b, &high)?);
+        let (created_low, created_high) = tokio::join!(create_low, create_high);
+        assert_eq!(created_low?.status(), StatusCode::CREATED);
+        assert_eq!(created_high?.status(), StatusCode::CREATED);
+        let resolved: runloom_protocol::ArtifactRecord = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(
+                        "/api/v1/projects/artifact-backfill/artifacts/concurrent-policy/aliases/latest",
+                    )
+                    .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(resolved.id, high.id.expect("explicit artifact ID"));
+
+        let unsafe_version = CreateArtifactRequest {
+            id: Some(runloom_protocol::ArtifactId::new()),
+            name: "unsafe-version".to_owned(),
+            version: Some(runloom_protocol::MAX_JSON_SAFE_INTEGER + 1),
+            ..newer
+        };
+        let response = router
+            .oneshot(json_request("POST", &path_a, &unsafe_version)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn artifact_verification_waits_on_a_bounded_cancelable_io_pool()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let metrics = MetricRuntime::new(MetricStore::new(directory.path().join("metrics")));
+        let blobs = BlobStore::new(directory.path().join("blobs"));
+        blobs.ensure()?;
+        let state = AppState::new(
+            catalog.clone(),
+            metrics,
+            blobs,
+            Arc::new(Mutex::new(ChartAxisExtentCache::default())),
+            Arc::new(RequestTelemetry::from_environment()),
+        );
+        let (run, _) = catalog
+            .create_or_resume_run(
+                "artifact-io",
+                &CreateRunRequest {
+                    id: None,
+                    name: Some("producer".to_owned()),
+                    config: BTreeMap::new(),
+                    resume: ResumePolicy::Never,
+                    sweep_trial_id: None,
+                },
+            )
+            .await?;
+        let held = Arc::clone(&state.artifact_io_permits)
+            .acquire_many_owned(super::ARTIFACT_IO_WORKERS as u32)
+            .await?;
+        let state_for_create = state.clone();
+        let create = tokio::spawn(async move {
+            create_artifact(
+                State(state_for_create),
+                Path(run.id),
+                Json(CreateArtifactRequest {
+                    id: Some(runloom_protocol::ArtifactId::new()),
+                    name: "blocked".to_owned(),
+                    artifact_type: "model".to_owned(),
+                    version: None,
+                    description: None,
+                    metadata: BTreeMap::new(),
+                    aliases: Vec::new(),
+                    entries: Vec::new(),
+                }),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!create.is_finished());
+        create.abort();
+        let _ = create.await;
+        drop(held);
+        assert!(
+            catalog
+                .list_project_artifacts("artifact-io", None, 10)
+                .await?
+                .is_empty()
+        );
+        assert_eq!(
+            state.artifact_io_permits.available_permits(),
+            super::ARTIFACT_IO_WORKERS
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_blob_puts_report_one_idempotent_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let content = b"concurrent-content-addressed-blob";
+        let digest = format!("{:x}", Sha256::digest(content));
+        let path = format!("/api/v1/blobs/{digest}");
+        let upload_a = router.clone().oneshot(
+            Request::put(&path)
+                .header("content-length", content.len())
+                .header("x-runloom-file-name", "policy_%EC%A0%95%EC%B1%85.bin")
+                .body(Body::from(content.as_slice()))?,
+        );
+        let upload_b = router.clone().oneshot(
+            Request::put(&path)
+                .header("content-length", content.len())
+                .header("x-runloom-file-name", "policy_%EC%A0%95%EC%B1%85.bin")
+                .body(Body::from(content.as_slice()))?,
+        );
+        let (upload_a, upload_b) = tokio::join!(upload_a, upload_b);
+        let upload_a = upload_a?;
+        let upload_b = upload_b?;
+        assert!(
+            (upload_a.status() == StatusCode::CREATED && upload_b.status() == StatusCode::OK)
+                || (upload_b.status() == StatusCode::CREATED
+                    && upload_a.status() == StatusCode::OK)
+        );
+        let uploaded_a: BlobUploadResponse = response_json(upload_a).await?;
+        let uploaded_b: BlobUploadResponse = response_json(upload_b).await?;
+        assert_ne!(uploaded_a.duplicate, uploaded_b.duplicate);
+        assert_eq!(uploaded_a.blob.digest, digest);
+        assert_eq!(uploaded_b.blob.digest, digest);
+        assert_eq!(
+            uploaded_a.blob.file_name.as_deref(),
+            Some("policy_정책.bin")
+        );
+        assert_eq!(uploaded_b.blob.file_name, uploaded_a.blob.file_name);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_stream_admission_sheds_and_holds_permits_until_body_drop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let blobs = BlobStore::new(directory.path().join("blobs"));
+        let content = b"bounded-download-stream";
+        let digest = format!("{:x}", Sha256::digest(content));
+        let mut staging = blobs.staging_file()?;
+        std::fs::write(staging.path(), content)?;
+        blobs.install(staging.path(), &digest)?;
+        staging.disarm();
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let response = super::serve_blob(
+            &blobs,
+            &permits,
+            &digest,
+            None,
+            Request::get("/").body(Body::empty())?,
+        )
+        .await
+        .map_err(|error| std::io::Error::other(error.body.message))?;
+        assert_eq!(permits.available_permits(), 0);
+        drop(response);
+        assert_eq!(permits.available_permits(), 1);
+
+        let response = super::serve_blob(
+            &blobs,
+            &permits,
+            &digest,
+            None,
+            Request::get("/").body(Body::empty())?,
+        )
+        .await
+        .map_err(|error| std::io::Error::other(error.body.message))?;
+        assert_eq!(permits.available_permits(), 0);
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await?,
+            content.as_slice()
+        );
+        assert_eq!(permits.available_permits(), 1);
+
+        let held = Arc::clone(&permits).acquire_owned().await?;
+        let error = super::serve_blob(
+            &blobs,
+            &permits,
+            &digest,
+            None,
+            Request::get("/").body(Body::empty())?,
+        )
+        .await
+        .expect_err("a full download pool must shed immediately");
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        drop(held);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_writer_contention_is_retryable_http_overload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = super::HttpError::from(CatalogError::Busy(
+            "(code: 517) database is locked".to_owned(),
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        let error: ApiError = response_json(response).await?;
+        assert_eq!(error.code, "server_busy");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_upload_concurrency_is_bounded_and_cancellation_cleans_staging()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let metrics = MetricRuntime::new(MetricStore::new(directory.path().join("metrics")));
+        let blobs = BlobStore::new(directory.path().join("blobs"));
+        blobs.ensure()?;
+        let state = AppState::new(
+            catalog,
+            metrics,
+            blobs.clone(),
+            Arc::new(Mutex::new(ChartAxisExtentCache::default())),
+            Arc::new(RequestTelemetry::from_environment()),
+        );
+        let held = Arc::clone(&state.blob_upload_permits)
+            .acquire_many_owned((BLOB_UPLOAD_WORKERS - 1) as u32)
+            .await?;
+        let mut uploads = Vec::new();
+        for digest in ["a".repeat(64), "b".repeat(64)] {
+            let state = state.clone();
+            uploads.push(tokio::spawn(async move {
+                let body = Body::from_stream(futures_util::stream::pending::<
+                    Result<Bytes, std::io::Error>,
+                >());
+                upload_blob(State(state), Path(digest), HeaderMap::new(), body).await
+            }));
+        }
+        let staging_dir = blobs.root().join("staging");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let staged = std::fs::read_dir(&staging_dir)
+                    .map(|entries| entries.filter_map(Result::ok).count())
+                    .unwrap_or(0);
+                if staged == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(state.blob_upload_permits.available_permits(), 0);
+
+        for upload in &uploads {
+            upload.abort();
+        }
+        for upload in uploads {
+            let _ = upload.await;
+        }
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let staged = std::fs::read_dir(&staging_dir)
+                    .map(|entries| entries.filter_map(Result::ok).count())
+                    .unwrap_or(0);
+                if staged == 0
+                    && state.blob_upload_permits.available_permits() == BLOB_UPLOAD_WORKERS
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_is_serialized_with_config_and_resource_mutations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let mut run_ids = Vec::new();
+        for name in ["config-race", "resource-race"] {
+            let created: CreateRunResponse = response_json(
+                router
+                    .clone()
+                    .oneshot(json_request(
+                        "POST",
+                        "/api/v1/projects/mutation-races/runs",
+                        &CreateRunRequest {
+                            id: None,
+                            name: Some(name.to_owned()),
+                            config: BTreeMap::new(),
+                            resume: ResumePolicy::Never,
+                            sweep_trial_id: None,
+                        },
+                    )?)
+                    .await?,
+            )
+            .await?;
+            run_ids.push(created.run.id);
+        }
+
+        let finish = router.clone().oneshot(json_request(
+            "POST",
+            &format!("/api/v1/runs/{}/finish", run_ids[0]),
+            &FinishRunRequest {
+                summary: BTreeMap::new(),
+            },
+        )?);
+        let config = router.clone().oneshot(json_request(
+            "PATCH",
+            &format!("/api/v1/runs/{}/config", run_ids[0]),
+            &ConfigUpdateRequest {
+                updates: BTreeMap::from([("seed".to_owned(), 1.into())]),
+                allow_val_change: false,
+            },
+        )?);
+        let (finish, config) = tokio::join!(finish, config);
+        let finish = finish?;
+        let config = config?;
+        assert_eq!(finish.status(), StatusCode::OK);
+        assert!(matches!(
+            config.status(),
+            StatusCode::OK | StatusCode::CONFLICT
+        ));
+
+        let finish = router.clone().oneshot(json_request(
+            "POST",
+            &format!("/api/v1/runs/{}/finish", run_ids[1]),
+            &FinishRunRequest {
+                summary: BTreeMap::new(),
+            },
+        )?);
+        let alert = router.clone().oneshot(json_request(
+            "POST",
+            &format!("/api/v1/runs/{}/alerts", run_ids[1]),
+            &CreateAlertRequest {
+                id: Some(AlertId::new()),
+                title: "race".to_owned(),
+                text: "race".to_owned(),
+                level: AlertLevel::Info,
+                step: None,
+                timestamp_ms: 1,
+            },
+        )?);
+        let (finish, alert) = tokio::join!(finish, alert);
+        let finish = finish?;
+        let alert = alert?;
+        assert_eq!(finish.status(), StatusCode::OK);
+        assert!(matches!(
+            alert.status(),
+            StatusCode::CREATED | StatusCode::CONFLICT
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_trial_binding_and_terminal_mutations_are_serialized()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let sweep: CreateSweepResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/sweep-race/sweeps",
+                    &CreateSweepRequest {
+                        id: None,
+                        name: Some("binding".to_owned()),
+                        method: SweepMethod::Grid,
+                        metric: SweepMetric {
+                            name: "loss".to_owned(),
+                            goal: MetricGoal::Minimize,
+                        },
+                        parameters: BTreeMap::from([(
+                            "seed".to_owned(),
+                            SweepParameter {
+                                values: vec![1.into()],
+                            },
+                        )]),
+                        max_runs: 1,
+                        early_terminate: None,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        let agent_id = "race-agent";
+        let claim: ClaimSweepTrialResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("/api/v1/sweeps/{}/claim", sweep.sweep.id),
+                    &ClaimSweepTrialRequest {
+                        agent_id: agent_id.to_owned(),
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        let trial = claim.trial.expect("grid sweep has one trial");
+
+        let run_request_a = CreateRunRequest {
+            id: Some(RunId::new()),
+            name: Some("trial-a".to_owned()),
+            config: trial.config.clone(),
+            resume: ResumePolicy::Never,
+            sweep_trial_id: Some(trial.id),
+        };
+        let run_request_b = CreateRunRequest {
+            id: Some(RunId::new()),
+            name: Some("trial-b".to_owned()),
+            ..run_request_a.clone()
+        };
+        let bind_a = router.clone().oneshot(json_request(
+            "POST",
+            "/api/v1/projects/sweep-race/runs",
+            &run_request_a,
+        )?);
+        let bind_b = router.clone().oneshot(json_request(
+            "POST",
+            "/api/v1/projects/sweep-race/runs",
+            &run_request_b,
+        )?);
+        let (bind_a, bind_b) = tokio::join!(bind_a, bind_b);
+        let bind_a = bind_a?;
+        let bind_b = bind_b?;
+        assert!(
+            (bind_a.status() == StatusCode::CREATED && bind_b.status() == StatusCode::CONFLICT)
+                || (bind_b.status() == StatusCode::CREATED
+                    && bind_a.status() == StatusCode::CONFLICT)
+        );
+
+        let complete = router.clone().oneshot(json_request(
+            "POST",
+            &format!("/api/v1/sweep-trials/{}/complete", trial.id),
+            &CompleteSweepTrialRequest {
+                agent_id: agent_id.to_owned(),
+                state: SweepTrialState::Completed,
+                metric: Some(0.5),
+            },
+        )?);
+        let heartbeat = router.clone().oneshot(json_request(
+            "POST",
+            &format!("/api/v1/sweep-trials/{}/heartbeat", trial.id),
+            &HeartbeatSweepTrialRequest {
+                agent_id: agent_id.to_owned(),
+            },
+        )?);
+        let (complete, heartbeat) = tokio::join!(complete, heartbeat);
+        let complete = complete?;
+        let heartbeat = heartbeat?;
+        assert_eq!(complete.status(), StatusCode::OK);
+        assert!(matches!(
+            heartbeat.status(),
+            StatusCode::OK | StatusCode::CONFLICT
+        ));
         Ok(())
     }
 
@@ -3856,6 +6050,20 @@ mod tests {
             )
             .await?;
             let trial = claim.trial.expect("available grid trial");
+            let heartbeat: runloom_protocol::SweepTrialRecord = response_json(
+                router
+                    .clone()
+                    .oneshot(json_request(
+                        "POST",
+                        &format!("/api/v1/sweep-trials/{}/heartbeat", trial.id),
+                        &HeartbeatSweepTrialRequest {
+                            agent_id: agent.to_owned(),
+                        },
+                    )?)
+                    .await?,
+            )
+            .await?;
+            assert_eq!(heartbeat.agent_id, agent);
             let run: CreateRunResponse = response_json(
                 router
                     .clone()
@@ -3905,6 +6113,7 @@ mod tests {
                         "POST",
                         &format!("/api/v1/sweep-trials/{}/complete", trial.id),
                         &CompleteSweepTrialRequest {
+                            agent_id: agent.to_owned(),
                             state: terminal_state,
                             metric: Some(loss),
                         },
@@ -3928,6 +6137,19 @@ mod tests {
         )
         .await?;
         assert_eq!(trials.trials.len(), 1);
+        let encoded_trial_page = serde_json::to_value(&trials)?;
+        assert!(encoded_trial_page["trials"][0].get("config").is_none());
+        let trial_detail: runloom_protocol::SweepTrialRecord = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/v1/sweep-trials/{}", trials.trials[0].id))
+                        .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert!(!trial_detail.config.is_empty());
         let trial_cursor = trials.next_before.expect("full trial page has a cursor");
         let next_trials: SweepTrialListResponse = response_json(
             router
@@ -3944,6 +6166,20 @@ mod tests {
         .await?;
         assert_eq!(next_trials.trials.len(), 1);
         assert_ne!(trials.trials[0].id, next_trials.trials[0].id);
+
+        let sweeps: runloom_protocol::SweepListResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/projects/sweep-demo/sweeps?limit=10")
+                        .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(sweeps.sweeps[0].parameter_count, 2);
+        let encoded_sweeps = serde_json::to_value(&sweeps)?;
+        assert!(encoded_sweeps["sweeps"][0].get("parameters").is_none());
         Ok(())
     }
 
@@ -4000,6 +6236,15 @@ mod tests {
             description: Some("Baseline dashboard".to_owned()),
             layout: layout.clone(),
         };
+        let token_before = response_json::<ProjectSummary>(
+            router
+                .clone()
+                .oneshot(Request::get("/api/v1/projects/report-demo").body(Body::empty())?)
+                .await?,
+        )
+        .await?
+        .mutation_token
+        .parse::<u64>()?;
         let created: CreateReportResponse = response_json(
             router
                 .clone()
@@ -4012,6 +6257,16 @@ mod tests {
         )
         .await?;
         assert!(!created.duplicate);
+        let token_after_create = response_json::<ProjectSummary>(
+            router
+                .clone()
+                .oneshot(Request::get("/api/v1/projects/report-demo").body(Body::empty())?)
+                .await?,
+        )
+        .await?
+        .mutation_token
+        .parse::<u64>()?;
+        assert!(token_after_create > token_before);
         let replay: CreateReportResponse = response_json(
             router
                 .clone()
@@ -4027,6 +6282,16 @@ mod tests {
         )
         .await?;
         assert!(replay.duplicate);
+        let token_after_replay = response_json::<ProjectSummary>(
+            router
+                .clone()
+                .oneshot(Request::get("/api/v1/projects/report-demo").body(Body::empty())?)
+                .await?,
+        )
+        .await?
+        .mutation_token
+        .parse::<u64>()?;
+        assert_eq!(token_after_replay, token_after_create);
         let reports: ReportListResponse = response_json(
             router
                 .clone()
@@ -4038,20 +6303,7 @@ mod tests {
         )
         .await?;
         assert_eq!(reports.reports.len(), 1);
-        let report_cursor = reports.next_before.expect("full report page has a cursor");
-        let next_reports: ReportListResponse = response_json(
-            router
-                .clone()
-                .oneshot(
-                    Request::get(format!(
-                        "/api/v1/projects/report-demo/reports?limit=1&before={report_cursor}"
-                    ))
-                    .body(Body::empty())?,
-                )
-                .await?,
-        )
-        .await?;
-        assert!(next_reports.reports.is_empty());
+        assert_eq!(reports.next_before, None);
         let updated: ReportRecord = response_json(
             router
                 .clone()
@@ -4068,6 +6320,16 @@ mod tests {
         )
         .await?;
         assert_eq!(updated.name, "Updated report");
+        let token_after_update = response_json::<ProjectSummary>(
+            router
+                .clone()
+                .oneshot(Request::get("/api/v1/projects/report-demo").body(Body::empty())?)
+                .await?,
+        )
+        .await?
+        .mutation_token
+        .parse::<u64>()?;
+        assert!(token_after_update > token_after_replay);
         let deleted: ReportRecord = response_json(
             router
                 .clone()
@@ -4079,6 +6341,15 @@ mod tests {
         )
         .await?;
         assert_eq!(deleted.id, created.report.id);
+        let token_after_delete = response_json::<ProjectSummary>(
+            router
+                .oneshot(Request::get("/api/v1/projects/report-demo").body(Body::empty())?)
+                .await?,
+        )
+        .await?
+        .mutation_token
+        .parse::<u64>()?;
+        assert!(token_after_delete > token_after_update);
         Ok(())
     }
 
@@ -4554,6 +6825,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_ingest_waiter_does_not_orphan_a_written_segment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let metrics = MetricRuntime::new(MetricStore::new(directory.path().join("metrics")));
+        let blobs = BlobStore::new(directory.path().join("blobs"));
+        blobs.ensure()?;
+        let state = AppState::new(
+            catalog.clone(),
+            metrics.clone(),
+            blobs,
+            Arc::new(Mutex::new(ChartAxisExtentCache::default())),
+            Arc::new(RequestTelemetry::from_environment()),
+        );
+        let (run, _) = catalog
+            .create_or_resume_run(
+                "cancelled-ingest",
+                &CreateRunRequest {
+                    id: None,
+                    name: Some("detached".to_owned()),
+                    config: BTreeMap::new(),
+                    resume: ResumePolicy::Never,
+                    sweep_trial_id: None,
+                },
+            )
+            .await?;
+        let request = IngestBatchRequest {
+            batch_sequence: 1,
+            points: vec![MetricPoint {
+                sequence: 1,
+                step: 0,
+                timestamp_ms: 1,
+                metrics: BTreeMap::from([("loss".to_owned(), 1.0)]),
+            }],
+        };
+        let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
+        let run_mutation = Arc::clone(&state.mutation_locks[mutation_lock_index(&run.id)])
+            .lock_owned()
+            .await;
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let state_for_ingest = state.clone();
+        let waiter = tokio::spawn(async move {
+            let owned_ingest = tokio::spawn(process_ingest_batch(
+                state_for_ingest,
+                run.id,
+                request,
+                run_mutation,
+            ));
+            let _ = started_sender.send(());
+            owned_ingest.await
+        });
+        started_receiver.await?;
+        waiter.abort();
+        let _ = waiter.await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    catalog.batch_status(run.id, 1, &digest).await?,
+                    BatchStatus::Duplicate { .. }
+                ) {
+                    return Ok::<_, runloom_catalog::CatalogError>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        let segments = catalog.list_segments(run.id, None).await?;
+        assert_eq!(segments.len(), 1);
+        assert!(
+            metrics
+                .store()
+                .root()
+                .join(&segments[0].relative_path)
+                .is_file()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_ingests_waiting_for_a_run_lock_do_not_detach()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let metrics = MetricRuntime::new(MetricStore::new(directory.path().join("metrics")));
+        let blobs = BlobStore::new(directory.path().join("blobs"));
+        blobs.ensure()?;
+        let state = AppState::new(
+            catalog.clone(),
+            metrics,
+            blobs,
+            Arc::new(Mutex::new(ChartAxisExtentCache::default())),
+            Arc::new(RequestTelemetry::from_environment()),
+        );
+        let (run, _) = catalog
+            .create_or_resume_run(
+                "cancelled-queue",
+                &CreateRunRequest {
+                    id: None,
+                    name: Some("queued".to_owned()),
+                    config: BTreeMap::new(),
+                    resume: ResumePolicy::Never,
+                    sweep_trial_id: None,
+                },
+            )
+            .await?;
+        let request = IngestBatchRequest {
+            batch_sequence: 1,
+            points: vec![MetricPoint {
+                sequence: 1,
+                step: 0,
+                timestamp_ms: 1,
+                metrics: BTreeMap::from([("loss".to_owned(), 1.0)]),
+            }],
+        };
+        let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
+        let held_lock = Arc::clone(&state.mutation_locks[mutation_lock_index(&run.id)])
+            .lock_owned()
+            .await;
+        let mut waiters = Vec::new();
+        for _ in 0..64 {
+            let state = state.clone();
+            let request = request.clone();
+            waiters.push(tokio::spawn(async move {
+                ingest_batch(State(state), Path(run.id), Json(request)).await
+            }));
+        }
+        tokio::task::yield_now().await;
+        for waiter in &waiters {
+            waiter.abort();
+        }
+        for waiter in waiters {
+            let _ = waiter.await;
+        }
+        drop(held_lock);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            catalog.batch_status(run.id, 1, &digest).await?,
+            BatchStatus::Missing
+        );
+        assert!(catalog.list_segments(run.id, None).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_ingest_preserves_registered_segment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let metrics_root = directory.path().join("metrics");
+        let router = app(catalog.clone(), MetricStore::new(&metrics_root));
+        let created: CreateRunResponse = response_json(
+            router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/projects/concurrent-ingest/runs",
+                    &CreateRunRequest {
+                        id: None,
+                        name: Some("duplicate-race".to_owned()),
+                        config: BTreeMap::new(),
+                        resume: ResumePolicy::Never,
+                        sweep_trial_id: None,
+                    },
+                )?)
+                .await?,
+        )
+        .await?;
+        let batch = IngestBatchRequest {
+            batch_sequence: 1,
+            points: (1..=runloom_protocol::MAX_BATCH_POINTS as u64)
+                .map(|sequence| MetricPoint {
+                    sequence,
+                    step: sequence - 1,
+                    timestamp_ms: sequence as i64,
+                    metrics: BTreeMap::from([("loss".to_owned(), sequence as f64)]),
+                })
+                .collect(),
+        };
+        let path = format!("/api/v1/runs/{}/batches", created.run.id);
+        let first = router.clone().oneshot(json_request("POST", &path, &batch)?);
+        let second = router.clone().oneshot(json_request("POST", &path, &batch)?);
+        let (first, second) = tokio::join!(first, second);
+        let first = first?;
+        let second = second?;
+        let mut statuses = [first.status(), second.status()];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::CREATED]);
+        let first: IngestBatchResponse = response_json(first).await?;
+        let second: IngestBatchResponse = response_json(second).await?;
+        assert_ne!(first.duplicate, second.duplicate);
+
+        let segments = catalog.list_segments(created.run.id, None).await?;
+        assert_eq!(segments.len(), 1);
+        assert!(metrics_root.join(&segments[0].relative_path).is_file());
+        let history: HistoryResponse = response_json(
+            router
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/runs/{}/history?key=loss&limit=1024",
+                        created.run.id
+                    ))
+                    .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(history.sequence.len(), runloom_protocol::MAX_BATCH_POINTS);
+        assert_eq!(history.sequence.last(), Some(&1024));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn lifecycle_is_idempotent_and_history_is_columnar()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
@@ -4663,7 +7148,11 @@ mod tests {
                     sequence: 1,
                     step: 10,
                     timestamp_ms: 1_000,
-                    metrics: BTreeMap::from([("loss".to_owned(), 2.0), ("reward".to_owned(), 3.0)]),
+                    metrics: BTreeMap::from([
+                        ("comma,key".to_owned(), 4.0),
+                        ("loss".to_owned(), 2.0),
+                        ("reward".to_owned(), 3.0),
+                    ]),
                 },
                 MetricPoint {
                     sequence: 2,
@@ -4768,11 +7257,38 @@ mod tests {
         let values: RichValueListResponse = response_json(
             router
                 .clone()
-                .oneshot(Request::get(format!("{rich_path}?limit=10")).body(Body::empty())?)
+                .oneshot(
+                    Request::get(format!("{rich_path}?key=rollout%2Fvideo&limit=10"))
+                        .body(Body::empty())?,
+                )
                 .await?,
         )
         .await?;
-        assert_eq!(values.values, vec![created_value.value]);
+        assert_eq!(values.values.len(), 1);
+        assert_eq!(values.values[0].id, created_value.value.id);
+        assert_eq!(values.values[0].blob, created_value.value.blob);
+        assert_eq!(values.next_before, None);
+        let rich_keys: RichValueKeyListResponse = response_json(
+            router
+                .clone()
+                .oneshot(Request::get(format!("{rich_path}/keys?limit=10")).body(Body::empty())?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(rich_keys.keys.len(), 1);
+        assert_eq!(rich_keys.keys[0].key, "rollout/video");
+        assert_eq!(rich_keys.keys[0].count, 1);
+        let loaded_value: runloom_protocol::RichValueRecord = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/v1/rich-values/{}", created_value.value.id))
+                        .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(loaded_value, created_value.value);
 
         let response = router
             .clone()
@@ -4784,13 +7300,47 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.headers()["content-type"], "video/mp4");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(
+            response.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        let expected_etag = format!("\"sha256:{blob_digest}\"");
+        assert_eq!(response.headers()["etag"], expected_etag.as_str());
         assert_eq!(to_bytes(response.into_body(), 64).await?, &video[7..=11]);
+        let not_modified = router
+            .clone()
+            .oneshot(
+                Request::get(format!("{blob_path}?mime=video%2Fmp4"))
+                    .header("if-none-match", &expected_etag)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(not_modified.headers()["etag"], expected_etag.as_str());
+        assert_eq!(
+            not_modified.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(to_bytes(not_modified.into_body(), 1).await?.is_empty());
+        let unsafe_mime = router
+            .clone()
+            .oneshot(Request::get(format!("{blob_path}?mime=text%2Fhtml")).body(Body::empty())?)
+            .await?;
+        assert_eq!(unsafe_mime.status(), StatusCode::OK);
+        assert_eq!(
+            unsafe_mime.headers()["content-type"],
+            "application/octet-stream"
+        );
+        assert_eq!(unsafe_mime.headers()["content-disposition"], "attachment");
+        assert_eq!(unsafe_mime.headers()["x-content-type-options"], "nosniff");
 
         let artifact_path = format!("/api/v1/runs/{}/artifacts", created.run.id);
         let artifact_request = CreateArtifactRequest {
             id: Some(runloom_protocol::ArtifactId::new()),
             name: "policy".to_owned(),
             artifact_type: "model".to_owned(),
+            version: None,
             description: Some("trained policy".to_owned()),
             metadata: BTreeMap::from([("framework".to_owned(), "jax".into())]),
             aliases: vec!["latest".to_owned()],
@@ -4877,12 +7427,12 @@ mod tests {
         )
         .await?;
         assert_eq!(project_artifacts.artifacts.len(), 2);
-        let lineage: runloom_protocol::ArtifactLineageResponse = response_json(
+        let input_lineage: runloom_protocol::ArtifactLineageResponse = response_json(
             router
                 .clone()
                 .oneshot(
                     Request::get(format!(
-                        "/api/v1/artifacts/{}/lineage",
+                        "/api/v1/artifacts/{}/lineage?relation=input&limit=10",
                         version_zero.artifact.id
                     ))
                     .body(Body::empty())?,
@@ -4890,8 +7440,23 @@ mod tests {
                 .await?,
         )
         .await?;
-        assert_eq!(lineage.input_runs, vec![created.run.id]);
-        assert_eq!(lineage.output_runs, vec![created.run.id]);
+        assert_eq!(input_lineage.relation, ArtifactRelation::Input);
+        assert_eq!(input_lineage.runs[0].id, created.run.id);
+        let output_lineage: runloom_protocol::ArtifactLineageResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/artifacts/{}/lineage?relation=output&limit=10",
+                        version_zero.artifact.id
+                    ))
+                    .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(output_lineage.relation, ArtifactRelation::Output);
+        assert_eq!(output_lineage.runs[0].id, created.run.id);
         let response = router
             .clone()
             .oneshot(
@@ -4998,7 +7563,8 @@ mod tests {
                 .await?,
         )
         .await?;
-        assert_eq!(traces.spans, vec![created_trace.span.clone()]);
+        assert_eq!(traces.spans.len(), 1);
+        assert_eq!(traces.spans[0].id, created_trace.span.id);
         let loaded_trace: TraceSpanRecord = response_json(
             router
                 .clone()
@@ -5027,7 +7593,10 @@ mod tests {
         assert_eq!(resumed.next_sequence, 3);
         assert_eq!(resumed.next_step, 13);
 
-        let history_path = format!("/api/v1/runs/{}/history?keys=loss&limit=1", created.run.id);
+        let history_path = format!(
+            "/api/v1/runs/{}/history?key=loss&key=comma%2Ckey&limit=1",
+            created.run.id
+        );
         let response = router
             .clone()
             .oneshot(Request::get(history_path).body(Body::empty())?)
@@ -5035,12 +7604,13 @@ mod tests {
         let history: HistoryResponse = response_json(response).await?;
         assert_eq!(history.sequence, vec![1]);
         assert_eq!(history.metrics["loss"], vec![Some(2.0)]);
+        assert_eq!(history.metrics["comma,key"], vec![Some(4.0)]);
         assert_eq!(history.next_after, Some(1));
         assert!(!history.sampled);
         assert_eq!(history.source_points, None);
 
         let sampled_path = format!(
-            "/api/v1/runs/{}/history?keys=loss&max_points=2",
+            "/api/v1/runs/{}/history?key=loss&max_points=2",
             created.run.id
         );
         let response = router
@@ -5054,7 +7624,7 @@ mod tests {
         assert!(sampled.sampled);
 
         let invalid_path = format!(
-            "/api/v1/runs/{}/history?keys=loss&limit=2&max_points=2",
+            "/api/v1/runs/{}/history?key=loss&limit=2&max_points=2",
             created.run.id
         );
         let response = router
@@ -5062,6 +7632,33 @@ mod tests {
             .oneshot(Request::get(invalid_path).body(Body::empty())?)
             .await?;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/runs/{}/history?key=loss&unknown=1",
+                    created.run.id
+                ))
+                .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        for query in [
+            "key=loss&unknown=1",
+            "key=loss&max_buckets=10&max_buckets=20",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/runs/{}/chart-history?{query}",
+                        created.run.id
+                    ))
+                    .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
 
         let response = router
             .clone()
@@ -5074,9 +7671,11 @@ mod tests {
             .oneshot(Request::get("/api/v1/projects/robotics/runs").body(Body::empty())?)
             .await?;
         let runs: RunListResponse = response_json(response).await?;
-        assert_eq!(runs.runs[0].summary["loss"], 1.0);
-        assert_eq!(runs.runs[0].summary["status"], "running");
-        assert_eq!(runs.runs[0].config["seed"], 7);
+        assert_eq!(runs.runs[0].id, created.run.id);
+        assert_eq!(runs.runs[0].metric_revision, 1);
+        let encoded_runs = serde_json::to_value(&runs)?;
+        assert!(encoded_runs["runs"][0].get("summary").is_none());
+        assert!(encoded_runs["runs"][0].get("config").is_none());
         let response = router
             .clone()
             .oneshot(
@@ -5085,7 +7684,35 @@ mod tests {
             )
             .await?;
         let keys: MetricKeyListResponse = response_json(response).await?;
-        assert_eq!(keys.keys, vec!["loss", "reward"]);
+        assert_eq!(keys.keys, vec!["comma,key", "loss", "reward"]);
+        assert_eq!(keys.next_after, None);
+        let first_keys: MetricKeyListResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/v1/runs/{}/metrics?limit=2", created.run.id))
+                        .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(first_keys.keys, vec!["comma,key", "loss"]);
+        assert_eq!(first_keys.next_after.as_deref(), Some("loss"));
+        let final_keys: MetricKeyListResponse = response_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/runs/{}/metrics?limit=2&after=loss",
+                        created.run.id
+                    ))
+                    .body(Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(final_keys.keys, vec!["reward"]);
+        assert_eq!(final_keys.next_after, None);
 
         let finish_path = format!("/api/v1/runs/{}/finish", created.run.id);
         let response = router
@@ -5178,7 +7805,7 @@ mod tests {
             .await?;
         let created: CreateRunResponse = response_json(response).await?;
         let batch_path = format!("/api/v1/runs/{}/batches", created.run.id);
-        for batch_index in 0..3u64 {
+        for batch_index in 0..4u64 {
             let first_sequence = batch_index * 2 + 1;
             let batch = IngestBatchRequest {
                 batch_sequence: first_sequence,
@@ -5200,7 +7827,7 @@ mod tests {
                 .await?;
             assert_eq!(response.status(), StatusCode::CREATED);
         }
-        let history_path = format!("/api/v1/runs/{}/history?keys=loss&limit=10", created.run.id);
+        let history_path = format!("/api/v1/runs/{}/history?key=loss&limit=10", created.run.id);
         let before: HistoryResponse = response_json(
             router
                 .clone()
@@ -5221,6 +7848,7 @@ mod tests {
                     target_rows: 16,
                     max_input_segments: 16,
                     retirement_batch: 16,
+                    max_consecutive_passes: 8,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -5232,7 +7860,7 @@ mod tests {
                 .is_err(),
             "manifest replacement must wait for active history snapshots"
         );
-        assert_eq!(catalog.list_segments(created.run.id, None).await?.len(), 3);
+        assert_eq!(catalog.list_segments(created.run.id, None).await?.len(), 4);
         drop(snapshot);
         let outcome = compaction.await??;
         let after: HistoryResponse = response_json(
@@ -5244,7 +7872,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            CompactionOutcome::SegmentsCompacted { inputs: 3, rows: 6 }
+            CompactionOutcome::SegmentsCompacted { inputs: 4, rows: 8 }
         );
         assert_eq!(after, before);
         assert_eq!(catalog.list_segments(created.run.id, None).await?.len(), 1);
@@ -5254,6 +7882,120 @@ mod tests {
                 .iter()
                 .all(|source| !metrics_root.join(&source.relative_path).exists())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_compaction_removes_only_its_unregistered_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
+        let metrics_root = directory.path().join("metrics");
+        let metrics = MetricRuntime::new(MetricStore::new(&metrics_root));
+        let (run, resumed) = catalog
+            .create_or_resume_run(
+                "compaction-cancel",
+                &CreateRunRequest {
+                    id: None,
+                    name: Some("cancelled-output".to_owned()),
+                    config: BTreeMap::new(),
+                    resume: ResumePolicy::Never,
+                    sweep_trial_id: None,
+                },
+            )
+            .await?;
+        assert!(!resumed);
+        for batch_index in 0..4u64 {
+            let first_sequence = batch_index * 2 + 1;
+            let batch = IngestBatchRequest {
+                batch_sequence: batch_index + 1,
+                points: (0..2)
+                    .map(|offset| {
+                        let sequence = first_sequence + offset;
+                        MetricPoint {
+                            sequence,
+                            step: sequence - 1,
+                            timestamp_ms: sequence as i64,
+                            metrics: BTreeMap::from([("loss".to_owned(), sequence as f64)]),
+                        }
+                    })
+                    .collect(),
+            };
+            let digest = format!("{:064x}", batch_index + 1);
+            let written = metrics
+                .store()
+                .write_batch(run.project_id, run.id, &digest, &batch)?;
+            catalog
+                .register_batch(
+                    run.id,
+                    batch.batch_sequence,
+                    &digest,
+                    &SegmentManifest {
+                        id: written.id,
+                        signature: written.signature,
+                        relative_path: written.relative_path,
+                        first_sequence: written.first_sequence,
+                        last_sequence: written.last_sequence,
+                        row_count: written.row_count,
+                        byte_size: written.byte_size,
+                    },
+                    &BTreeMap::new(),
+                )
+                .await?;
+        }
+        let sources = catalog.list_segments(run.id, None).await?;
+        let segment_directory = metrics_root
+            .join(&sources[0].relative_path)
+            .parent()
+            .ok_or_else(|| std::io::Error::other("segment path has no parent"))?
+            .to_path_buf();
+        let snapshot = metrics.read_snapshot().await;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_catalog = catalog.clone();
+        let task_metrics = metrics.clone();
+        let task_cancelled = Arc::clone(&cancelled);
+        let task = tokio::spawn(async move {
+            compact_once(
+                &task_catalog,
+                &task_metrics,
+                CompactionConfig {
+                    interval: Duration::from_secs(1),
+                    target_rows: 16,
+                    max_input_segments: 16,
+                    retirement_batch: 16,
+                    max_consecutive_passes: 8,
+                },
+                task_cancelled,
+            )
+            .await
+        });
+        let mut output_observed = false;
+        for _ in 0..100 {
+            output_observed = std::fs::read_dir(&segment_directory)?.any(|entry| {
+                entry.is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with("compact-"))
+            });
+            if output_observed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(output_observed, "compaction output was not installed");
+        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(snapshot);
+        let result = task.await?;
+        assert!(matches!(
+            result,
+            Err(CompactionError::Storage(StorageError::Cancelled))
+        ));
+        assert_eq!(catalog.list_segments(run.id, None).await?.len(), 4);
+        assert!(
+            sources
+                .iter()
+                .all(|source| { metrics_root.join(&source.relative_path).is_file() })
+        );
+        assert!(!std::fs::read_dir(segment_directory)?.any(|entry| {
+            entry.is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with("compact-"))
+        }));
         Ok(())
     }
 

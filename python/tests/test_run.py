@@ -8,8 +8,36 @@ import uuid
 import httpx
 import pytest
 
-from runloom import Artifact, Histogram, Image, Table
-from runloom.run import DeliveryError, create_run, sync_spool
+from runloom import Artifact, Audio, Histogram, Image, Table
+from runloom import _spool as spool_module
+from runloom._protocol import encode_json_request
+from runloom.rich import PreparedRichValue, RichValue
+from runloom.run import (
+    _SUMMARY_CHECKPOINT_BYTE_INTERVAL,
+    _SUMMARY_CHECKPOINT_RECORD_INTERVAL,
+    DeliveryError,
+    _DeliveryWorker,
+    create_run,
+    sync_spool,
+)
+
+_METRIC_REQUEST_BUDGET = 1_750_000
+
+
+def _summary_fields(
+    *,
+    explicit: dict | None = None,
+    metric: dict | None = None,
+    truncated: bool = False,
+) -> dict:
+    explicit = dict(explicit or {})
+    metric = dict(metric or {})
+    return {
+        "explicit_summary": explicit,
+        "metric_summary": metric,
+        "summary": {**metric, **explicit},
+        "summary_truncated": truncated,
+    }
 
 
 def test_online_run_batches_nested_metrics_without_blocking_on_upload(tmp_path) -> None:
@@ -26,6 +54,7 @@ def test_online_run_batches_nested_metrics_without_blocking_on_upload(tmp_path) 
                     "run": {
                         "id": body["id"],
                         "name": "training",
+                        **_summary_fields(),
                     },
                     "resumed": False,
                     "next_sequence": 1,
@@ -40,15 +69,32 @@ def test_online_run_batches_nested_metrics_without_blocking_on_upload(tmp_path) 
             return httpx.Response(
                 201,
                 json={
-                    "run_id": "ignored",
+                    "run_id": "019c1234-5678-7000-8000-000000000001",
                     "batch_sequence": batch["batch_sequence"],
                     "accepted_points": len(batch["points"]),
                     "duplicate": False,
                     "metric_revision": 1,
+                    "stop_requested": False,
                 },
             )
         if request.url.path.endswith("/finish"):
-            return httpx.Response(200, json={"run": {"state": "finished"}})
+            return httpx.Response(
+                200,
+                json={
+                    "run": {
+                        "id": "019c1234-5678-7000-8000-000000000001",
+                        "state": "finished",
+                        **_summary_fields(
+                            metric={
+                                key: value
+                                for batch in uploaded
+                                for point in batch["points"]
+                                for key, value in point["metrics"].items()
+                            }
+                        ),
+                    }
+                },
+            )
         raise AssertionError(f"unexpected request: {request.url}")
 
     run = create_run(
@@ -103,13 +149,14 @@ def test_offline_run_keeps_a_durable_journal(tmp_path) -> None:
     assert event["metrics"] == {"loss": 1.5}
     assert metadata["finished"] is True
     assert metadata["config"] == {"optimizer": "adam", "seed": 8}
-    assert metadata["summary"] == {
+    assert {**metadata["metric_summary"], **metadata["explicit_summary"]} == {
         "best": {"score": 1.5, "tags": ["stable", None]},
         "loss": 1.5,
         "status": "offline",
     }
 
     requests: list[str] = []
+    finish_summaries: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request.url.path)
@@ -117,7 +164,7 @@ def test_offline_run_keeps_a_durable_journal(tmp_path) -> None:
             return httpx.Response(
                 201,
                 json={
-                    "run": {"name": "training"},
+                    "run": {"id": run.id, "name": "training"},
                     "resumed": False,
                     "next_sequence": 1,
                     "next_step": 0,
@@ -133,10 +180,12 @@ def test_offline_run_keeps_a_durable_journal(tmp_path) -> None:
                     "accepted_points": len(batch["points"]),
                     "duplicate": False,
                     "metric_revision": 1,
+                    "stop_requested": False,
                 },
             )
         if request.url.path.endswith("/finish"):
-            return httpx.Response(200, json={"run": {"state": "finished"}})
+            finish_summaries.append(json.loads(request.content)["summary"])
+            return httpx.Response(200, json={"run": {"id": run.id, "state": "finished"}})
         raise AssertionError(f"unexpected request: {request.url}")
 
     synced_id = sync_spool(run_directory, transport=httpx.MockTransport(handler), timeout=2)
@@ -145,6 +194,12 @@ def test_offline_run_keeps_a_durable_journal(tmp_path) -> None:
         "/api/v1/projects/robotics/runs",
         f"/api/v1/runs/{run.id}/batches",
         f"/api/v1/runs/{run.id}/finish",
+    ]
+    assert finish_summaries == [
+        {
+            "best": {"score": 1.5, "tags": ["stable", None]},
+            "status": "offline",
+        }
     ]
     assert (
         int((run_directory / "ack").read_text()) == (run_directory / "events.jsonl").stat().st_size
@@ -164,6 +219,533 @@ def test_disabled_run_does_not_touch_the_spool(tmp_path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def test_run_id_validation_prevents_spool_traversal_and_canonicalizes_uuid(tmp_path) -> None:
+    spool_root = tmp_path / "spool"
+    with pytest.raises(ValueError, match="valid UUID"):
+        create_run(
+            project="robotics",
+            run_id="../../escaped",
+            mode="offline",
+            spool_root=spool_root,
+        )
+    with pytest.raises(DeliveryError, match="canonical UUID"):
+        spool_module._Spool(spool_root, "../../escaped")
+
+    assert not spool_root.exists()
+    assert not (tmp_path / "escaped").exists()
+
+    uppercase = "019C1234-5678-7000-8000-000000000029"
+    run = create_run(
+        project="robotics",
+        run_id=uppercase,
+        mode="offline",
+        spool_root=spool_root,
+    )
+    run.finish()
+    assert run.id == uppercase.lower()
+    assert (spool_root / uppercase.lower()).is_dir()
+
+
+def test_sync_rejects_a_noncanonical_spool_directory_before_reading_metadata(tmp_path) -> None:
+    directory = tmp_path / "not-a-run-id"
+    directory.mkdir()
+    (directory / "run.json").write_text("{}")
+
+    with pytest.raises(DeliveryError, match="canonical UUID"):
+        sync_spool(directory)
+
+
+def test_spool_rejects_a_symlinked_journal_without_touching_its_target(tmp_path) -> None:
+    run_id = "019c1234-5678-7000-8000-000000000030"
+    run_directory = tmp_path / run_id
+    run_directory.mkdir()
+    target = tmp_path / "outside.jsonl"
+    target.write_bytes(b"outside\n")
+    (run_directory / "events.jsonl").symlink_to(target)
+
+    with pytest.raises(DeliveryError, match="regular non-symbolic file"):
+        spool_module._Spool(tmp_path, run_id)
+
+    assert target.read_bytes() == b"outside\n"
+
+
+def test_spool_bounds_metadata_delivery_and_journal_recovery_reads(tmp_path) -> None:
+    spool = spool_module._Spool(tmp_path, "019c1234-5678-7000-8000-000000000031")
+    spool.metadata_path.write_bytes(b"{" + b" " * spool_module._MAX_RUN_METADATA_BYTES)
+    with pytest.raises(DeliveryError, match="spool file exceeds"):
+        spool.read_metadata()
+
+    spool.append({"sequence": 1, "step": 0, "timestamp_ms": 0, "metrics": {"x": 1}})
+    spool.delivery_path.write_bytes(b"{" + b" " * spool_module._MAX_DELIVERY_BYTES)
+    with pytest.raises(DeliveryError, match="spool file exceeds"):
+        spool.read_batch(1, request_byte_budget=_METRIC_REQUEST_BUDGET)
+
+    spool.delivery_path.unlink()
+    oversized = b"x" * (spool_module._MAX_JOURNAL_RECORD_BYTES + 1) + b"\n"
+    spool.events_path.write_bytes(oversized)
+    with pytest.raises(DeliveryError, match="journal record exceeds"):
+        spool.read_batch(1, request_byte_budget=_METRIC_REQUEST_BUDGET)
+    with pytest.raises(DeliveryError, match="journal record exceeds"):
+        spool.last_point()
+    with pytest.raises(DeliveryError, match="journal record exceeds"):
+        spool.recover_summary(
+            {},
+            False,
+            0,
+            max_tail_records=1,
+            max_tail_bytes=len(oversized),
+        )
+
+
+def test_spool_rejects_an_incomplete_journal_record(tmp_path) -> None:
+    spool = spool_module._Spool(tmp_path, "019c1234-5678-7000-8000-000000000032")
+    spool.events_path.write_bytes(b'{"sequence":1}')
+
+    with pytest.raises(DeliveryError, match="journal record is incomplete"):
+        spool.read_batch(1, request_byte_budget=_METRIC_REQUEST_BUDGET)
+
+    spool.events_path.write_bytes(b"\xff\n")
+    with pytest.raises(DeliveryError, match="invalid journal event"):
+        spool.read_batch(1, request_byte_budget=_METRIC_REQUEST_BUDGET)
+
+
+def test_dense_metric_points_validate_before_the_durable_append(tmp_path) -> None:
+    astral_character = "\U0001f600"
+    dense = {f"{index:03d}{astral_character * 63}x": index for index in range(256)}
+    run = create_run(
+        project="robotics",
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+
+    run.log(dense)
+
+    event = json.loads((tmp_path / run.id / "events.jsonl").read_text())
+    assert len(event["metrics"]) == 256
+    assert all(len(key.encode("utf-8")) == 256 for key in event["metrics"])
+    run.finish()
+
+
+@pytest.mark.parametrize(
+    ("metrics", "message"),
+    [
+        ({f"metric-{index}": index for index in range(257)}, "1 to 256"),
+        ({"k" * 257: 1.0}, "1 to 256 non-control bytes"),
+        ({"bad\u0085key": 1.0}, "non-control bytes"),
+        ({"loss": float("nan")}, "finite"),
+        ({"loss": 10**10_000}, "finite"),
+    ],
+)
+def test_invalid_metric_points_never_touch_the_journal(tmp_path, metrics, message) -> None:
+    run = create_run(
+        project="robotics",
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        run.log(metrics)
+
+    assert (tmp_path / run.id / "events.jsonl").read_bytes() == b""
+    run.finish()
+
+
+def test_metric_delivery_splits_on_the_exact_encoded_request_budget(tmp_path) -> None:
+    spool = spool_module._Spool(tmp_path, "019c1234-5678-7000-8000-000000000033")
+    points = [
+        {
+            "sequence": sequence,
+            "step": sequence - 1,
+            "timestamp_ms": sequence,
+            "metrics": {f"{index:03d}-{'m' * 180}": float(sequence) for index in range(100)},
+        }
+        for sequence in range(1, 6)
+    ]
+    for point in points:
+        spool.append(point)
+    two_point_request = {
+        "batch_sequence": points[0]["sequence"],
+        "points": points[:2],
+    }
+    budget = len(encode_json_request(two_point_request))
+
+    first, first_offset = spool.read_batch(1_024, request_byte_budget=budget)
+    reopened = spool_module._Spool(
+        tmp_path,
+        "019c1234-5678-7000-8000-000000000033",
+    )
+    replay, replay_offset = reopened.read_batch(1, request_byte_budget=budget)
+
+    assert first == points[:2]
+    assert replay == first
+    assert replay_offset == first_offset
+    assert len(encode_json_request(two_point_request)) == budget
+    delivery = json.loads(spool.delivery_path.read_text())
+    assert delivery["request_bytes"] == budget
+    reopened.acknowledge(first_offset)
+    second, _ = reopened.read_batch(1_024, request_byte_budget=budget)
+    assert second == points[2:4]
+
+
+def test_single_metric_event_over_the_delivery_budget_is_not_persisted_as_a_boundary(
+    tmp_path,
+) -> None:
+    spool = spool_module._Spool(tmp_path, "019c1234-5678-7000-8000-000000000034")
+    spool.append(
+        {
+            "sequence": 1,
+            "step": 0,
+            "timestamp_ms": 1,
+            "metrics": {"loss": 1.0},
+        }
+    )
+
+    with pytest.raises(DeliveryError, match="request byte budget"):
+        spool.read_batch(1, request_byte_budget=32)
+
+    assert not spool.delivery_path.exists()
+    assert not spool.ack_path.exists()
+
+
+def test_summary_recovery_rejects_a_tail_beyond_its_record_bound(tmp_path) -> None:
+    spool = spool_module._Spool(tmp_path, "019c1234-5678-7000-8000-000000000038")
+    for sequence in range(1, _SUMMARY_CHECKPOINT_RECORD_INTERVAL + 2):
+        spool.append(
+            {
+                "sequence": sequence,
+                "step": sequence - 1,
+                "timestamp_ms": sequence,
+                "metrics": {"loss": float(sequence)},
+            }
+        )
+
+    with pytest.raises(DeliveryError, match="exceeds 128 records"):
+        spool.recover_summary(
+            {},
+            False,
+            0,
+            max_tail_records=_SUMMARY_CHECKPOINT_RECORD_INTERVAL,
+            max_tail_bytes=spool.events_path.stat().st_size,
+        )
+
+
+def test_delivery_worker_retries_the_identical_durable_metric_request(tmp_path) -> None:
+    spool = spool_module._Spool(tmp_path, "019c1234-5678-7000-8000-000000000037")
+    for sequence in range(1, 4):
+        spool.append(
+            {
+                "sequence": sequence,
+                "step": sequence - 1,
+                "timestamp_ms": sequence,
+                "metrics": {"loss": 1.0 / sequence},
+            }
+        )
+    attempts: list[bytes] = []
+
+    class RetryClient:
+        def ingest_batch(self, run_id, request):
+            attempts.append(encode_json_request(request))
+            if len(attempts) == 1:
+                raise RuntimeError("response lost after commit")
+            return {"stop_requested": False}
+
+    worker = _DeliveryWorker(
+        client=RetryClient(),  # type: ignore[arg-type]
+        run_id="019c1234-5678-7000-8000-000000000037",
+        spool=spool,
+        batch_size=3,
+        flush_interval=0,
+        stop_requested=lambda: None,
+    )
+    worker.start()
+    worker.stop()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert attempts[0] == attempts[1]
+    assert len(attempts[0]) <= _METRIC_REQUEST_BUDGET
+    assert not spool.pending_metrics()
+    assert not spool.delivery_path.exists()
+
+
+def test_summary_resume_replays_a_bounded_tail_without_consulting_ack(tmp_path) -> None:
+    run_id = "019c1234-5678-7000-8000-000000000035"
+    first = create_run(
+        project="robotics",
+        run_id=run_id,
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+    first.log({"loss": 1.0, "reward": 1.0})
+    first.summary["loss"] = 99.0
+    checkpoint = json.loads((tmp_path / run_id / "run.json").read_text())["summary_event_offset"]
+    first.log({"loss": 2.0, "reward": 2.0})
+    journal_size = (tmp_path / run_id / "events.jsonl").stat().st_size
+    (tmp_path / run_id / "ack").write_text(str(journal_size))
+    del first
+
+    resumed = create_run(
+        project="robotics",
+        run_id=run_id,
+        mode="offline",
+        resume="allow",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+
+    assert checkpoint < journal_size
+    assert resumed.summary.to_dict() == {"loss": 99.0, "reward": 2.0}
+    assert (
+        json.loads((tmp_path / run_id / "run.json").read_text())["summary_event_offset"]
+        == journal_size
+    )
+    resumed.finish()
+
+
+def test_metric_summary_checkpoint_interval_bounds_crash_recovery_tail(tmp_path) -> None:
+    run = create_run(
+        project="robotics",
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+    metadata_path = tmp_path / run.id / "run.json"
+    for step in range(_SUMMARY_CHECKPOINT_RECORD_INTERVAL - 1):
+        run.log({"loss": float(step)})
+    assert json.loads(metadata_path.read_text())["summary_event_offset"] == 0
+
+    run.log({"loss": 999.0})
+
+    assert (
+        json.loads(metadata_path.read_text())["summary_event_offset"]
+        == (tmp_path / run.id / "events.jsonl").stat().st_size
+    )
+    run.finish()
+
+
+def test_metric_summary_byte_interval_checkpoints_before_the_record_limit(tmp_path) -> None:
+    run = create_run(
+        project="robotics",
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+    metadata_path = tmp_path / run.id / "run.json"
+    journal_path = tmp_path / run.id / "events.jsonl"
+    dense = {f"{index:03d}-{'b' * 252}": float(index) for index in range(256)}
+    record_count = 0
+
+    while json.loads(metadata_path.read_text())["summary_event_offset"] == 0:
+        run.log(dense)
+        record_count += 1
+        assert record_count < _SUMMARY_CHECKPOINT_RECORD_INTERVAL
+
+    assert journal_path.stat().st_size >= _SUMMARY_CHECKPOINT_BYTE_INTERVAL
+    assert (
+        json.loads(metadata_path.read_text())["summary_event_offset"] == journal_path.stat().st_size
+    )
+    run.finish()
+
+
+@pytest.mark.parametrize("offset", [None, 1, 10**9])
+def test_resume_rejects_a_malformed_summary_event_offset(tmp_path, offset) -> None:
+    run_id = "019c1234-5678-7000-8000-000000000036"
+    run = create_run(
+        project="robotics",
+        run_id=run_id,
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+    run.log({"loss": 1.0})
+    metadata_path = tmp_path / run_id / "run.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["summary_event_offset"] = offset
+    metadata_path.write_text(json.dumps(metadata))
+    del run
+
+    with pytest.raises(DeliveryError, match="summary event offset"):
+        create_run(
+            project="robotics",
+            run_id=run_id,
+            mode="offline",
+            resume="allow",
+            spool_root=tmp_path,
+            system_monitor_interval=0,
+        )
+
+
+def test_resume_does_not_fall_back_to_the_pre_snapshot_spool_format(tmp_path) -> None:
+    run_id = "019c1234-5678-7000-8000-000000000039"
+    run = create_run(
+        project="robotics",
+        run_id=run_id,
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+    metadata_path = tmp_path / run_id / "run.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["format_version"] = 1
+    metadata_path.write_text(json.dumps(metadata))
+    del run
+
+    with pytest.raises(DeliveryError, match="unsupported spool format version 1"):
+        create_run(
+            project="robotics",
+            run_id=run_id,
+            mode="offline",
+            resume="allow",
+            spool_root=tmp_path,
+            system_monitor_interval=0,
+        )
+
+
+def test_metric_summary_is_bounded_and_explicit_values_keep_precedence(tmp_path) -> None:
+    run = create_run(
+        project="robotics",
+        mode="offline",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+    )
+    run.log({f"k{index:03d}": float(index) for index in range(256)})
+    run.log({"zzzz": 1.0})
+    assert run.summary_truncated
+    assert len(run.summary) == 256
+    assert "zzzz" not in run.summary
+
+    run.log({"a": 7.0, "k000": 8.0})
+    run.summary["k000"] = 99.0
+    run.log({"k000": 10.0, "reward": 11.0})
+
+    assert run.summary["a"] == 7.0
+    assert run.summary["k000"] == 99.0
+    assert "k255" not in run.summary
+    run.finish()
+
+
+def test_online_finish_reclaims_acknowledged_payloads_and_keeps_private_metadata(tmp_path) -> None:
+    run_id = "019c1234-5678-7000-8000-000000000099"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = (
+            {}
+            if "/blobs/" in request.url.path
+            else json.loads(request.content)
+            if request.content
+            else {}
+        )
+        if request.url.path.endswith("/runs"):
+            return httpx.Response(
+                201,
+                json={
+                    "run": {"id": run_id, "name": "private", **_summary_fields()},
+                    "resumed": False,
+                    "next_sequence": 1,
+                    "next_step": 0,
+                },
+            )
+        if request.url.path.endswith("/batches"):
+            return httpx.Response(
+                201,
+                json={
+                    "run_id": run_id,
+                    "batch_sequence": body["batch_sequence"],
+                    "accepted_points": len(body["points"]),
+                    "duplicate": False,
+                    "metric_revision": 1,
+                    "stop_requested": False,
+                },
+            )
+        if "/blobs/" in request.url.path:
+            content = request.read()
+            return httpx.Response(
+                201,
+                json={
+                    "blob": {
+                        "digest": request.url.path.rsplit("/", 1)[1],
+                        "size": len(content),
+                        "mime_type": request.headers["content-type"],
+                        "file_name": request.headers.get("x-runloom-file-name"),
+                    },
+                    "duplicate": False,
+                },
+            )
+        if request.url.path.endswith("/rich-values"):
+            return httpx.Response(201, json={"value": body, "duplicate": False})
+        if request.url.path.endswith("/finish"):
+            return httpx.Response(
+                200,
+                json={
+                    "run": {
+                        "id": run_id,
+                        "state": "finished",
+                        **_summary_fields(metric={"loss": 1.0}),
+                    }
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    run = create_run(
+        project="robotics",
+        run_id=run_id,
+        mode="online",
+        spool_root=tmp_path,
+        flush_interval=0,
+        system_monitor_interval=0,
+        transport=httpx.MockTransport(handler),
+    )
+    run.log({"loss": 1.0, "preview": Image(b"image")})
+    run.finish(timeout=2)
+
+    spool = tmp_path / run_id
+    assert spool.stat().st_mode & 0o777 == 0o700
+    assert (spool / "run.json").stat().st_mode & 0o777 == 0o600
+    assert (spool / "events.jsonl").read_bytes() == b""
+    assert (spool / "rich-values.jsonl").read_bytes() == b""
+    assert list((spool / "blobs").iterdir()) == []
+
+
+def test_mixed_log_validates_every_rich_record_before_appending_metrics(tmp_path) -> None:
+    class InvalidMetadata(RichValue):
+        def _prepare(self, blob_root):
+            return PreparedRichValue(kind="histogram", blob=None, metadata={"bad": object()})
+
+    run = create_run(project="robotics", mode="offline", spool_root=tmp_path)
+    with pytest.raises(TypeError, match="unsupported JSON type"):
+        run.log({"loss": 1.0, "invalid": InvalidMetadata()})
+    assert (tmp_path / run.id / "events.jsonl").read_bytes() == b""
+    assert (tmp_path / run.id / "rich-values.jsonl").read_bytes() == b""
+    run.finish()
+
+
+def test_audio_and_histogram_reject_ambiguous_metadata() -> None:
+    with pytest.raises(ValueError, match="sample_rate"):
+        Audio(b"audio", sample_rate=44.1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="negative"):
+        Histogram(np_histogram=([-1], [0, 1]))
+    with pytest.raises(ValueError, match="strictly increasing"):
+        Histogram(np_histogram=([1, 2], [0, 1, 1]))
+
+
+def test_run_context_preserves_the_training_exception_when_cleanup_fails(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    run = create_run(project="robotics", mode="offline", spool_root=tmp_path)
+
+    def fail_finish(**kwargs):
+        raise DeliveryError("cleanup failed")
+
+    monkeypatch.setattr(run, "finish", fail_finish)
+    with pytest.raises(ValueError, match="training failed") as captured, run:
+        raise ValueError("training failed")
+    assert any("cleanup failed" in note for note in captured.value.__notes__)
+
+
 def test_online_documents_use_authoritative_server_state(tmp_path) -> None:
     server_config: dict = {"seed": 1}
     server_summary: dict = {"status": "resumed"}
@@ -171,9 +753,10 @@ def test_online_documents_use_authoritative_server_state(tmp_path) -> None:
 
     def response_run() -> dict:
         return {
+            "id": "019c1234-5678-7000-8000-000000000003",
             "name": "resumed-run",
             "config": dict(server_config),
-            "summary": dict(server_summary),
+            **_summary_fields(explicit=server_summary),
         }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -197,7 +780,10 @@ def test_online_documents_use_authoritative_server_state(tmp_path) -> None:
             return httpx.Response(200, json={"run": response_run()})
         if request.url.path.endswith("/finish"):
             server_summary.update(body["summary"])
-            return httpx.Response(200, json={"run": response_run()})
+            return httpx.Response(
+                200,
+                json={"run": {**response_run(), "state": "finished"}},
+            )
         raise AssertionError(f"unexpected request: {request.url}")
 
     run = create_run(
@@ -301,7 +887,7 @@ def test_alert_delivery_replays_the_same_durable_record(tmp_path) -> None:
             return httpx.Response(
                 201,
                 json={
-                    "run": {"id": body["id"], "name": "training"},
+                    "run": {"id": body["id"], "name": "training", **_summary_fields()},
                     "resumed": False,
                     "next_sequence": 1,
                     "next_step": 0,
@@ -324,10 +910,20 @@ def test_alert_delivery_replays_the_same_durable_record(tmp_path) -> None:
                     "accepted_points": len(body["points"]),
                     "duplicate": False,
                     "metric_revision": 1,
+                    "stop_requested": False,
                 },
             )
         if request.url.path.endswith("/finish"):
-            return httpx.Response(200, json={"run": {"state": "finished"}})
+            return httpx.Response(
+                200,
+                json={
+                    "run": {
+                        "id": run.id,
+                        "state": "finished",
+                        **_summary_fields(metric={"loss": 1.0}),
+                    }
+                },
+            )
         raise AssertionError(f"unexpected request: {request.url}")
 
     run = create_run(
@@ -427,7 +1023,7 @@ def test_offline_rich_values_stream_blobs_and_sync_idempotently(tmp_path) -> Non
             return httpx.Response(
                 201,
                 json={
-                    "run": {"name": "rich-run"},
+                    "run": {"id": run.id, "name": "rich-run"},
                     "resumed": False,
                     "next_sequence": 1,
                     "next_step": 0,
@@ -454,7 +1050,7 @@ def test_offline_rich_values_stream_blobs_and_sync_idempotently(tmp_path) -> Non
             received.append(value)
             return httpx.Response(201, json={"value": value, "duplicate": False})
         if request.url.path.endswith("/finish"):
-            return httpx.Response(200, json={"run": {"state": "finished"}})
+            return httpx.Response(200, json={"run": {"id": run.id, "state": "finished"}})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     sync_spool(directory, transport=httpx.MockTransport(handler), timeout=2)
@@ -502,7 +1098,7 @@ def test_artifacts_upload_versions_and_durable_lineage_operations(tmp_path) -> N
             return httpx.Response(
                 201,
                 json={
-                    "run": {"name": "artifact-run"},
+                    "run": {"id": run.id, "name": "artifact-run"},
                     "resumed": False,
                     "next_sequence": 1,
                     "next_step": 0,
@@ -519,7 +1115,7 @@ def test_artifacts_upload_versions_and_durable_lineage_operations(tmp_path) -> N
                         "digest": digest,
                         "size": len(content),
                         "mime_type": request.headers["content-type"],
-                        "file_name": None,
+                        "file_name": request.headers.get("x-runloom-file-name"),
                     },
                     "duplicate": False,
                 },
@@ -536,7 +1132,7 @@ def test_artifacts_upload_versions_and_durable_lineage_operations(tmp_path) -> N
                 json={"artifact": {"id": body["id"], "version": 0}, "duplicate": False},
             )
         if request.url.path.endswith("/finish"):
-            return httpx.Response(200, json={"run": {"state": "finished"}})
+            return httpx.Response(200, json={"run": {"id": run.id, "state": "finished"}})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     sync_spool(directory, transport=httpx.MockTransport(handler), timeout=2)
@@ -623,7 +1219,7 @@ def test_trace_sync_replays_the_same_span_after_response_loss(tmp_path) -> None:
             return httpx.Response(
                 201,
                 json={
-                    "run": {"name": "trace-run"},
+                    "run": {"id": run.id, "name": "trace-run"},
                     "resumed": False,
                     "next_sequence": 1,
                     "next_step": 0,
@@ -631,7 +1227,20 @@ def test_trace_sync_replays_the_same_span_after_response_loss(tmp_path) -> None:
             )
         if "/blobs/" in request.url.path:
             uploaded_payloads.append(request.read())
-            return httpx.Response(201, json={"blob": {}, "duplicate": attempts > 0})
+            content = uploaded_payloads[-1]
+            digest = request.url.path.rsplit("/", 1)[1]
+            return httpx.Response(
+                201,
+                json={
+                    "blob": {
+                        "digest": digest,
+                        "size": len(content),
+                        "mime_type": request.headers["content-type"],
+                        "file_name": request.headers.get("x-runloom-file-name"),
+                    },
+                    "duplicate": attempts > 0,
+                },
+            )
         if request.url.path.endswith("/traces"):
             delivered_spans.append(json.loads(request.content))
             attempts += 1
@@ -642,7 +1251,7 @@ def test_trace_sync_replays_the_same_span_after_response_loss(tmp_path) -> None:
                 json={"span": delivered_spans[-1], "duplicate": True},
             )
         if request.url.path.endswith("/finish"):
-            return httpx.Response(200, json={"run": {"state": "finished"}})
+            return httpx.Response(200, json={"run": {"id": run.id, "state": "finished"}})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     directory = tmp_path / run.id

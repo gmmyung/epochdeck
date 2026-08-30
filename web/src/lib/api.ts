@@ -9,6 +9,7 @@ export type Project = {
   name: string;
   created_at: string;
   run_count: number;
+  mutation_token: string;
 };
 
 export type Run = {
@@ -19,11 +20,18 @@ export type Run = {
   state: "running" | "finished";
   config: Record<string, unknown>;
   summary: Record<string, unknown>;
+  explicit_summary: Record<string, unknown>;
+  metric_summary: Record<string, unknown>;
+  summary_truncated: boolean;
+  document_revision: number;
   metric_revision: number;
+  rich_data_revision: number;
   created_at: string;
   updated_at: string;
   finished_at: string | null;
 };
+
+export type RunListItem = Omit<Run, "config" | "summary" | "explicit_summary" | "metric_summary">;
 
 export type History = {
   run_id: string;
@@ -70,6 +78,16 @@ export type ChartHistoryOptions = {
 };
 
 export type ComparisonAlignment = "step" | "relative_step" | "elapsed_time";
+
+export type MetricCatalogEntry = {
+  key: string;
+  run_ids: string[];
+};
+
+export type MetricCatalogPage = {
+  items: MetricCatalogEntry[];
+  nextAfter: string | null;
+};
 
 export type ComparisonChartSeriesRequest = {
   run_id: string;
@@ -129,6 +147,14 @@ export type RichValue = {
   created_at: string;
 };
 
+export type RichValueSummary = Omit<RichValue, "metadata">;
+
+export type RichValueKeySummary = {
+  key: string;
+  count: number;
+  latest: RichValueSummary;
+};
+
 export type ArtifactEntry = {
   path: string;
   blob: BlobRef;
@@ -149,8 +175,15 @@ export type Artifact = {
   created_at: string;
 };
 
+export type ArtifactSummary = Pick<
+  Artifact,
+  "id" | "project_id" | "project" | "name" | "type" | "version" | "created_by_run" | "created_at"
+> & {
+  entry_count: number;
+};
+
 export type RunArtifact = {
-  artifact: Artifact;
+  artifact: ArtifactSummary;
   relation: "input" | "output";
 };
 
@@ -158,6 +191,27 @@ export type CursorPage<T> = {
   items: T[];
   nextBefore: string | null;
 };
+
+export type RunArtifactCursor = {
+  before: string;
+  relation: RunArtifact["relation"];
+};
+
+export type RunArtifactPage = {
+  items: RunArtifact[];
+  nextCursor: RunArtifactCursor | null;
+};
+
+export class RunloomApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "RunloomApiError";
+  }
+}
 
 export type TraceSpan = {
   id: string;
@@ -175,6 +229,8 @@ export type TraceSpan = {
   payload: BlobRef | null;
   created_at: string;
 };
+
+export type TraceSpanSummary = Omit<TraceSpan, "attributes" | "preview">;
 
 export type ReportPanel = {
   id: string;
@@ -201,67 +257,161 @@ export type Report = {
   updated_at: string;
 };
 
+export type ReportSummary = Pick<
+  Report,
+  "id" | "project_id" | "project" | "name" | "created_at" | "updated_at"
+>;
+
 export function getHealth(signal?: AbortSignal): Promise<Health> {
   return getJson<Health>("/api/v1/health", signal);
 }
 
-export async function getProjects(signal?: AbortSignal): Promise<Project[]> {
-  const result = await getJson<{ projects: Project[] }>("/api/v1/projects?limit=200", signal);
-  return result.projects;
+export async function getProjectPage(
+  before?: string,
+  signal?: AbortSignal,
+): Promise<CursorPage<Project>> {
+  const query = cursorQuery(before);
+  const result = await getJson<{ projects: Project[]; next_before: string | null }>(
+    `/api/v1/projects?${query}`,
+    signal,
+  );
+  return { items: result.projects, nextBefore: result.next_before };
 }
 
-export async function getRuns(project: string, signal?: AbortSignal): Promise<Run[]> {
-  const result = await getJson<{ runs: Run[] }>(
-    `/api/v1/projects/${encodeURIComponent(project)}/runs?limit=200`,
+export function getProject(project: string, signal?: AbortSignal): Promise<Project> {
+  return getJson<Project>(`/api/v1/projects/${encodeURIComponent(project)}`, signal);
+}
+
+export async function getRunPage(
+  project: string,
+  search = "",
+  before?: string,
+  signal?: AbortSignal,
+): Promise<CursorPage<RunListItem>> {
+  const query = cursorQuery(before);
+  const boundedSearch = validatedSearch(search, "run search");
+  if (boundedSearch) query.set("q", boundedSearch);
+  const result = await getJson<{ runs: RunListItem[]; next_before: string | null }>(
+    `/api/v1/projects/${encodeURIComponent(project)}/runs?${query}`,
     signal,
+  );
+  return { items: result.runs, nextBefore: result.next_before };
+}
+
+export async function getRunSummariesByIds(
+  project: string,
+  runIds: readonly string[],
+  signal?: AbortSignal,
+): Promise<RunListItem[]> {
+  if (runIds.length === 0) return [];
+  if (runIds.length > 32 || new Set(runIds).size !== runIds.length) {
+    throw new RangeError("run summary queries require 1 to 32 unique run IDs");
+  }
+  const result = await requestJson<{ runs: RunListItem[]; next_before: null }>(
+    "/api/v1/query/runs",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project, run_ids: runIds, limit: runIds.length }),
+      signal,
+    },
   );
   return result.runs;
 }
 
-export async function getReports(project: string, signal?: AbortSignal): Promise<Report[]> {
-  const result = await getJson<{ reports: Report[] }>(
-    `/api/v1/projects/${encodeURIComponent(project)}/reports?limit=100`,
+export async function getReportPage(
+  project: string,
+  before?: string,
+  signal?: AbortSignal,
+): Promise<CursorPage<ReportSummary>> {
+  const query = cursorQuery(before);
+  const result = await getJson<{ reports: ReportSummary[]; next_before: string | null }>(
+    `/api/v1/projects/${encodeURIComponent(project)}/reports?${query}`,
     signal,
   );
-  return result.reports;
+  return { items: result.reports, nextBefore: result.next_before };
 }
 
 export function getRun(runId: string, signal?: AbortSignal): Promise<Run> {
   return getJson<Run>(`/api/v1/runs/${encodeURIComponent(runId)}`, signal);
 }
 
-export async function getMetricKeys(runId: string, signal?: AbortSignal): Promise<string[]> {
-  const result = await getJson<{ run_id: string; keys: string[] }>(
-    `/api/v1/runs/${encodeURIComponent(runId)}/metrics`,
-    signal,
-  );
-  return result.keys;
+export function getReport(reportId: string, signal?: AbortSignal): Promise<Report> {
+  return getJson<Report>(`/api/v1/reports/${encodeURIComponent(reportId)}`, signal);
 }
 
-export async function getAlerts(runId: string, signal?: AbortSignal): Promise<Alert[]> {
+export async function getProjectMetricCatalogPage(
+  project: string,
+  runIds: string[],
+  mode: "union" | "intersection",
+  search: string,
+  after?: string,
+  limit = 24,
+  signal?: AbortSignal,
+): Promise<MetricCatalogPage> {
+  const boundedSearch = validatedSearch(search, "metric search");
+  const result = await requestJson<{
+    keys: MetricCatalogEntry[];
+    next_after: string | null;
+  }>(`/api/v1/projects/${encodeURIComponent(project)}/metrics/query`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      run_ids: runIds,
+      mode,
+      ...(boundedSearch ? { search: boundedSearch } : {}),
+      ...(after ? { after } : {}),
+      limit,
+    }),
+    signal,
+  });
+  return { items: result.keys, nextAfter: result.next_after };
+}
+
+export async function getAlertPage(
+  runId: string,
+  before?: string,
+  signal?: AbortSignal,
+): Promise<CursorPage<Alert>> {
+  const query = cursorQuery(before);
   const result = await getJson<{ alerts: Alert[]; next_before: string | null }>(
-    `/api/v1/runs/${encodeURIComponent(runId)}/alerts?limit=100`,
+    `/api/v1/runs/${encodeURIComponent(runId)}/alerts?${query}`,
     signal,
   );
-  return result.alerts;
+  return { items: result.alerts, nextBefore: result.next_before };
 }
 
-export async function getRichValues(runId: string, signal?: AbortSignal): Promise<RichValue[]> {
-  return (await getRichValuePage(runId, undefined, signal)).items;
+export async function getRichValueKeyPage(
+  runId: string,
+  after?: string,
+  signal?: AbortSignal,
+): Promise<{ items: RichValueKeySummary[]; nextAfter: string | null }> {
+  const query = new URLSearchParams({ limit: "100" });
+  if (after) query.set("after", after);
+  const result = await getJson<{ keys: RichValueKeySummary[]; next_after: string | null }>(
+    `/api/v1/runs/${encodeURIComponent(runId)}/rich-values/keys?${query}`,
+    signal,
+  );
+  return { items: result.keys, nextAfter: result.next_after };
 }
 
 export async function getRichValuePage(
   runId: string,
+  key: string,
   before?: string,
   signal?: AbortSignal,
-): Promise<CursorPage<RichValue>> {
-  const query = new URLSearchParams({ limit: "100" });
-  if (before) query.set("before", before);
-  const result = await getJson<{ values: RichValue[]; next_before: string | null }>(
+): Promise<CursorPage<RichValueSummary>> {
+  const query = cursorQuery(before);
+  query.set("key", key);
+  const result = await getJson<{ values: RichValueSummary[]; next_before: string | null }>(
     `/api/v1/runs/${encodeURIComponent(runId)}/rich-values?${query}`,
     signal,
   );
   return { items: result.values, nextBefore: result.next_before };
+}
+
+export function getRichValue(valueId: string, signal?: AbortSignal): Promise<RichValue> {
+  return getJson<RichValue>(`/api/v1/rich-values/${encodeURIComponent(valueId)}`, signal);
 }
 
 export function blobUrl(blob: BlobRef): string {
@@ -269,22 +419,55 @@ export function blobUrl(blob: BlobRef): string {
   return `/api/v1/blobs/${encodeURIComponent(blob.digest)}?${query}`;
 }
 
-export async function getRunArtifacts(runId: string, signal?: AbortSignal): Promise<RunArtifact[]> {
-  return (await getRunArtifactPage(runId, undefined, signal)).items;
-}
-
 export async function getRunArtifactPage(
   runId: string,
+  cursor?: RunArtifactCursor,
+  signal?: AbortSignal,
+): Promise<RunArtifactPage> {
+  const query = new URLSearchParams({ limit: "100" });
+  if (cursor) {
+    query.set("before", cursor.before);
+    query.set("before_relation", cursor.relation);
+  }
+  const result = await getJson<{
+    artifacts: RunArtifact[];
+    next_before: string | null;
+    next_before_relation: RunArtifact["relation"] | null;
+  }>(`/api/v1/runs/${encodeURIComponent(runId)}/artifacts?${query}`, signal);
+  if ((result.next_before === null) !== (result.next_before_relation === null)) {
+    throw new Error("Runloom returned an incomplete artifact cursor");
+  }
+  return {
+    items: result.artifacts,
+    nextCursor:
+      result.next_before && result.next_before_relation
+        ? { before: result.next_before, relation: result.next_before_relation }
+        : null,
+  };
+}
+
+export function getArtifact(artifactId: string, signal?: AbortSignal): Promise<Artifact> {
+  return getJson<Artifact>(`/api/v1/artifacts/${encodeURIComponent(artifactId)}`, signal);
+}
+
+export async function getArtifactLineagePage(
+  artifactId: string,
+  relation: RunArtifact["relation"],
   before?: string,
   signal?: AbortSignal,
-): Promise<CursorPage<RunArtifact>> {
-  const query = new URLSearchParams({ limit: "100" });
-  if (before) query.set("before", before);
-  const result = await getJson<{ artifacts: RunArtifact[]; next_before: string | null }>(
-    `/api/v1/runs/${encodeURIComponent(runId)}/artifacts?${query}`,
-    signal,
-  );
-  return { items: result.artifacts, nextBefore: result.next_before };
+): Promise<CursorPage<RunListItem>> {
+  const query = cursorQuery(before);
+  query.set("relation", relation);
+  const result = await getJson<{
+    artifact_id: string;
+    relation: RunArtifact["relation"];
+    runs: RunListItem[];
+    next_before: string | null;
+  }>(`/api/v1/artifacts/${encodeURIComponent(artifactId)}/lineage?${query}`, signal);
+  if (result.artifact_id !== artifactId || result.relation !== relation) {
+    throw new Error("Runloom returned lineage for a different artifact relation");
+  }
+  return { items: result.runs, nextBefore: result.next_before };
 }
 
 export function artifactFileUrl(artifactId: string, path: string): string {
@@ -296,28 +479,25 @@ export function artifactArchiveUrl(artifactId: string): string {
   return `/api/v1/artifacts/${encodeURIComponent(artifactId)}/download`;
 }
 
-export async function getTraces(
-  runId: string,
-  query = "",
-  signal?: AbortSignal,
-): Promise<TraceSpan[]> {
-  return (await getTracePage(runId, query, undefined, signal)).items;
-}
-
 export async function getTracePage(
   runId: string,
   query = "",
   before?: string,
   signal?: AbortSignal,
-): Promise<CursorPage<TraceSpan>> {
+): Promise<CursorPage<TraceSpanSummary>> {
   const params = new URLSearchParams({ limit: "100" });
-  if (query.trim()) params.set("q", query.trim());
+  const boundedSearch = validatedSearch(query, "trace search");
+  if (boundedSearch) params.set("q", boundedSearch);
   if (before) params.set("before", before);
-  const result = await getJson<{ spans: TraceSpan[]; next_before: string | null }>(
+  const result = await getJson<{ spans: TraceSpanSummary[]; next_before: string | null }>(
     `/api/v1/runs/${encodeURIComponent(runId)}/traces?${params}`,
     signal,
   );
   return { items: result.spans, nextBefore: result.next_before };
+}
+
+export function getTrace(spanId: string, signal?: AbortSignal): Promise<TraceSpan> {
+  return getJson<TraceSpan>(`/api/v1/traces/${encodeURIComponent(spanId)}`, signal);
 }
 
 export function getHistory(
@@ -327,7 +507,8 @@ export function getHistory(
   signal?: AbortSignal,
   after?: number,
 ): Promise<History> {
-  const query = new URLSearchParams({ keys: keys.join(","), limit: String(limit) });
+  const query = new URLSearchParams({ limit: String(limit) });
+  for (const key of keys) query.append("key", key);
   if (after !== undefined) query.set("after", String(after));
   return getJson<History>(`/api/v1/runs/${encodeURIComponent(runId)}/history?${query}`, signal);
 }
@@ -338,10 +519,8 @@ export function getSampledHistory(
   maxPoints = 2_000,
   signal?: AbortSignal,
 ): Promise<History> {
-  const query = new URLSearchParams({
-    keys: keys.join(","),
-    max_points: String(maxPoints),
-  });
+  const query = new URLSearchParams({ max_points: String(maxPoints) });
+  for (const key of keys) query.append("key", key);
   return getJson<History>(`/api/v1/runs/${encodeURIComponent(runId)}/history?${query}`, signal);
 }
 
@@ -411,10 +590,38 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   return requestJson<T>(path, { signal });
 }
 
+function cursorQuery(before?: string): URLSearchParams {
+  const query = new URLSearchParams({ limit: "100" });
+  if (before) query.set("before", before);
+  return query;
+}
+
+function validatedSearch(value: string, name: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (
+    new TextEncoder().encode(trimmed).byteLength > 256 ||
+    /[\u0000-\u001f\u007f-\u009f]/.test(trimmed)
+  ) {
+    throw new RangeError(`${name} cannot exceed 256 non-control bytes`);
+  }
+  return trimmed;
+}
+
 async function requestJson<T>(path: string, init: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
-    throw new Error(`Runloom request failed with HTTP ${response.status}`);
+    const fallback = `Runloom request failed with HTTP ${response.status}`;
+    let code = "http_error";
+    let message = fallback;
+    try {
+      const body = (await response.json()) as { code?: unknown; message?: unknown };
+      if (typeof body.code === "string" && body.code) code = body.code;
+      if (typeof body.message === "string" && body.message) message = body.message;
+    } catch {
+      // A proxy or upstream may return a non-JSON error page.
+    }
+    throw new RunloomApiError(response.status, code, message);
   }
   return (await response.json()) as T;
 }

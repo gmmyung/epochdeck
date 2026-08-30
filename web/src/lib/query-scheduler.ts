@@ -4,6 +4,7 @@ export type ScheduledQuery<T> = {
   request: (signal: AbortSignal) => Promise<T>;
   publish: (value: T, requestKey: string) => void;
   reject?: (reason: unknown) => void;
+  discard?: () => void;
 };
 
 type ActiveQuery = {
@@ -15,9 +16,15 @@ export class QueryScheduler {
   private readonly pending = new Map<string, ScheduledQuery<unknown>>();
   private readonly active = new Map<string, ActiveQuery>();
 
-  constructor(private readonly concurrency: number) {
+  constructor(
+    private readonly concurrency: number,
+    private readonly maximumPending: number,
+  ) {
     if (!Number.isInteger(concurrency) || concurrency < 1) {
       throw new Error("query concurrency must be a positive integer");
+    }
+    if (!Number.isInteger(maximumPending) || maximumPending < 1) {
+      throw new Error("maximum pending queries must be a positive integer");
     }
   }
 
@@ -28,19 +35,30 @@ export class QueryScheduler {
     if (active) {
       active.controller.abort();
     }
-    this.pending.delete(query.identity);
+    this.discardPending(query.identity);
+    if (this.pending.size >= this.maximumPending) {
+      const oldestIdentity = this.pending.keys().next().value as string | undefined;
+      if (oldestIdentity !== undefined) this.discardPending(oldestIdentity);
+    }
     this.pending.set(query.identity, query as ScheduledQuery<unknown>);
     this.drain();
   }
 
   cancel(identity: string): void {
-    this.pending.delete(identity);
+    this.discardPending(identity);
     this.active.get(identity)?.controller.abort();
   }
 
   cancelAll(): void {
-    this.pending.clear();
+    for (const identity of [...this.pending.keys()]) this.discardPending(identity);
     for (const query of this.active.values()) query.controller.abort();
+  }
+
+  private discardPending(identity: string): void {
+    const query = this.pending.get(identity);
+    if (!query) return;
+    this.pending.delete(identity);
+    query.discard?.();
   }
 
   private drain(): void {

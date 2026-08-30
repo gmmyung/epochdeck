@@ -28,42 +28,78 @@ ZFS pool. It must:
 ### Rust service
 
 The server owns ingestion, query scheduling, catalog transactions, storage
-manifests, authentication, and HTTP delivery. Tokio and Axum provide the runtime
-and HTTP boundary. CPU-heavy encoding and query work runs in bounded worker pools
-rather than on async executor threads.
+manifests, and HTTP delivery. Tokio and Axum provide the runtime and HTTP
+boundary. CPU-heavy encoding and query work runs in bounded worker pools rather
+than on async executor threads. Application-level multi-user authentication is
+not implemented yet; current deployment relies on its trusted-interface or
+Tailnet boundary.
 
 The `embedded-dashboard` production feature packages the built dashboard into
 the server binary. Single-node operation requires no external database, queue,
 object store, or runtime web directory.
 
-### Catalog and ingest journal
+### Catalog and client journal
 
 SQLite is the transactional control plane. It stores projects, runs, metric
 schemas, segment manifests, revisions, artifact manifests, lineage, and
 idempotent ingest-batch records.
 
-SQLite does not store complete metric histories as JSON. Incoming batches first
-enter a bounded, crash-recoverable journal. Acknowledged batches can always be
-replayed after a process or machine restart.
+Dashboard list paths read small summary rows rather than complete documents.
+The catalog maintains project run counts and per-run rich-key counts/latest
+references in the same transactions as their source rows, avoiding list-time
+scans of every run or rich value. Newest-first cursors resolve an ID to its
+event-time/ID tuple, so deterministic imported UUIDs do not have to encode
+chronology. See [ADR 0015](adr/0015-bounded-dashboard-discovery.md).
+Every project-visible logical mutation also advances a catalog-backed monotonic
+project token. Project summaries expose the token as an opaque decimal string,
+allowing a streaming export to detect even a transient create-delete ABA across
+its traversal. Physical metric compaction does not advance the logical token.
+
+Explicit user summary data and the derived latest-metric preview are stored
+separately. The explicit document has its own 256 KiB budget. The preview keeps
+the lexicographically smallest 256 non-system metric keys and sets a sticky,
+observable truncation flag if more keys exist; complete values remain in
+Parquet and the metric-key catalog. Full run reads merge the preview with the
+explicit layer taking precedence and also expose both source layers. A distinct
+`document_revision` makes same-second config, explicit-summary, and finish
+mutations observable without relying on SQLite timestamp precision.
+
+SQLite does not store complete metric histories as JSON. Before an HTTP request,
+the Python SDK writes each outgoing batch to its bounded, crash-recoverable local
+journal. An acknowledgement advances that journal only after the server confirms
+the exact request identity, so ambiguous requests can be replayed after a process
+or machine restart.
+
+Write-intent catalog transactions acquire SQLite's writer reservation before
+their first read. This avoids deferred-transaction snapshot upgrades failing
+when compaction commits concurrently, while WAL readers remain concurrent. The
+writer wait is bounded to five seconds; exhaustion is exposed as retryable HTTP
+503 `server_busy` with `Retry-After: 1` rather than an internal error.
 
 ### Metric storage
 
-Journal records are grouped by project, run, and metric signature, converted to
-Arrow record batches, and flushed as immutable Parquet segments. A catalog
-transaction makes each segment visible atomically.
+Submitted metric batches are grouped by project, run, and metric signature,
+converted to Arrow record batches, and flushed as immutable Parquet segments. A
+catalog transaction makes each segment visible atomically.
 
 The Python journal is append-only and fsynced before `log` returns. Its byte
 offset advances atomically only after an idempotent server acknowledgement. The
-server writes each batch to a temporary Parquet file, syncs it, installs it with
-an atomic rename, and then commits its SQLite manifest. A client retry after a
-crash therefore either installs the missing batch or receives the same duplicate
-acknowledgement.
+server writes each batch to an owned temporary Parquet file under
+`RUNLOOM_METRICS_DIR/staging`, syncs it, installs it with an atomic no-replace
+operation, and then commits its SQLite manifest. The staging directory is on
+the same filesystem as final segments, so hard-link installation remains
+atomic. RAII removes temporary files on ordinary errors and cancellation; the
+exclusive server startup path removes crash leftovers before accepting work. A
+client retry after a crash therefore either installs the missing batch or
+receives the same duplicate acknowledgement.
 
 Parquet provides typed values, compression, column projection, row-group
 statistics, immutable snapshot-friendly files, and one metric name per column
-rather than per row. One background worker compacts adjacent, schema-compatible
-segments in bounded streaming passes. The default pass merges at most 16 files
-and 16,384 rows; hard limits prevent configuration from making a pass unbounded.
+rather than per row. One background worker compacts cohorts of at least four
+adjacent, schema-compatible segments whose largest and smallest row counts are
+within a factor of two. The default pass merges at most 16 files and 16,384
+rows; hard limits prevent configuration from making a pass unbounded. Cohorting
+avoids rewriting a growing active prefix for every small incoming batch.
 
 Compaction installs a new immutable file before atomically swapping catalog
 manifests. History queries hold a shared snapshot guard from manifest lookup
@@ -99,13 +135,19 @@ alignment origin, viewport, and lattice are unchanged. Its 512-entry,
 250,000-cell, and 32-MiB limits are independent eviction bounds, not history
 retention limits.
 
-The dashboard derives deterministic request groups from the selected runs and
-the union metric catalog. Full-range and viewport refreshes reuse the same
+The dashboard discovers union or intersection metric keys through a bounded
+project-scoped catalog query for at most 32 selected runs. It then derives
+deterministic chart request groups from the selected runs and requested keys.
+Full-range and viewport refreshes reuse the same
 group, so alignment origins and bucket lattices do not depend on scroll timing.
 Only 24 Canvas charts are instantiated per page, at most four chart requests
 are physically in flight, and offscreen histories leave component state. A
 separate browser LRU is independently capped at 12 responses, 40,000 occupied
-cells, and 4 MiB of estimated column payload.
+cells, and 4 MiB of estimated column payload. Navigation pages and run-resource
+summaries retain explicit head/tail windows with pinned selections, while full
+run, artifact, rich-value, and trace detail caches have smaller independent
+caps. Truncation is shown in the UI instead of silently presenting a retained
+window as a complete collection.
 See [ADR 0013](adr/0013-multi-run-chart-comparison.md).
 
 ### Media, artifacts, and traces
@@ -113,7 +155,9 @@ See [ADR 0013](adr/0013-multi-run-chart-comparison.md).
 Media and artifact bytes live in a content-addressed store rooted separately
 from metrics. The catalog contains small manifests, aliases, versions, and
 lineage edges. Uploads are streamed, hashed, deduplicated, and atomically
-installed.
+installed. At most eight new blob uploads stream concurrently. Artifact
+manifest verification and ZIP delivery share a four-permit blocking-I/O pool,
+so a parallel importer cannot create an unbounded filesystem work queue.
 
 Video supports HTTP range delivery. Structured trace names, timing, status,
 attributes, relationships, and bounded message previews are indexed in SQLite.
@@ -138,12 +182,16 @@ HTTP namespace remains explicitly versioned under `/api/v1`.
 
 The optional W&B importer is a Python boundary adapter. It scans source runs
 lazily, adapts history windows to sparse step domains, admits a bounded number
-of run workers, and sends deterministic metric batches. An fsynced checkpoint
-advances only after acknowledgement, allowing an ambiguous accepted request to
-replay under the server's existing idempotency contract. Source run files are
-chunked into ordinary CAS-backed artifacts, logged artifacts use a fixed
-four-transfer window, and supported media references become deterministic
-native rich values backed by the same CAS.
+of run workers, and sends deterministic metric batches. One process exclusively
+owns the fsynced checkpoint, which advances only after acknowledgement, allowing
+an ambiguous accepted request to replay under the server's existing idempotency
+contract. Source run files are chunked into ordinary CAS-backed artifacts,
+logged artifacts preserve their canonical W&B `vN` in exact Runloom version
+slots, and logged artifacts and history media use fixed transfer windows. Each
+temporary file is uploaded and unlinked before the next is retained. Supported
+media references become deterministic native rich values backed by the same
+CAS. Cooperative cancellation stops queued work; a W&B SDK call already in
+progress is the only non-preemptible unit.
 
 Portable Runloom export traverses only public bounded APIs. It writes raw
 full-resolution history pages, metadata JSON Lines, lineage links, and verified
@@ -193,24 +241,36 @@ produced with fixed buffers on a bounded download worker, and the worker permit
 is retained through terminal stream-error delivery.
 
 Live charts compare per-run metric revisions and request a fresh bounded
-aggregate when a revision changes. They do not append raw deltas to existing
-buckets because later sequence values can update an older step bucket. The
-dashboard can select multiple project runs and render every requested metric on
-the same server-defined lattice. It never requests complete histories for chart
-rendering. See [ADR 0012](adr/0012-exact-bucket-chart-history.md) and
-[ADR 0013](adr/0013-multi-run-chart-comparison.md).
+aggregate when a revision changes. `document_revision` invalidates selected
+config and summary documents after a real document or finish mutation, and a
+separate unified `rich_data_revision` invalidates already-open media, alert,
+artifact, and trace resources after any real non-scalar mutation; idempotent
+retries do not increment either counter. The dashboard polls all selected
+running IDs through one bounded lightweight-summary query; it hydrates the
+primary run's complete config/summary document only when that document is
+visible. It does not append raw deltas to existing buckets because later
+sequence values can
+update an older step bucket. It can select multiple project runs and render
+every requested metric on the same server-defined lattice. It never requests
+complete histories for chart rendering. See
+[ADR 0012](adr/0012-exact-bucket-chart-history.md),
+[ADR 0013](adr/0013-multi-run-chart-comparison.md), and
+[ADR 0015](adr/0015-bounded-dashboard-discovery.md).
 
 ## Storage layout
 
 ```text
 RUNLOOM_DATA_DIR/
   catalog.sqlite3
-  journal/
+  runloom.lock
 
 RUNLOOM_METRICS_DIR/
+  runloom.lock
+  staging/
   projects/<project-id>/runs/<run-id>/segments/*.parquet
 
 RUNLOOM_BLOBS_DIR/
+  runloom.lock
   sha256/<prefix>/<digest>
   staging/
 ```
@@ -218,10 +278,23 @@ RUNLOOM_BLOBS_DIR/
 The data and metric roots belong on SSD. The blob root can be a bind-mounted ZFS
 dataset on high-capacity disks.
 
-The server holds `RUNLOOM_DATA_DIR/runloom.lock` while active. Physical backup
-and restore take the same advisory lock, use a verified streaming inventory, and
-therefore cannot race catalog or immutable-file mutation. Portable project
-exports remain available through the HTTP API while the server is running.
+The SQLite catalog has one current disposable pre-alpha definition. It carries
+no internal generation marker or upgrade logic; a storage-definition change is
+deployed by archiving the complete old root set and starting with empty roots.
+
+After creating the directories, startup resolves symlinks and validates their
+canonical paths. Metric and blob roots must be disjoint: neither may equal or
+contain the other. The data root may be a strict ancestor of either root (the
+default layout), but it may not equal or live inside the metric or blob root.
+This prevents staging, segment, CAS, lock, and catalog namespaces from mixing.
+The server resolves the three canonical roots, sorts and deduplicates their
+`runloom.lock` paths, and holds every advisory lock for its complete lifetime.
+Only after acquiring the whole set may it clear metric or blob staging. Thus a
+second instance with a different data root cannot mutate or clean a shared
+external metric/blob root. Physical backup and restore acquire the identical
+lock set and omit root lock files and staging trees from their payloads, so they
+cannot race catalog or immutable-file mutation. Portable project exports remain
+available through the HTTP API while the server is running.
 
 ## Performance budgets
 

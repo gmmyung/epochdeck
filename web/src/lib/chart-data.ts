@@ -1,6 +1,9 @@
 export type SmoothingMode = "none" | "ema" | "time-ema" | "running" | "gaussian";
 export type ScaleMode = "linear" | "log";
 
+export const MAX_GAUSSIAN_SIGMA = 50;
+export const MAX_SMOOTHING_WINDOW = 500;
+
 export function smoothSeries(
   x: number[],
   values: Array<number | null>,
@@ -71,10 +74,18 @@ export function closestPointIndex(
   maximum = Number.POSITIVE_INFINITY,
   valueScale: ScaleMode = "linear",
 ): number | null {
+  if (x.length === 0 || !Number.isFinite(target) || (scale === "log" && target <= 0)) return null;
   let closest: number | null = null;
   let distance = Number.POSITIVE_INFINITY;
   const transformedTarget = transformValue(target, scale);
-  for (let index = 0; index < x.length; index += 1) {
+  let right = lowerBound(x, target);
+  let left = right - 1;
+  while (left >= 0 || right < x.length) {
+    const leftDistance = coordinateDistance(x[left], transformedTarget, scale);
+    const rightDistance = coordinateDistance(x[right], transformedTarget, scale);
+    if (leftDistance > distance && rightDistance > distance) break;
+    const chooseLeft = left >= 0 && (right >= x.length || leftDistance <= rightDistance);
+    const index = chooseLeft ? left-- : right++;
     const coordinate = x[index];
     const value = values[index];
     if (
@@ -97,22 +108,53 @@ export function closestPointIndex(
   return closest;
 }
 
+function lowerBound(values: number[], target: number): number {
+  let minimum = 0;
+  let maximum = values.length;
+  while (minimum < maximum) {
+    const middle = minimum + Math.floor((maximum - minimum) / 2);
+    if (values[middle] < target) minimum = middle + 1;
+    else maximum = middle;
+  }
+  return minimum;
+}
+
+function coordinateDistance(
+  coordinate: number | undefined,
+  target: number,
+  scale: ScaleMode,
+): number {
+  if (
+    coordinate === undefined ||
+    !Number.isFinite(coordinate) ||
+    (scale === "log" && coordinate <= 0)
+  ) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.abs(transformValue(coordinate, scale) - target);
+}
+
 function runningAverage(values: Array<number | null>, amount: number): Array<number | null> {
-  const window = Math.max(1, Math.min(500, Math.round(amount)));
+  const window = Math.max(1, Math.min(MAX_SMOOTHING_WINDOW, Math.round(amount)));
   const output: Array<number | null> = [];
-  const queue: number[] = [];
+  const ring = new Array<number>(window);
+  let count = 0;
+  let writeIndex = 0;
   let total = 0;
   for (const value of values) {
     if (value === null || !Number.isFinite(value)) {
       output.push(null);
-      queue.length = 0;
+      count = 0;
+      writeIndex = 0;
       total = 0;
       continue;
     }
-    queue.push(value);
+    if (count === window) total -= ring[writeIndex];
+    else count += 1;
+    ring[writeIndex] = value;
+    writeIndex = (writeIndex + 1) % window;
     total += value;
-    if (queue.length > window) total -= queue.shift() ?? 0;
-    output.push(total / queue.length);
+    output.push(total / count);
   }
   return output;
 }
@@ -150,7 +192,7 @@ function exponentialSmooth(
 }
 
 function gaussianSmooth(values: Array<number | null>, amount: number): Array<number | null> {
-  const sigma = Math.max(0.25, Math.min(50, amount));
+  const sigma = Math.max(0.25, Math.min(MAX_GAUSSIAN_SIGMA, amount));
   const radius = Math.ceil(sigma * 3);
   return values.map((value, index) => {
     if (value === null) return null;

@@ -4,11 +4,11 @@ default:
   @just --list
 
 bootstrap:
-  cargo fetch
-  uv sync --project python --all-groups
-  pnpm --dir web install
+  cargo fetch --locked
+  uv sync --project python --all-groups --locked
+  pnpm --dir web install --frozen-lockfile
 
-check: dependency-guard workflow-check dashboard-build rust-check python-check web-check
+check: dependency-guard workflow-check rust-check python-check web-check
 
 dependency-guard:
   ./scripts/check-forbidden-dependencies.sh
@@ -24,6 +24,7 @@ rust-check:
 python-check:
   uv run --project python ruff format --check
   uv run --project python ruff check
+  uv run --project python mypy --config-file python/pyproject.toml python/src/runloom
   uv run --project python pytest
 
 web-check:

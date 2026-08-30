@@ -4,6 +4,7 @@
     | "archive"
     | "chart"
     | "check"
+    | "close"
     | "chevron-down"
     | "chevron-right"
     | "download"
@@ -45,6 +46,8 @@
     <path d="M4 19V5M4 19h16M7 15l4-5 3 2 5-7" />
   {:else if name === "check"}
     <circle cx="12" cy="12" r="9" /><path d="m8 12 3 3 5-6" />
+  {:else if name === "close"}
+    <path d="m6 6 12 12M18 6 6 18" />
   {:else if name === "chevron-down"}
     <path d="m7 9 5 5 5-5" />
   {:else if name === "chevron-right"}

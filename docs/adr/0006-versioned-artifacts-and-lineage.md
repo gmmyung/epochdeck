@@ -14,10 +14,18 @@ safe under concurrent and replayed requests.
 ## Decision
 
 Artifact manifests are project-scoped immutable versions in SQLite. A
-collection name has one stable type. Creation allocates the next integer version,
-stores the bounded ordered entry manifest, moves requested aliases, and inserts
-the producing run's output edge in one transaction. A client-assigned UUIDv7 and
-canonical request document make exact response-loss retries idempotent.
+collection name has one stable type. Creation normally allocates the next
+integer version. Boundary importers may instead provide a nonnegative JSON-safe
+integer to reserve an exact source version; an occupied slot conflicts unless
+the request is an exact same-ID replay. The transaction stores the bounded
+ordered entry manifest and inserts the producing run's output edge. A
+client-assigned UUIDv7 and canonical request document make exact response-loss
+retries idempotent.
+
+Requested aliases resolve to the highest artifact version that requested them.
+This makes source backfills independent of arrival order: a late older version
+cannot take an alias from a newer version, while an ordinary newly allocated
+version can still advance it.
 
 Entries reference the shared SHA-256 blob store. The server verifies existence
 and byte size before opening the catalog transaction. Artifact file delivery
@@ -47,10 +55,11 @@ version; large directory trees should be packed or split into collections.
 Aliases move. Storing only a historical alias list cannot resolve the current
 target atomically and makes concurrent `latest` updates ambiguous.
 
-### Derive versions in the SDK
+### Derive every version in the SDK
 
-Multiple writers can race. The catalog transaction is the only authority that
-can allocate a unique next version.
+Multiple ordinary writers can race, so the catalog transaction remains the only
+authority that can allocate a unique next version. Exact source versions are a
+validated import contract and still reserve their slot transactionally.
 
 ### Infer lineage from downloads
 

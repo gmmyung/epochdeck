@@ -13,6 +13,7 @@
 **/*.py[cod]
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 .coverage
 htmlcov/
 
@@ -23,11 +24,17 @@ web/.svelte-kit/
 
 # Runtime data
 /data/
+/data.prealpha-archive-*/
 .runloom/
 *.sqlite
 *.sqlite3
+*.sqlite-shm
+*.sqlite-wal
 *.sqlite3-shm
 *.sqlite3-wal
+*runloom-wandb-checkpoint.json*
+*.import.json*
+*.runloom-export/
 *.parquet
 *.arrow
 *.ipc

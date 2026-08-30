@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from runloom._json_normalization import normalize_json_object
 from runloom._sweep_context import current_sweep_context
 from runloom.artifact import Artifact
 from runloom.run import Mode, Resume, Run, create_run
@@ -14,6 +15,7 @@ from runloom.trace import Trace, TraceKind
 
 _current_run: Run | None = None
 _current_run_lock = threading.Lock()
+_MAX_RUN_DOCUMENT_BYTES = 256 * 1024
 
 
 def init(
@@ -36,7 +38,11 @@ def init(
                 "a Runloom run is already active; finish it before calling init again"
             )
         sweep_context = current_sweep_context.get()
-        selected_config = dict(config or {})
+        selected_config = normalize_json_object(
+            config if config is not None else {},
+            "config",
+            _MAX_RUN_DOCUMENT_BYTES,
+        )
         if sweep_context is not None:
             conflicts = {
                 key
@@ -48,6 +54,11 @@ def init(
                     "run config conflicts with sweep parameters: " + ", ".join(sorted(conflicts))
                 )
             selected_config = {**selected_config, **sweep_context.config}
+            if sweep_context.run_id is not None:
+                if id is not None and id != sweep_context.run_id:
+                    raise ValueError("run ID conflicts with the recovered sweep trial run")
+                id = sweep_context.run_id
+                resume = "allow"
         spool_root = Path(dir) / ".runloom" / "spool" if dir is not None else None
         new_run = create_run(
             project=project,
@@ -62,6 +73,8 @@ def init(
         )
         if sweep_context is not None:
             sweep_context.run_id = new_run.id
+            if sweep_context.run_id_callback is not None:
+                sweep_context.run_id_callback(new_run.id)
         new_run._set_finish_callback(_clear_current_run)
         _current_run = None if new_run.finished else new_run
         _publish_current_run(_current_run)

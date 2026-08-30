@@ -10,14 +10,21 @@ import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from itertools import islice, pairwise
 from pathlib import Path
 from typing import Any, BinaryIO
+
+from runloom._json_normalization import normalize_json_value
+from runloom._limits import MAX_SAFE_INTEGER
+from runloom._protocol import validate_blob_file_name
 
 _COPY_CHUNK_BYTES = 1024 * 1024
 _MAX_TABLE_COLUMNS = 1_024
 _MAX_TABLE_ROW_BYTES = 1024 * 1024
 _MAX_TABLE_PREVIEW_BYTES = 64 * 1024
+_MAX_TABLE_COLUMNS_BYTES = 256 * 1024 - _MAX_TABLE_PREVIEW_BYTES - 1024
 _MAX_HISTOGRAM_BINS = 512
+_MAX_RICH_METADATA_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,9 +55,18 @@ class _Media(RichValue):
             raise TypeError(f"{self.kind} data must be a path or bytes")
         if caption is not None and not isinstance(caption, str):
             raise TypeError(f"{self.kind} caption must be a string or None")
+        if mime_type is not None:
+            _validate_mime_type(mime_type)
+        metadata = {"caption": caption} if caption is not None else {}
+        normalized_metadata = normalize_json_value(
+            metadata,
+            f"{self.kind} metadata",
+            _MAX_RICH_METADATA_BYTES,
+        )
+        assert isinstance(normalized_metadata, dict)
         self._data = data
-        self._caption = caption
         self._mime_type = mime_type
+        self._metadata = normalized_metadata
 
     def _prepare(self, blob_root: Path) -> PreparedRichValue:
         file_name: str | None = None
@@ -59,6 +75,7 @@ class _Media(RichValue):
             if not path.is_file():
                 raise FileNotFoundError(f"{self.kind} file was not found: {path}")
             file_name = path.name
+            validate_blob_file_name(file_name)
             guessed_mime, _ = mimetypes.guess_type(path.name)
             with path.open("rb") as source:
                 digest, size = _install_stream(blob_root, source)
@@ -68,7 +85,6 @@ class _Media(RichValue):
             guessed_mime = None
         mime_type = self._mime_type or guessed_mime or self.default_mime_type
         _validate_mime_type(mime_type)
-        metadata = {"caption": self._caption} if self._caption is not None else {}
         return PreparedRichValue(
             kind=self.kind,
             blob={
@@ -77,7 +93,7 @@ class _Media(RichValue):
                 "mime_type": mime_type,
                 "file_name": file_name,
             },
-            metadata=metadata,
+            metadata=self._metadata,
         )
 
 
@@ -99,19 +115,20 @@ class Audio(_Media):
         mime_type: str | None = None,
     ) -> None:
         super().__init__(data, caption=caption, mime_type=mime_type)
-        if sample_rate is not None and (isinstance(sample_rate, bool) or sample_rate <= 0):
-            raise ValueError("audio sample_rate must be a positive integer or None")
-        self._sample_rate = sample_rate
-
-    def _prepare(self, blob_root: Path) -> PreparedRichValue:
-        prepared = super()._prepare(blob_root)
-        if self._sample_rate is None:
-            return prepared
-        return PreparedRichValue(
-            kind=prepared.kind,
-            blob=prepared.blob,
-            metadata={**prepared.metadata, "sample_rate": self._sample_rate},
-        )
+        if sample_rate is not None and (
+            isinstance(sample_rate, bool)
+            or not isinstance(sample_rate, int)
+            or not 1 <= sample_rate <= MAX_SAFE_INTEGER
+        ):
+            raise ValueError(f"audio sample_rate must be between 1 and {MAX_SAFE_INTEGER}, or None")
+        if sample_rate is not None:
+            normalized_metadata = normalize_json_value(
+                {**self._metadata, "sample_rate": sample_rate},
+                "audio metadata",
+                _MAX_RICH_METADATA_BYTES,
+            )
+            assert isinstance(normalized_metadata, dict)
+            self._metadata = normalized_metadata
 
 
 class Video(_Media):
@@ -121,16 +138,21 @@ class Video(_Media):
 
 class Table(RichValue):
     def __init__(self, *, columns: Sequence[str], data: Iterable[Sequence[Any]]) -> None:
-        normalized_columns = tuple(columns)
+        normalized_columns = tuple(islice(iter(columns), _MAX_TABLE_COLUMNS + 1))
         if not normalized_columns or len(normalized_columns) > _MAX_TABLE_COLUMNS:
             raise ValueError(f"table must contain 1 to {_MAX_TABLE_COLUMNS} columns")
         if any(not isinstance(column, str) or not column for column in normalized_columns):
             raise TypeError("table columns must be non-empty strings")
+        normalize_json_value(
+            list(normalized_columns),
+            "table columns",
+            _MAX_TABLE_COLUMNS_BYTES,
+        )
         self.columns = normalized_columns
         self._data = data
 
     def _prepare(self, blob_root: Path) -> PreparedRichValue:
-        blob_root.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(blob_root)
         temporary = tempfile.NamedTemporaryFile(  # noqa: SIM115 - closed before CAS install
             mode="w+b",
             prefix="table-",
@@ -156,14 +178,18 @@ class Table(RichValue):
             write(_json_bytes(list(self.columns)))
             write(b',"data":[')
             for raw_row in self._data:
-                row = list(raw_row)
+                row = list(islice(iter(raw_row), len(self.columns) + 1))
                 if len(row) != len(self.columns):
                     raise ValueError(
                         f"table row {row_count} has {len(row)} cells; expected {len(self.columns)}"
                     )
+                row = normalize_json_value(
+                    row,
+                    f"table row {row_count}",
+                    _MAX_TABLE_ROW_BYTES,
+                )
+                assert isinstance(row, list)
                 encoded = _json_bytes(row)
-                if len(encoded) > _MAX_TABLE_ROW_BYTES:
-                    raise ValueError(f"serialized table row exceeds {_MAX_TABLE_ROW_BYTES} bytes")
                 if row_count:
                     write(b",")
                 write(encoded)
@@ -207,27 +233,43 @@ class Histogram(RichValue):
     ) -> None:
         if (values is None) == (np_histogram is None):
             raise ValueError("histogram requires exactly one of values or np_histogram")
-        if isinstance(num_bins, bool) or not 1 <= num_bins <= _MAX_HISTOGRAM_BINS:
+        if (
+            isinstance(num_bins, bool)
+            or not isinstance(num_bins, int)
+            or not 1 <= num_bins <= _MAX_HISTOGRAM_BINS
+        ):
             raise ValueError(f"histogram num_bins must be between 1 and {_MAX_HISTOGRAM_BINS}")
+        self._counts: list[float] | None
+        self._edges: list[float] | None
         if np_histogram is not None:
             counts, edges = np_histogram
-            self._counts = [_finite_float(value, "histogram count") for value in counts]
-            self._edges = [_finite_float(value, "histogram edge") for value in edges]
+            self._counts = _bounded_floats(
+                counts,
+                maximum=_MAX_HISTOGRAM_BINS,
+                name="histogram count",
+            )
+            self._edges = _bounded_floats(
+                edges,
+                maximum=_MAX_HISTOGRAM_BINS + 1,
+                name="histogram edge",
+            )
             if not self._counts or len(self._edges) != len(self._counts) + 1:
                 raise ValueError("histogram edges must contain exactly one more value than counts")
-            if len(self._counts) > _MAX_HISTOGRAM_BINS:
-                raise ValueError(f"histogram cannot exceed {_MAX_HISTOGRAM_BINS} bins")
+            if any(count < 0 for count in self._counts):
+                raise ValueError("histogram counts cannot be negative")
+            if any(right <= left for left, right in pairwise(self._edges)):
+                raise ValueError("histogram edges must be strictly increasing")
             self._values: Iterable[float] | None = None
             self._num_bins = len(self._counts)
         else:
             self._values = values
             self._num_bins = num_bins
-            self._counts: list[float] | None = None
-            self._edges: list[float] | None = None
+            self._counts = None
+            self._edges = None
 
     def _prepare(self, blob_root: Path) -> PreparedRichValue:
         if self._counts is None or self._edges is None:
-            blob_root.mkdir(parents=True, exist_ok=True)
+            _ensure_private_directory(blob_root)
             minimum = math.inf
             maximum = -math.inf
             value_count = 0
@@ -269,7 +311,7 @@ class Histogram(RichValue):
 
 def _install_bytes(blob_root: Path, data: bytes) -> tuple[str, int]:
     digest = hashlib.sha256(data).hexdigest()
-    blob_root.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(blob_root)
     final_path = blob_root / digest
     if not final_path.exists():
         temporary = tempfile.NamedTemporaryFile(  # noqa: SIM115 - closed before CAS install
@@ -290,7 +332,7 @@ def _install_bytes(blob_root: Path, data: bytes) -> tuple[str, int]:
 
 
 def _install_stream(blob_root: Path, source: BinaryIO) -> tuple[str, int]:
-    blob_root.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(blob_root)
     temporary = tempfile.NamedTemporaryFile(  # noqa: SIM115 - closed before CAS install
         dir=blob_root, delete=False
     )
@@ -322,6 +364,20 @@ def _install_temporary(blob_root: Path, temporary_path: Path, digest: str) -> No
         pass
     finally:
         temporary_path.unlink(missing_ok=True)
+    _fsync_directory(blob_root)
+
+
+def _ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -342,6 +398,7 @@ def _validate_mime_type(value: str) -> None:
         or not value
         or len(value.encode("utf-8")) > 256
         or "/" not in value
+        or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value)
     ):
         raise ValueError("mime_type must be a valid non-empty media type")
 
@@ -353,3 +410,12 @@ def _finite_float(value: Any, name: str) -> float:
     if not math.isfinite(number):
         raise ValueError(f"{name} must be finite")
     return number
+
+
+def _bounded_floats(values: Iterable[float], *, maximum: int, name: str) -> list[float]:
+    normalized: list[float] = []
+    for value in values:
+        if len(normalized) >= maximum:
+            raise ValueError(f"{name} collection cannot exceed {maximum} values")
+        normalized.append(_finite_float(value, name))
+    return normalized

@@ -1,7 +1,7 @@
 export const MAX_SELECTED_RUNS = 12;
 export const MAX_COMPARISON_CELLS = 20_000;
 export const MAX_COMPARISON_SERIES = 32;
-export const METRIC_CHART_PAGE_SIZE = 24;
+export const METRIC_CATALOG_PAGE_SIZE = 24;
 
 export type MetricSetMode = "union" | "intersection";
 export type RunAlignment = "step" | "relative-step" | "elapsed-time";
@@ -9,12 +9,6 @@ export type RunAlignment = "step" | "relative-step" | "elapsed-time";
 export type RunStyle = {
   color: string;
   pattern: "solid" | "dash" | "dot" | "dash-dot";
-};
-
-export type MetricAvailability = {
-  key: string;
-  available: number;
-  total: number;
 };
 
 export type ComparisonBatchCandidate = {
@@ -35,12 +29,14 @@ export type ComparisonCacheMetric = {
 
 export type ComparisonUrlState<TTab extends string> = {
   project: string | null;
+  reportId: string | null;
   runIds: string[];
   runSelectionSpecified: boolean;
   primaryRunId: string | null;
   tab: TTab;
   metricMode: MetricSetMode;
   search: string;
+  metricAfter: string | null;
   alignment: RunAlignment;
   chartMetric: string | null;
   chartViewport: { minimum: number; maximum: number } | null;
@@ -62,6 +58,10 @@ const RUN_COLORS = [
 ] as const;
 
 const RUN_PATTERNS = ["solid", "dash", "dot", "dash-dot"] as const;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_PROJECT_NAME_BYTES = 128;
+const MAX_SEARCH_BYTES = 256;
+const MAX_METRIC_KEY_BYTES = 256;
 
 export function normalizeRunSelection(
   requestedRunIds: readonly string[],
@@ -133,39 +133,6 @@ export function comparisonCacheKey(
   return JSON.stringify({ project, alignment, maxBuckets, viewport, metrics });
 }
 
-export function metricPage<T>(
-  values: readonly T[],
-  requestedPage: number,
-  pageSize = METRIC_CHART_PAGE_SIZE,
-): { page: number; pageCount: number; values: T[] } {
-  if (!Number.isInteger(pageSize) || pageSize < 1) {
-    throw new Error("metric page size must be a positive integer");
-  }
-  const pageCount = Math.max(1, Math.ceil(values.length / pageSize));
-  const normalizedPage = Number.isFinite(requestedPage) ? Math.floor(requestedPage) : 0;
-  const page = Math.max(0, Math.min(normalizedPage, pageCount - 1));
-  const start = page * pageSize;
-  return { page, pageCount, values: values.slice(start, start + pageSize) };
-}
-
-export function metricAvailability(
-  runIds: readonly string[],
-  keysByRun: Readonly<Record<string, readonly string[]>>,
-  mode: MetricSetMode,
-): MetricAvailability[] {
-  if (runIds.length === 0) return [];
-  const counts = new Map<string, number>();
-  for (const runId of runIds) {
-    for (const key of new Set(keysByRun[runId] ?? [])) {
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
-  }
-  return [...counts]
-    .filter(([, available]) => mode === "union" || available === runIds.length)
-    .map(([key, available]) => ({ key, available, total: runIds.length }))
-    .sort((left, right) => left.key.localeCompare(right.key, undefined, { numeric: true }));
-}
-
 export function runStyle(runId: string): RunStyle {
   const hash = stableHash(runId);
   return {
@@ -182,7 +149,7 @@ export function readComparisonUrl<TTab extends string>(
   const requestedTab = url.searchParams.get("tab") as TTab | null;
   const requestedMode = url.searchParams.get("metricMode");
   const requestedAlignment = url.searchParams.get("alignment");
-  const chartMetric = cleanValue(url.searchParams.get("chart"));
+  const chartMetric = cleanBoundedValue(url.searchParams.get("chart"), MAX_METRIC_KEY_BYTES);
   const hasChartBounds = url.searchParams.has("xmin") && url.searchParams.has("xmax");
   const chartMinimum = Number(url.searchParams.get("xmin"));
   const chartMaximum = Number(url.searchParams.get("xmax"));
@@ -195,16 +162,15 @@ export function readComparisonUrl<TTab extends string>(
       ? { minimum: chartMinimum, maximum: chartMaximum }
       : null;
   return {
-    project: cleanValue(url.searchParams.get("project")),
+    project: cleanBoundedValue(url.searchParams.get("project"), MAX_PROJECT_NAME_BYTES),
+    reportId: cleanIdentifier(url.searchParams.get("report")),
     runSelectionSpecified: url.searchParams.has("run"),
-    runIds: url.searchParams.getAll("run").flatMap((runId) => {
-      const cleaned = cleanValue(runId);
-      return cleaned ? [cleaned] : [];
-    }),
-    primaryRunId: cleanValue(url.searchParams.get("primary")),
+    runIds: boundedRunIds(url.searchParams.getAll("run")),
+    primaryRunId: cleanIdentifier(url.searchParams.get("primary")),
     tab: requestedTab && validTabs.has(requestedTab) ? requestedTab : defaultTab,
     metricMode: requestedMode === "intersection" ? "intersection" : "union",
-    search: url.searchParams.get("search") ?? "",
+    search: cleanBoundedSearch(url.searchParams.get("search")),
+    metricAfter: cleanBoundedValue(url.searchParams.get("metric_after"), MAX_METRIC_KEY_BYTES),
     alignment:
       requestedAlignment === "relative-step" || requestedAlignment === "elapsed-time"
         ? requestedAlignment
@@ -221,11 +187,13 @@ export function writeComparisonUrl<TTab extends string>(
   const next = new URL(url);
   for (const key of [
     "project",
+    "report",
     "run",
     "primary",
     "tab",
     "metricMode",
     "search",
+    "metric_after",
     "alignment",
     "chart",
     "xmin",
@@ -234,12 +202,14 @@ export function writeComparisonUrl<TTab extends string>(
     next.searchParams.delete(key);
   }
   if (state.project) next.searchParams.set("project", state.project);
+  if (state.reportId) next.searchParams.set("report", state.reportId);
   if (state.runIds.length === 0) next.searchParams.append("run", "");
   else for (const runId of state.runIds) next.searchParams.append("run", runId);
   if (state.primaryRunId) next.searchParams.set("primary", state.primaryRunId);
   next.searchParams.set("tab", state.tab);
   next.searchParams.set("metricMode", state.metricMode);
   if (state.search) next.searchParams.set("search", state.search);
+  if (state.metricAfter) next.searchParams.set("metric_after", state.metricAfter);
   next.searchParams.set("alignment", state.alignment);
   if (state.chartMetric && state.chartViewport) {
     next.searchParams.set("chart", state.chartMetric);
@@ -252,6 +222,41 @@ export function writeComparisonUrl<TTab extends string>(
 function cleanValue(value: string | null): string | null {
   const cleaned = value?.trim();
   return cleaned ? cleaned : null;
+}
+
+function cleanBoundedValue(value: string | null, maxBytes: number): string | null {
+  const cleaned = cleanValue(value);
+  if (!cleaned || utf8Bytes(cleaned) > maxBytes || hasControlCharacter(cleaned)) return null;
+  return cleaned;
+}
+
+function cleanIdentifier(value: string | null): string | null {
+  const cleaned = cleanValue(value);
+  return cleaned && UUID_PATTERN.test(cleaned) ? cleaned : null;
+}
+
+function boundedRunIds(values: readonly string[]): string[] {
+  const unique = new Set<string>();
+  for (const value of values) {
+    const runId = cleanIdentifier(value);
+    if (runId) unique.add(runId);
+    if (unique.size >= MAX_SELECTED_RUNS) break;
+  }
+  return [...unique];
+}
+
+function cleanBoundedSearch(value: string | null): string {
+  if (value === null || utf8Bytes(value) > MAX_SEARCH_BYTES || hasControlCharacter(value))
+    return "";
+  return value;
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function hasControlCharacter(value: string): boolean {
+  return /[\u0000-\u001f\u007f-\u009f]/.test(value);
 }
 
 function stableHash(value: string): number {

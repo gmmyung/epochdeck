@@ -22,7 +22,13 @@ Complete JSON inputs, outputs, and messages are serialized once into the shared
 SHA-256 content-addressed blob store. The Python SDK installs that payload in
 its durable spool, appends the span to a separate fsynced journal, and uploads
 the blob before creating the catalog row. A stable client-assigned span ID makes
-the operation replay-safe after a lost response.
+the operation replay-safe after a lost response. SDK construction is explicitly
+bounded: serialized attributes may use at most 256 KiB and the complete JSON
+input/output/message document may use at most 16 MiB. Both limits are checked
+before the span enters durable storage. Each document permits at most 64 nested
+levels, while the complete aggregate payload and each attributes document permit
+at most 65,536 JSON value nodes. Integer values must remain in the signed
+JSON-safe range so dashboard decoding cannot round them.
 
 Search accepts a bounded token query and returns the same bounded newest-first
 span records as ordinary listing. Payload retrieval remains an explicit blob

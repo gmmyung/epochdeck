@@ -16,7 +16,8 @@
   import { onMount } from "svelte";
 
   import { readChartPreferences, rememberChartPreferences } from "./chart-preferences";
-  import { axisTicks, numericExtent, type ScaleMode, type SmoothingMode } from "./chart-data";
+  import { axisTicks, type ScaleMode, type SmoothingMode } from "./chart-data";
+  import { formatDurationMs } from "./resource-state";
   import {
     closestSeriesPoints,
     contiguousBucketRanges,
@@ -32,6 +33,24 @@
     type XAlignment,
   } from "./chart-series";
   import Icon from "./Icon.svelte";
+  import {
+    boundedDomain,
+    configuredChartViewport as configuredDomain,
+    fromScreenX,
+    fromScreenY,
+    insidePlot,
+    toScreenX,
+    toScreenY,
+    transformScale as transformed,
+    validateChartAxes as validateAxes,
+    viewportFromSelection,
+    type Domain,
+    type Drag,
+    type Frame,
+    type Point,
+    type Viewport,
+  } from "./metric-chart-viewport";
+  import MetricChartSettings from "./MetricChartSettings.svelte";
 
   export let metric: string;
   export let identity = metric;
@@ -45,25 +64,11 @@
     xMinimum: number | null,
     xMaximum: number | null,
   ) => void = () => {};
-  export let onalignmentchange: (metric: string, alignment: XAlignment) => void = () => {};
+  export let loadError: string | null = null;
+  export let onretry: (metric: string) => void = () => {};
 
   type InteractionMode = "pan" | "select";
   type DisplayMode = "band" | "line";
-  type Domain = { minimum: number; maximum: number };
-  type Viewport = { x: Domain; y: Domain };
-  type Point = { x: number; y: number };
-  type Frame = {
-    width: number;
-    height: number;
-    padding: { top: number; right: number; bottom: number; left: number };
-    x: Domain;
-    y: Domain;
-  };
-  type Drag = {
-    start: Point;
-    current: Point;
-    viewport: Viewport;
-  };
 
   const CANVAS_PIXEL_BUDGET = 8_000_000;
   const CANVAS_DIMENSION_LIMIT = 4_096;
@@ -82,11 +87,11 @@
 
   let card: HTMLElement;
   let canvas: HTMLCanvasElement;
-  let settings: HTMLDetailsElement;
-  let settingsSummary: HTMLElement;
+  let plotCanvas: HTMLCanvasElement;
   let expandButton: HTMLButtonElement;
   let visible = false;
-  let chartRevision = 0;
+  let layoutRevision = 0;
+  let overlayRevision = 0;
   let interactionMode: InteractionMode = "pan";
   let displayMode: DisplayMode = DEFAULT_PREFERENCES.displayMode;
   let smoothingMode: SmoothingMode = DEFAULT_PREFERENCES.smoothingMode;
@@ -127,17 +132,16 @@
   let domainValues: Array<number | null> = [];
   let axisWarning: string | null = null;
   let anyLoading = false;
-  let anyHistory = false;
+  let anyPending = false;
   let expanded = false;
   let settingsOpen = false;
   let mounted = false;
-  let layerListenersActive = false;
   let focusTrapActive = false;
   let ownsModalBodyLock = false;
   let restoreFocusElement: HTMLElement | null = null;
   let inertedElements: Array<{ element: HTMLElement; wasInert: boolean }> = [];
 
-  $: updateLayerListeners(settingsOpen, expanded);
+  $: updateLayerListeners(expanded);
 
   $: if (identity !== preferenceIdentity) {
     clearViewportRequest();
@@ -243,7 +247,9 @@
     domainValues,
   );
   $: anyLoading = series.some((item) => item.loading);
-  $: anyHistory = series.some((item) => item.history !== undefined);
+  $: anyPending = preparedSeries.some(
+    (item) => item.status === "loading" || item.status === "not-loaded",
+  );
   $: hoverPoints =
     hoverX !== null && frame
       ? closestSeriesPoints(
@@ -256,7 +262,7 @@
         )
       : [];
   $: if (tooltip && hoverPosition && hoverPoints.length > 0) {
-    queueTooltipPosition(tooltip, hoverPosition, hoverPoints.length, expanded, chartRevision);
+    queueTooltipPosition(tooltip, hoverPosition, overlayRevision);
   }
 
   onMount(() => {
@@ -271,12 +277,12 @@
       },
       { rootMargin: "500px 0px" },
     );
-    const resizeObserver = new ResizeObserver(() => (chartRevision += 1));
+    const resizeObserver = new ResizeObserver(redrawAll);
     const theme = window.matchMedia("(prefers-color-scheme: dark)");
-    const redraw = () => (chartRevision += 1);
+    const redraw = redrawAll;
     const repositionTooltip = () => {
       if (tooltip && hoverPosition && hoverPoints.length > 0) {
-        queueTooltipPosition(tooltip, hoverPosition, hoverPoints.length, expanded, chartRevision);
+        queueTooltipPosition(tooltip, hoverPosition, overlayRevision);
       }
     };
     observer.observe(card);
@@ -284,10 +290,10 @@
     theme.addEventListener("change", redraw);
     window.addEventListener("resize", repositionTooltip);
     window.addEventListener("scroll", repositionTooltip, true);
-    updateLayerListeners(settingsOpen, expanded);
+    updateLayerListeners(expanded);
     return () => {
       mounted = false;
-      updateLayerListeners(false, false);
+      updateLayerListeners(false);
       visible = false;
       onvisibilitychange(metric, false);
       observer.disconnect();
@@ -303,132 +309,26 @@
     };
   });
 
-  $: if (canvas && visible && renderableSeries.length > 0 && chartRevision >= 0) {
+  $: if (plotCanvas && visible && renderableSeries.length > 0 && layoutRevision >= 0) {
     drawChart(
-      canvas,
+      plotCanvas,
       renderableSeries,
       displayMode,
       xScale,
       yScale,
       configuredViewport,
       viewport,
-      hoverX,
-      hoverPoints,
-      drag,
       highlightedRunId,
     );
   }
 
-  function configuredDomain(
-    horizontalValues: Array<number | null>,
-    values: Array<number | null>,
-    horizontalScale: ScaleMode,
-    verticalScale: ScaleMode,
-    horizontalMinimum: string,
-    horizontalMaximum: string,
-    verticalMinimum: string,
-    verticalMaximum: string,
-  ): Viewport | null {
-    const xExtent = numericExtent(horizontalValues, horizontalScale);
-    const yExtent = numericExtent(values, verticalScale);
-    if (!xExtent || !yExtent) return null;
-    const rawX = manualDomain(xExtent, horizontalMinimum, horizontalMaximum, horizontalScale);
-    const rawY = manualDomain(yExtent, verticalMinimum, verticalMaximum, verticalScale);
-    return {
-      x: boundedDomain(
-        transformed(rawX.minimum, horizontalScale),
-        transformed(rawX.maximum, horizontalScale),
-        horizontalScale,
-      ),
-      y: boundedDomain(
-        transformed(rawY.minimum, verticalScale),
-        transformed(rawY.maximum, verticalScale),
-        verticalScale,
-      ),
-    };
+  $: if (canvas && visible && frame && renderableSeries.length > 0 && overlayRevision >= 0) {
+    drawInteraction(canvas, frame, xScale, yScale, hoverX, hoverPoints, drag, highlightedRunId);
   }
 
-  function manualDomain(
-    extent: [number, number],
-    minimumInput: string,
-    maximumInput: string,
-    scale: ScaleMode,
-  ): Domain {
-    const parsedMinimum = parseOptionalNumber(minimumInput);
-    const parsedMaximum = parseOptionalNumber(maximumInput);
-    const minimum = parsedMinimum ?? extent[0];
-    const maximum = parsedMaximum ?? extent[1];
-    if (
-      !Number.isFinite(minimum) ||
-      !Number.isFinite(maximum) ||
-      minimum >= maximum ||
-      (scale === "log" && minimum <= 0)
-    ) {
-      return { minimum: extent[0], maximum: extent[1] };
-    }
-    return { minimum, maximum };
-  }
-
-  function validateAxes(
-    horizontalMinimum: string,
-    horizontalMaximum: string,
-    horizontalScale: ScaleMode,
-    verticalMinimum: string,
-    verticalMaximum: string,
-    verticalScale: ScaleMode,
-    horizontalValues: Array<number | null>,
-    values: Array<number | null>,
-  ): string | null {
-    for (const [label, minimumInput, maximumInput, scale, extent] of [
-      [
-        "X",
-        horizontalMinimum,
-        horizontalMaximum,
-        horizontalScale,
-        numericExtent(horizontalValues, horizontalScale),
-      ],
-      ["Y", verticalMinimum, verticalMaximum, verticalScale, numericExtent(values, verticalScale)],
-    ] as const) {
-      const minimum = parseOptionalNumber(minimumInput);
-      const maximum = parseOptionalNumber(maximumInput);
-      if (minimumInput.trim() && minimum === null) return `${label} minimum must be a number.`;
-      if (maximumInput.trim() && maximum === null) return `${label} maximum must be a number.`;
-      if (minimum !== null && maximum !== null && minimum >= maximum) {
-        return `${label} minimum must be smaller than its maximum.`;
-      }
-      if (extent && (minimum ?? extent[0]) >= (maximum ?? extent[1])) {
-        return `${label} range does not overlap the automatic data range.`;
-      }
-      if (
-        extent &&
-        (!Number.isFinite(
-          transformed(maximum ?? extent[1], scale) - transformed(minimum ?? extent[0], scale),
-        ) ||
-          Math.abs(transformed(minimum ?? extent[0], scale)) > (scale === "log" ? 300 : 1e150) ||
-          Math.abs(transformed(maximum ?? extent[1], scale)) > (scale === "log" ? 300 : 1e150))
-      ) {
-        return `${label} range exceeds the supported chart domain.`;
-      }
-      if (
-        scale === "log" &&
-        ((minimum !== null && minimum <= 0) || (maximum !== null && maximum <= 0))
-      ) {
-        return `${label} logarithmic ranges must be positive.`;
-      }
-    }
-    if (horizontalScale === "log" && !numericExtent(horizontalValues, horizontalScale)) {
-      return "X logarithmic scale requires positive coordinates.";
-    }
-    if (verticalScale === "log" && !numericExtent(values, verticalScale)) {
-      return "Y logarithmic scale requires positive values.";
-    }
-    return null;
-  }
-
-  function parseOptionalNumber(input: string): number | null {
-    if (!input.trim()) return null;
-    const value = Number(input);
-    return Number.isFinite(value) ? value : null;
+  function redrawAll(): void {
+    layoutRevision += 1;
+    overlayRevision += 1;
   }
 
   function drawChart(
@@ -439,9 +339,6 @@
     verticalScale: ScaleMode,
     configured: Viewport | null,
     activeViewport: Viewport | null,
-    activeHoverX: number | null,
-    activeHoverPoints: SeriesHoverPoint[],
-    activeDrag: Drag | null,
     highlighted: string | null,
   ): void {
     const width = Math.max(target.clientWidth, 1);
@@ -474,8 +371,6 @@
     const styles = getComputedStyle(target);
     const gridColor = styles.getPropertyValue("--chart-grid").trim() || "#d9dde0";
     const mutedColor = styles.getPropertyValue("--muted").trim() || "#596168";
-    const surfaceColor = styles.getPropertyValue("--surface").trim() || "#ffffff";
-    const accentColor = styles.getPropertyValue("--accent").trim() || "#2766ad";
     const plotWidth = Math.max(width - padding.left - padding.right, 1);
     const plotHeight = Math.max(height - padding.top - padding.bottom, 1);
 
@@ -517,12 +412,53 @@
       );
     }
 
+    context.globalAlpha = 1;
+    context.restore();
+  }
+
+  function drawInteraction(
+    target: HTMLCanvasElement,
+    activeFrame: Frame,
+    horizontalScale: ScaleMode,
+    verticalScale: ScaleMode,
+    activeHoverX: number | null,
+    activeHoverPoints: SeriesHoverPoint[],
+    activeDrag: Drag | null,
+    highlighted: string | null,
+  ): void {
+    const { width, height, padding } = activeFrame;
+    const requestedRatio = Math.min(window.devicePixelRatio || 1, CANVAS_DPR_LIMIT);
+    const pixelBudgetRatio = Math.sqrt(CANVAS_PIXEL_BUDGET / (width * height));
+    const dimensionRatio = Math.min(
+      CANVAS_DIMENSION_LIMIT / width,
+      CANVAS_DIMENSION_LIMIT / height,
+    );
+    const ratio = Math.max(0.01, Math.min(requestedRatio, pixelBudgetRatio, dimensionRatio));
+    const pixelWidth = Math.floor(width * ratio);
+    const pixelHeight = Math.floor(height * ratio);
+    if (target.width !== pixelWidth) target.width = pixelWidth;
+    if (target.height !== pixelHeight) target.height = pixelHeight;
+    const context = target.getContext("2d");
+    if (!context) return;
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.clearRect(0, 0, target.width, target.height);
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    const styles = getComputedStyle(target);
+    const mutedColor = styles.getPropertyValue("--muted").trim() || "#596168";
+    const surfaceColor = styles.getPropertyValue("--surface").trim() || "#ffffff";
+    const accentColor = styles.getPropertyValue("--accent").trim() || "#2766ad";
+    const plotWidth = Math.max(width - padding.left - padding.right, 1);
+    const plotHeight = Math.max(height - padding.top - padding.bottom, 1);
+    context.save();
+    context.beginPath();
+    context.rect(padding.left, padding.top, plotWidth, plotHeight);
+    context.clip();
+
     if (activeDrag && interactionMode !== "pan") {
       const left = Math.min(activeDrag.start.x, activeDrag.current.x);
       const top = Math.min(activeDrag.start.y, activeDrag.current.y);
       const dragWidth = Math.abs(activeDrag.current.x - activeDrag.start.x);
       const dragHeight = Math.abs(activeDrag.current.y - activeDrag.start.y);
-      context.globalAlpha = 1;
       context.fillStyle = accentColor;
       context.globalAlpha = 0.12;
       context.fillRect(left, top, dragWidth, dragHeight);
@@ -538,7 +474,7 @@
       Number.isFinite(activeHoverX) &&
       (horizontalScale !== "log" || activeHoverX > 0)
     ) {
-      const x = toScreenX(activeHoverX, currentFrame, horizontalScale);
+      const x = toScreenX(activeHoverX, activeFrame, horizontalScale);
       context.globalAlpha = 1;
       context.strokeStyle = mutedColor;
       context.setLineDash([3, 3]);
@@ -547,14 +483,13 @@
       context.lineTo(x, height - padding.bottom);
       context.stroke();
       context.setLineDash([]);
-
       for (const point of activeHoverPoints) {
         const emphasized = highlighted === null || highlighted === point.series.runId;
         context.globalAlpha = emphasized ? 1 : 0.2;
         drawMarker(
           context,
-          toScreenX(point.x, currentFrame, horizontalScale),
-          toScreenY(point.smoothed, currentFrame, verticalScale),
+          toScreenX(point.x, activeFrame, horizontalScale),
+          toScreenY(point.smoothed, activeFrame, verticalScale),
           point.series.color,
           point.series.pattern,
           surfaceColor,
@@ -604,7 +539,7 @@
       context.moveTo(x, padding.top);
       context.lineTo(x, height - padding.bottom);
       context.stroke();
-      const label = formatAxis(tick);
+      const label = formatHorizontalAxis(tick);
       const measured = context.measureText(label).width;
       const labelX =
         index === 0
@@ -752,52 +687,6 @@
     );
   }
 
-  function transformed(value: number, scale: ScaleMode): number {
-    return scale === "log" ? Math.log10(value) : value;
-  }
-
-  function restored(value: number, scale: ScaleMode): number {
-    return scale === "log" ? 10 ** value : value;
-  }
-
-  function toScreenX(value: number, activeFrame: Frame, scale: ScaleMode): number {
-    const plotWidth = activeFrame.width - activeFrame.padding.left - activeFrame.padding.right;
-    const minimum = transformed(activeFrame.x.minimum, scale);
-    const maximum = transformed(activeFrame.x.maximum, scale);
-    return (
-      activeFrame.padding.left +
-      ((transformed(value, scale) - minimum) / Math.max(maximum - minimum, Number.EPSILON)) *
-        plotWidth
-    );
-  }
-
-  function toScreenY(value: number, activeFrame: Frame, scale: ScaleMode): number {
-    const plotHeight = activeFrame.height - activeFrame.padding.top - activeFrame.padding.bottom;
-    const minimum = transformed(activeFrame.y.minimum, scale);
-    const maximum = transformed(activeFrame.y.maximum, scale);
-    return (
-      activeFrame.padding.top +
-      ((maximum - transformed(value, scale)) / Math.max(maximum - minimum, Number.EPSILON)) *
-        plotHeight
-    );
-  }
-
-  function fromScreenX(value: number, activeFrame: Frame): number {
-    const plotWidth = activeFrame.width - activeFrame.padding.left - activeFrame.padding.right;
-    const ratio = (value - activeFrame.padding.left) / plotWidth;
-    const minimum = transformed(activeFrame.x.minimum, xScale);
-    const maximum = transformed(activeFrame.x.maximum, xScale);
-    return restored(minimum + ratio * (maximum - minimum), xScale);
-  }
-
-  function fromScreenY(value: number, activeFrame: Frame): number {
-    const plotHeight = activeFrame.height - activeFrame.padding.top - activeFrame.padding.bottom;
-    const ratio = (value - activeFrame.padding.top) / plotHeight;
-    const minimum = transformed(activeFrame.y.minimum, yScale);
-    const maximum = transformed(activeFrame.y.maximum, yScale);
-    return restored(maximum - ratio * (maximum - minimum), yScale);
-  }
-
   function topLayerTooltip(node: HTMLElement): { destroy: () => void } {
     tooltipPositioned = false;
     let opened = false;
@@ -814,13 +703,7 @@
     };
   }
 
-  function queueTooltipPosition(
-    target: HTMLElement,
-    point: Point,
-    _rowCount: number,
-    _expanded: boolean,
-    _revision: number,
-  ): void {
+  function queueTooltipPosition(target: HTMLElement, point: Point, _revision: number): void {
     if (tooltipPositionFrame !== null) window.cancelAnimationFrame(tooltipPositionFrame);
     tooltipPositionFrame = window.requestAnimationFrame(() => {
       tooltipPositionFrame = null;
@@ -832,7 +715,7 @@
       const viewportHeight = document.documentElement.clientHeight;
       const margin = 8;
       const gap = 12;
-      const width = Math.max(160, Math.min(790, viewportWidth - margin * 2));
+      const width = Math.max(240, Math.min(420, viewportWidth - margin * 2));
       const maximumHeight = Math.max(120, viewportHeight - margin * 2);
       target.style.width = `${width}px`;
       target.style.maxHeight = `${maximumHeight}px`;
@@ -887,7 +770,7 @@
     pendingPointer = null;
     hoverX = null;
     hoverPosition = null;
-    chartRevision += 1;
+    overlayRevision += 1;
   }
 
   function tooltipEnter(): void {
@@ -937,15 +820,15 @@
     if (drag) {
       drag = { ...drag, current: point };
       if (interactionMode === "pan") panTo(point);
-      chartRevision += 1;
+      overlayRevision += 1;
       return;
     }
     if (!insidePlot(point, frame) || renderableSeries.length === 0) {
       hoverX = null;
       return;
     }
-    hoverX = fromScreenX(point.x, frame);
-    chartRevision += 1;
+    hoverX = fromScreenX(point.x, frame, xScale);
+    overlayRevision += 1;
   }
 
   function pointerUp(event: PointerEvent): void {
@@ -958,10 +841,10 @@
     const distanceX = Math.abs(completed.current.x - completed.start.x);
     const distanceY = Math.abs(completed.current.y - completed.start.y);
     if (interactionMode === "select" && distanceX >= 6 && distanceY >= 6) {
-      viewport = viewportFromDrag(completed, frame);
+      viewport = viewportFromSelection(completed, frame, xScale, yScale);
     }
     if (interactionMode === "pan" || viewport !== null) scheduleViewportRequest(viewport);
-    chartRevision += 1;
+    overlayRevision += 1;
   }
 
   function pointerLeave(): void {
@@ -986,34 +869,6 @@
     };
   }
 
-  function viewportFromDrag(completed: Drag, activeFrame: Frame): Viewport {
-    const left = Math.max(
-      activeFrame.padding.left,
-      Math.min(completed.start.x, completed.current.x),
-    );
-    const right = Math.min(
-      activeFrame.width - activeFrame.padding.right,
-      Math.max(completed.start.x, completed.current.x),
-    );
-    const top = Math.max(activeFrame.padding.top, Math.min(completed.start.y, completed.current.y));
-    const bottom = Math.min(
-      activeFrame.height - activeFrame.padding.bottom,
-      Math.max(completed.start.y, completed.current.y),
-    );
-    return {
-      x: boundedDomain(
-        transformed(fromScreenX(left, activeFrame), xScale),
-        transformed(fromScreenX(right, activeFrame), xScale),
-        xScale,
-      ),
-      y: boundedDomain(
-        transformed(fromScreenY(bottom, activeFrame), yScale),
-        transformed(fromScreenY(top, activeFrame), yScale),
-        yScale,
-      ),
-    };
-  }
-
   function wheel(event: WheelEvent): void {
     if (!frame || !insidePlot(canvasPoint(event), frame)) return;
     event.preventDefault();
@@ -1022,8 +877,8 @@
 
   function zoomAt(point: Point, factor: number): void {
     if (!frame) return;
-    const anchorX = transformed(fromScreenX(point.x, frame), xScale);
-    const anchorY = transformed(fromScreenY(point.y, frame), yScale);
+    const anchorX = transformed(fromScreenX(point.x, frame, xScale), xScale);
+    const anchorY = transformed(fromScreenY(point.y, frame, yScale), yScale);
     const xMinimum = transformed(frame.x.minimum, xScale);
     const xMaximum = transformed(frame.x.maximum, xScale);
     const yMinimum = transformed(frame.y.minimum, yScale);
@@ -1042,29 +897,7 @@
       ),
     };
     scheduleViewportRequest(viewport);
-    chartRevision += 1;
-  }
-
-  function boundedDomain(minimum: number, maximum: number, scale: ScaleMode): Domain {
-    const limit = scale === "log" ? 300 : 1e150;
-    let lower = finiteClamp(minimum, limit);
-    let upper = finiteClamp(maximum, limit);
-    if (lower > upper) [lower, upper] = [upper, lower];
-    let center = lower / 2 + upper / 2;
-    const minimumSpan = Math.max(1e-12, Math.abs(center) * 1e-12);
-    let span = Math.min(Math.max(upper - lower, minimumSpan), limit * 2);
-    if (!Number.isFinite(span)) span = limit * 2;
-    const halfSpan = span / 2;
-    center = Math.max(-limit + halfSpan, Math.min(limit - halfSpan, center));
-    return {
-      minimum: restored(center - halfSpan, scale),
-      maximum: restored(center + halfSpan, scale),
-    };
-  }
-
-  function finiteClamp(value: number, limit: number): number {
-    if (Number.isFinite(value)) return Math.max(-limit, Math.min(limit, value));
-    return value < 0 ? -limit : limit;
+    overlayRevision += 1;
   }
 
   function pointerCancel(event: PointerEvent): void {
@@ -1072,11 +905,12 @@
     if (interactionMode === "pan" && drag) viewport = drag.viewport;
     drag = null;
     if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
-    chartRevision += 1;
+    overlayRevision += 1;
   }
 
   function chartKeydown(event: KeyboardEvent): void {
-    if (event.key === "Escape" && dismissChartLayer()) {
+    if (event.key === "Escape" && expanded) {
+      toggleExpanded();
       event.preventDefault();
       event.stopPropagation();
       return;
@@ -1086,20 +920,49 @@
       x: (frame.padding.left + frame.width - frame.padding.right) / 2,
       y: (frame.padding.top + frame.height - frame.padding.bottom) / 2,
     };
-    if (["+", "="].includes(event.key)) zoomAt(center, 0.5);
+    if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      moveKeyboardCrosshair(event.key);
+    } else if (["+", "="].includes(event.key)) zoomAt(center, 0.5);
     else if (event.key === "-") zoomAt(center, 2);
     else if (["0", "Escape"].includes(event.key)) resetView();
     else return;
     event.preventDefault();
   }
 
-  function insidePlot(point: Point, activeFrame: Frame): boolean {
-    return (
-      point.x >= activeFrame.padding.left &&
-      point.x <= activeFrame.width - activeFrame.padding.right &&
-      point.y >= activeFrame.padding.top &&
-      point.y <= activeFrame.height - activeFrame.padding.bottom
-    );
+  function moveKeyboardCrosshair(key: string): void {
+    if (!frame) return;
+    const coordinates = [
+      ...new Set(
+        renderableSeries.flatMap((candidate) =>
+          candidate.x.filter(
+            (coordinate) =>
+              Number.isFinite(coordinate) &&
+              coordinate >= frame!.x.minimum &&
+              coordinate <= frame!.x.maximum &&
+              (xScale !== "log" || coordinate > 0),
+          ),
+        ),
+      ),
+    ].sort((left, right) => left - right);
+    if (coordinates.length === 0) return;
+    let index: number;
+    if (key === "Home") index = 0;
+    else if (key === "End") index = coordinates.length - 1;
+    else if (hoverX === null) index = key === "ArrowLeft" ? coordinates.length - 1 : 0;
+    else if (key === "ArrowLeft") {
+      const previous = coordinates.findLastIndex((coordinate) => coordinate < hoverX!);
+      index = previous < 0 ? 0 : previous;
+    } else {
+      const next = coordinates.findIndex((coordinate) => coordinate > hoverX!);
+      index = next < 0 ? coordinates.length - 1 : next;
+    }
+    hoverX = coordinates[index];
+    hoverPosition = {
+      x: toScreenX(hoverX, frame, xScale),
+      y: frame.padding.top + (frame.height - frame.padding.top - frame.padding.bottom) / 2,
+    };
+    cancelTooltipHide();
+    overlayRevision += 1;
   }
 
   function resetTransientState(): void {
@@ -1110,7 +973,7 @@
     drag = null;
     hoverX = null;
     hoverPosition = null;
-    chartRevision += 1;
+    overlayRevision += 1;
   }
 
   function synchronizeParentViewport(
@@ -1136,7 +999,7 @@
       if (viewport !== null) {
         viewport = null;
         resetPointerState();
-        chartRevision += 1;
+        overlayRevision += 1;
       }
       return;
     }
@@ -1149,7 +1012,7 @@
     if (viewport && domainsEqual(viewport.x, nextX)) return;
     viewport = { x: nextX, y: viewport?.y ?? configured!.y };
     resetPointerState();
-    chartRevision += 1;
+    overlayRevision += 1;
   }
 
   function domainsEqual(left: Domain, right: Domain): boolean {
@@ -1192,31 +1055,7 @@
   function setInteraction(mode: InteractionMode): void {
     interactionMode = mode;
     drag = null;
-    chartRevision += 1;
-  }
-
-  function changeAlignment(event: Event): void {
-    const alignment = (event.currentTarget as HTMLSelectElement).value as XAlignment;
-    if (alignment === xAlignment) return;
-    onalignmentchange(metric, alignment);
-  }
-
-  function changeSmoothing(event: Event): void {
-    const mode = (event.currentTarget as HTMLSelectElement).value as SmoothingMode;
-    smoothingMode = mode;
-    if (mode === "ema") smoothingAmount = 0.15;
-    else if (mode === "time-ema") smoothingAmount = 25;
-    else if (mode === "running") smoothingAmount = 20;
-    else if (mode === "gaussian") smoothingAmount = 2;
-  }
-
-  function normalizeChartNumbers(): void {
-    if (!Number.isFinite(smoothingAmount)) {
-      smoothingAmount = smoothingMode === "ema" ? 0.15 : smoothingMode === "gaussian" ? 2 : 20;
-    }
-    const minimum = smoothingMode === "ema" ? 0.001 : 1;
-    const maximum = smoothingMode === "ema" ? 1 : 500;
-    smoothingAmount = Math.max(minimum, Math.min(maximum, smoothingAmount));
+    overlayRevision += 1;
   }
 
   function toggleRun(runId: string): void {
@@ -1226,7 +1065,7 @@
     else next.add(runId);
     hiddenRunIds = next;
     hoverX = null;
-    chartRevision += 1;
+    overlayRevision += 1;
   }
 
   function toggleSolo(runId: string): void {
@@ -1240,7 +1079,7 @@
       );
     }
     hoverX = null;
-    chartRevision += 1;
+    overlayRevision += 1;
   }
 
   function exitSolo(): void {
@@ -1255,17 +1094,17 @@
     hiddenBeforeSolo = null;
     soloRunId = null;
     hoverX = null;
-    chartRevision += 1;
+    overlayRevision += 1;
   }
 
   function highlightRun(runId: string | null): void {
     highlightedRunId = runId;
-    chartRevision += 1;
+    overlayRevision += 1;
   }
 
   function toggleExpanded(): void {
     const nextExpanded = !expanded;
-    closeSettings(false);
+    settingsOpen = false;
     if (nextExpanded) {
       restoreFocusElement =
         document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -1274,7 +1113,7 @@
     setModalBodyLock(expanded);
     setSurroundingContentInert(expanded);
     window.requestAnimationFrame(() => {
-      chartRevision += 1;
+      redrawAll();
       if (expanded) {
         expandButton?.focus();
       } else {
@@ -1290,49 +1129,23 @@
       trapFocus(event);
       return;
     }
-    if (event.key !== "Escape" || !dismissChartLayer()) return;
+    if (event.key !== "Escape" || !expanded) return;
+    toggleExpanded();
     event.preventDefault();
     event.stopPropagation();
   }
 
-  function dismissChartLayer(): boolean {
-    if (settingsOpen) {
-      closeSettings(true);
-      return true;
-    }
-    if (!expanded) return false;
-    toggleExpanded();
-    return true;
-  }
-
-  function closeSettings(restoreFocus: boolean): void {
-    if (!settingsOpen) return;
-    settingsOpen = false;
-    if (restoreFocus) window.requestAnimationFrame(() => settingsSummary?.focus());
-  }
-
-  function documentPointerDown(event: PointerEvent): void {
-    if (!settingsOpen || settings.contains(event.target as Node)) return;
-    closeSettings(false);
-  }
-
-  function updateLayerListeners(open: boolean, enlarged: boolean): void {
-    const active = mounted && (open || enlarged);
-    if (active !== layerListenersActive) {
-      layerListenersActive = active;
-      if (active) {
-        window.addEventListener("keydown", cardKeydown);
-        document.addEventListener("pointerdown", documentPointerDown);
-      } else {
-        window.removeEventListener("keydown", cardKeydown);
-        document.removeEventListener("pointerdown", documentPointerDown);
-      }
-    }
+  function updateLayerListeners(enlarged: boolean): void {
     const trapActive = mounted && enlarged;
     if (trapActive !== focusTrapActive) {
       focusTrapActive = trapActive;
-      if (trapActive) document.addEventListener("focusin", documentFocusIn);
-      else document.removeEventListener("focusin", documentFocusIn);
+      if (trapActive) {
+        window.addEventListener("keydown", cardKeydown);
+        document.addEventListener("focusin", documentFocusIn);
+      } else {
+        window.removeEventListener("keydown", cardKeydown);
+        document.removeEventListener("focusin", documentFocusIn);
+      }
     }
   }
 
@@ -1415,13 +1228,6 @@
     }
   }
 
-  function smoothingAmountLabel(mode: SmoothingMode): string {
-    if (mode === "time-ema") return "Time constant (seconds)";
-    if (mode === "running") return "Window (points)";
-    if (mode === "gaussian") return "Sigma (points)";
-    return "Alpha";
-  }
-
   function alignmentLabel(alignment: XAlignment): string {
     if (alignment === "relative-step") return "Relative step";
     if (alignment === "elapsed-time") return "Elapsed time";
@@ -1443,25 +1249,8 @@
     return value.toLocaleString(undefined, { maximumFractionDigits: 4 });
   }
 
-  function formatNullable(value: number | null): string {
-    return value === null ? "—" : formatAxis(value);
-  }
-
-  function formatRange(minimum: number | null, maximum: number | null): string {
-    if (minimum === null || maximum === null) return "—";
-    return `${formatAxis(minimum)}–${formatAxis(maximum)}`;
-  }
-
-  function formatTimestamp(timestamp: number): string {
-    if (!Number.isFinite(timestamp)) return "—";
-    return new Date(timestamp).toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      fractionalSecondDigits: 3,
-    });
+  function formatHorizontalAxis(value: number): string {
+    return xAlignment === "elapsed-time" ? formatDurationMs(value) : formatAxis(value);
   }
 </script>
 
@@ -1481,6 +1270,7 @@
   class:tooltip-open={hoverPoints.length > 0 && hoverPosition !== null}
   role={expanded ? "dialog" : undefined}
   aria-modal={expanded ? "true" : undefined}
+  aria-keyshortcuts={expanded ? "Escape" : undefined}
   aria-label={`${title ?? metric} metric comparison panel`}
 >
   <div class="chart-heading">
@@ -1513,92 +1303,21 @@
         aria-label={expanded ? "Collapse chart" : "Enlarge chart"}
         onclick={toggleExpanded}><Icon name={expanded ? "minimize" : "expand"} size={14} /></button
       >
-      <details bind:this={settings} bind:open={settingsOpen} class="chart-settings">
-        <summary
-          bind:this={settingsSummary}
-          aria-label="Chart settings"
-          aria-expanded={settingsOpen}><Icon name="settings" size={14} /></summary
-        >
-        <div class="chart-settings-popover" role="group" aria-label="Chart display settings">
-          <label>
-            X alignment
-            <select value={xAlignment} onchange={changeAlignment}>
-              <option value="step">Absolute step</option>
-              <option value="relative-step">Relative step</option>
-              <option value="elapsed-time">Elapsed time</option>
-            </select>
-          </label>
-          <label>
-            Display
-            <select bind:value={displayMode}>
-              <option value="band">Band</option>
-              <option value="line">Line</option>
-            </select>
-          </label>
-          <label>
-            Smoothing
-            <select value={smoothingMode} onchange={changeSmoothing}>
-              <option value="none">None</option>
-              <option value="time-ema">Time-weighted EMA</option>
-              <option value="running">Running average</option>
-              <option value="gaussian">Gaussian</option>
-              <option value="ema">EMA</option>
-            </select>
-          </label>
-          {#if smoothingMode !== "none"}
-            <label>
-              {smoothingAmountLabel(smoothingMode)}
-              <input
-                type="number"
-                min={smoothingMode === "ema" ? 0.001 : 1}
-                max={smoothingMode === "ema" ? 1 : 500}
-                step={smoothingMode === "ema" ? 0.001 : 1}
-                bind:value={smoothingAmount}
-                onchange={normalizeChartNumbers}
-              />
-            </label>
-          {/if}
-          <fieldset>
-            <legend>X axis · {alignmentLabel(xAlignment)}</legend>
-            <select aria-label="X axis scale" bind:value={xScale} onchange={resetView}>
-              <option value="linear">Linear</option>
-              <option value="log">Log</option>
-            </select>
-            <input
-              aria-label="X axis minimum"
-              placeholder="Auto min"
-              bind:value={xMinimum}
-              onchange={resetView}
-            />
-            <input
-              aria-label="X axis maximum"
-              placeholder="Auto max"
-              bind:value={xMaximum}
-              onchange={resetView}
-            />
-          </fieldset>
-          <fieldset>
-            <legend>Y axis</legend>
-            <select aria-label="Y axis scale" bind:value={yScale} onchange={resetView}>
-              <option value="linear">Linear</option>
-              <option value="log">Log</option>
-            </select>
-            <input
-              aria-label="Y axis minimum"
-              placeholder="Auto min"
-              bind:value={yMinimum}
-              onchange={resetView}
-            />
-            <input
-              aria-label="Y axis maximum"
-              placeholder="Auto max"
-              bind:value={yMaximum}
-              onchange={resetView}
-            />
-          </fieldset>
-          {#if axisWarning}<p class="chart-warning">{axisWarning}</p>{/if}
-        </div>
-      </details>
+      <MetricChartSettings
+        bind:open={settingsOpen}
+        bind:displayMode
+        bind:smoothingMode
+        bind:smoothingAmount
+        {xAlignment}
+        bind:xScale
+        bind:yScale
+        bind:xMinimum
+        bind:xMaximum
+        bind:yMinimum
+        bind:yMaximum
+        {axisWarning}
+        onviewchange={resetView}
+      />
     </div>
   </div>
 
@@ -1645,12 +1364,21 @@
     </div>
   {/if}
 
+  {#if loadError}
+    <div class="chart-load-error" role="alert">
+      <span>{loadError}</span>
+      <button type="button" onclick={() => onretry(metric)}>Retry</button>
+    </div>
+  {/if}
+
   {#if renderableSeries.length > 0}
     <div class={`chart-canvas-wrap chart-mode-${interactionMode}`}>
+      <canvas bind:this={plotCanvas} class="chart-plot-canvas" aria-hidden="true"></canvas>
       <canvas
         bind:this={canvas}
+        class="chart-interaction-canvas"
         tabindex="0"
-        aria-label={`${metric} comparison history chart. Use plus and minus to zoom and zero to reset.`}
+        aria-label={`${metric} comparison history chart. Use left and right arrows to inspect points, plus and minus to zoom, and zero to reset.`}
         onpointerdown={pointerDown}
         onpointermove={pointerMove}
         onpointerup={pointerUp}
@@ -1661,7 +1389,11 @@
       ></canvas>
       <span class="visually-hidden" aria-live="polite">
         {#if hoverPoints.length > 0}
-          {metric}, {hoverPoints.length} runs near x {formatAxis(hoverX ?? 0)}
+          {metric}, {hoverPoints.length} runs near x {formatHorizontalAxis(hoverX ?? 0)}.
+          {#each hoverPoints as point}
+            {point.series.runName}, value {formatAxis(point.smoothed)}, step
+            {formatAxis(point.step)}.
+          {/each}
         {/if}
       </span>
       {#if hoverPoints.length > 0 && hoverPosition}
@@ -1679,20 +1411,19 @@
         >
           <div class="tooltip-heading">
             <strong>{metric}</strong>
-            <span>{alignmentLabel(xAlignment)} {formatAxis(hoverX ?? 0)}</span>
+            <span>{alignmentLabel(xAlignment)} {formatHorizontalAxis(hoverX ?? 0)}</span>
           </div>
           <!-- svelte-ignore a11y_no_noninteractive_tabindex (scrollable comparison data needs keyboard focus) -->
           <div class="tooltip-table-wrap" role="region" tabindex="0" aria-label="Comparison values">
             <table>
+              <caption class="visually-hidden">
+                Nearest value and source step for each visible run
+              </caption>
               <thead>
                 <tr>
-                  <th>Run</th>
-                  <th>X</th>
-                  <th>Step</th>
-                  <th>Raw</th>
-                  <th>Smoothed</th>
-                  <th>Min–max</th>
-                  <th>Timestamp</th>
+                  <th scope="col">Run</th>
+                  <th scope="col">Value</th>
+                  <th scope="col">Step</th>
                 </tr>
               </thead>
               <tbody>
@@ -1700,20 +1431,18 @@
                   <tr
                     class:deemphasized={highlightedRunId && highlightedRunId !== point.series.runId}
                   >
-                    <th title={point.series.runName}>
-                      <span
-                        class={`series-swatch pattern-${point.series.pattern}`}
-                        style={`--series-color: ${point.series.color}`}
-                        aria-hidden="true"
-                      ></span>
-                      <span>{point.series.runName}</span>
+                    <th scope="row" title={point.series.runName}>
+                      <span class="tooltip-series">
+                        <span
+                          class={`series-swatch pattern-${point.series.pattern}`}
+                          style={`--series-color: ${point.series.color}`}
+                          aria-hidden="true"
+                        ></span>
+                        <span class="tooltip-run-name">{point.series.runName}</span>
+                      </span>
                     </th>
-                    <td>{formatAxis(point.x)}</td>
-                    <td>{formatAxis(point.step)}</td>
-                    <td>{formatNullable(point.raw)}</td>
                     <td>{formatAxis(point.smoothed)}</td>
-                    <td>{formatRange(point.minimum, point.maximum)}</td>
-                    <td>{formatTimestamp(point.timestamp)}</td>
+                    <td>{formatAxis(point.step)}</td>
                   </tr>
                 {/each}
               </tbody>
@@ -1722,9 +1451,11 @@
         </div>
       {/if}
     </div>
+  {:else if loadError}
+    <div class="chart-placeholder">History could not be loaded.</div>
   {:else if series.length === 0}
     <div class="chart-placeholder">Select at least one run to compare.</div>
-  {:else if anyLoading || !anyHistory}
+  {:else if anyPending}
     <div class="chart-placeholder">Loading bounded histories…</div>
   {:else}
     <div class="chart-placeholder">This metric has no data in the visible runs.</div>
@@ -1751,7 +1482,7 @@
 
   .chart-title small {
     color: var(--muted);
-    font-size: 9px;
+    font-size: 11px;
     font-weight: 500;
   }
 
@@ -1813,14 +1544,14 @@
   .legend-name {
     overflow: hidden;
     color: var(--text);
-    font-size: 10px;
+    font-size: 11px;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .legend-toggle small {
     color: var(--muted);
-    font-size: 8px;
+    font-size: 11px;
     white-space: nowrap;
   }
 
@@ -1831,14 +1562,14 @@
   .legend-solo {
     padding: 0 7px;
     border-left: 1px solid var(--line);
-    font-size: 8px;
+    font-size: 11px;
     text-transform: uppercase;
   }
 
   .legend-show-all {
     flex: none;
     padding: 6px 8px;
-    font-size: 9px;
+    font-size: 11px;
     white-space: nowrap;
   }
 
@@ -1901,15 +1632,22 @@
   }
 
   .chart-canvas-wrap {
+    position: relative;
     min-height: 0;
     flex: 1;
+  }
+
+  .chart-interaction-canvas {
+    position: absolute;
+    inset: 0;
+    background: transparent;
   }
 
   .comparison-tooltip {
     position: fixed;
     z-index: 1100;
     inset: auto;
-    width: min(790px, calc(100vw - 16px));
+    width: min(420px, calc(100vw - 16px));
     max-width: calc(100vw - 16px);
     max-height: calc(100dvh - 16px);
     display: block;
@@ -1927,13 +1665,21 @@
 
   .tooltip-heading {
     display: flex;
-    gap: 14px;
+    gap: 10px;
     justify-content: space-between;
-    padding: 8px 10px;
+    padding: 6px 8px;
     border-bottom: 1px solid var(--line);
   }
 
+  .tooltip-heading strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .tooltip-heading span {
+    flex: none;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1952,15 +1698,16 @@
 
   .comparison-tooltip table {
     width: 100%;
+    table-layout: fixed;
     border-collapse: collapse;
     color: var(--muted);
-    font-size: 9px;
+    font-size: 11px;
     white-space: nowrap;
   }
 
   .comparison-tooltip th,
   .comparison-tooltip td {
-    padding: 5px 7px;
+    padding: 4px 6px;
     border-bottom: 1px solid var(--line);
     text-align: right;
     font-variant-numeric: tabular-nums;
@@ -1972,37 +1719,72 @@
     top: 0;
     background: var(--panel);
     color: var(--faint);
-    font-size: 8px;
+    font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
   }
 
   .comparison-tooltip th:first-child {
-    max-width: 220px;
     text-align: left;
   }
 
-  .comparison-tooltip tbody th {
+  .comparison-tooltip th:nth-child(2),
+  .comparison-tooltip td:nth-child(2) {
+    width: 96px;
+  }
+
+  .comparison-tooltip th:nth-child(3),
+  .comparison-tooltip td:nth-child(3) {
+    width: 80px;
+  }
+
+  .tooltip-series {
     display: flex;
     gap: 6px;
     align-items: center;
+    min-width: 0;
+  }
+
+  .comparison-tooltip tbody th {
     overflow: hidden;
     color: var(--text);
     font-weight: 500;
   }
 
-  .comparison-tooltip tbody th > span:last-child {
+  .tooltip-run-name {
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .comparison-tooltip .series-swatch {
-    width: 20px;
+    flex: 0 0 16px;
+    width: 16px;
     transform: scale(0.8);
   }
 
   .comparison-tooltip tr.deemphasized {
     opacity: 0.34;
+  }
+
+  .chart-load-error {
+    min-height: 34px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 8px;
+    border-left: 3px solid var(--danger);
+    background: var(--error-bg);
+    color: var(--error-text);
+    font-size: 11px;
+  }
+
+  .chart-load-error button {
+    min-height: 26px;
+    padding: 0 9px;
+    border: 1px solid var(--error-line);
+    background: transparent;
   }
 
   .expanded .chart-legend {

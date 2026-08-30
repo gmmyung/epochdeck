@@ -38,8 +38,8 @@ offline operation and lost responses, but Runloom does not yet send email,
 webhook, or mobile notifications.
 
 System metrics are absolute host observations rather than a separate resource
-schema. Rich device-specific telemetry can later add namespaced scalar keys
-without a catalog migration.
+schema. Rich device-specific telemetry can add namespaced scalar keys without
+changing the catalog layout.
 
 ## Rejected alternatives
 

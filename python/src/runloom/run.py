@@ -1,17 +1,23 @@
 from __future__ import annotations
 
-import json
 import math
 import os
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping, MutableMapping
+import warnings
+from collections.abc import Callable, Iterator, Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
 from runloom._ids import uuid7
+from runloom._json_normalization import normalize_json_object
+from runloom._limits import MAX_SAFE_INTEGER
+from runloom._metrics import MAX_METRICS_PER_POINT, normalize_metrics
+from runloom._protocol import DeliveryError
+from runloom._spool import _Spool
+from runloom._summary import MAX_DERIVED_SUMMARY_KEYS, merge_metric_preview
 from runloom.artifact import Artifact
 from runloom.client import RunloomApiError, RunloomClient
 from runloom.rich import RichValue
@@ -25,15 +31,19 @@ _DEFAULT_BATCH_SIZE = 64
 _DEFAULT_FLUSH_INTERVAL = 0.25
 _DEFAULT_FINISH_TIMEOUT = 30.0
 _MAX_DOCUMENT_BYTES = 256 * 1024
-_SPOOL_FORMAT_VERSION = 1
+_MAX_DOCUMENT_DEPTH = 64
+_MAX_DOCUMENT_NODES = 65_536
+_MAX_LOG_VALUE_DEPTH = 64
+_MAX_LOG_VALUE_NODES = 65_536
+_MAX_RICH_VALUES_PER_LOG = 256
+_SPOOL_FORMAT_VERSION = 2
 _DEFAULT_SYSTEM_METRIC_INTERVAL = 15.0
-_SYSTEM_METRIC_PREFIX = "system/"
 _MAX_ALERT_TITLE_BYTES = 256
 _MAX_ALERT_TEXT_BYTES = 4_096
-
-
-class DeliveryError(RuntimeError):
-    pass
+_MAX_METRIC_REQUEST_BYTES = 1_750_000
+_SUMMARY_CHECKPOINT_RECORD_INTERVAL = 128
+_SUMMARY_CHECKPOINT_BYTE_INTERVAL = 512 * 1024
+_SUMMARY_RECOVERY_MAX_TAIL_BYTES = _SUMMARY_CHECKPOINT_BYTE_INTERVAL + 2 * 1024 * 1024 + 1
 
 
 class SweepEarlyStop(RuntimeError):
@@ -75,10 +85,6 @@ class _RunDocument(Mapping[str, Any]):
             self._data.clear()
             self._data.update(deepcopy(dict(values)))
 
-    def _merge_local(self, values: Mapping[str, Any]) -> None:
-        with self._lock:
-            self._data.update(deepcopy(dict(values)))
-
 
 class RunConfig(_RunDocument):
     def __init__(
@@ -105,7 +111,7 @@ class RunConfig(_RunDocument):
         self.update({key: value})
 
 
-class RunSummary(_RunDocument, MutableMapping[str, Any]):
+class RunSummary(_RunDocument):
     def __init__(
         self,
         initial: Mapping[str, Any],
@@ -130,327 +136,19 @@ class RunSummary(_RunDocument, MutableMapping[str, Any]):
     def __delitem__(self, key: str) -> None:
         raise TypeError(f"summary key deletion is not supported: {key}")
 
-
-class _Spool:
-    def __init__(self, root: Path, run_id: str) -> None:
-        self.directory = root / run_id
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.events_path = self.directory / "events.jsonl"
-        self.ack_path = self.directory / "ack"
-        self.metadata_path = self.directory / "run.json"
-        self.delivery_path = self.directory / "delivery.json"
-        self.alerts_path = self.directory / "alerts.jsonl"
-        self.alert_ack_path = self.directory / "alert-ack"
-        self.alert_delivery_path = self.directory / "alert-delivery.json"
-        self.rich_values_path = self.directory / "rich-values.jsonl"
-        self.rich_ack_path = self.directory / "rich-ack"
-        self.rich_delivery_path = self.directory / "rich-delivery.json"
-        self.blob_root = self.directory / "blobs"
-        self.artifacts_path = self.directory / "artifacts.jsonl"
-        self.artifact_ack_path = self.directory / "artifact-ack"
-        self.artifact_delivery_path = self.directory / "artifact-delivery.json"
-        self.traces_path = self.directory / "traces.jsonl"
-        self.trace_ack_path = self.directory / "trace-ack"
-        self.trace_delivery_path = self.directory / "trace-delivery.json"
-        self._lock = threading.Lock()
-        self.events_path.touch(exist_ok=True)
-        self.alerts_path.touch(exist_ok=True)
-        self.rich_values_path.touch(exist_ok=True)
-        self.artifacts_path.touch(exist_ok=True)
-        self.traces_path.touch(exist_ok=True)
-        self.blob_root.mkdir(exist_ok=True)
-
-    def read_metadata(self) -> dict[str, Any] | None:
-        with self._lock:
-            if not self.metadata_path.exists():
-                return None
-            return self._read_json_object(self.metadata_path, "run metadata")
-
-    def write_metadata(self, metadata: dict[str, Any]) -> None:
-        with self._lock:
-            _atomic_json_write(self.metadata_path, metadata)
-
-    def update_metadata(self, updates: Mapping[str, Any]) -> None:
-        with self._lock:
-            metadata = self._read_json_object(self.metadata_path, "run metadata")
-            metadata.update(deepcopy(dict(updates)))
-            _atomic_json_write(self.metadata_path, metadata)
-
-    def append(self, point: dict[str, Any]) -> None:
-        self._append_record(self.events_path, point)
-
-    def append_alert(self, alert: dict[str, Any]) -> None:
-        self._append_record(self.alerts_path, alert)
-
-    def append_rich_value(self, value: dict[str, Any]) -> None:
-        self._append_record(self.rich_values_path, value)
-
-    def append_artifact(self, artifact: dict[str, Any]) -> None:
-        self._append_record(self.artifacts_path, artifact)
-
-    def append_trace(self, trace: dict[str, Any]) -> None:
-        self._append_record(self.traces_path, trace)
-
-    def _append_record(self, path: Path, record: dict[str, Any]) -> None:
-        encoded = json.dumps(record, separators=(",", ":"), sort_keys=True, allow_nan=False)
-        with self._lock, path.open("a", encoding="utf-8") as stream:
-            stream.write(encoded)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-
-    def read_batch(self, limit: int) -> tuple[list[dict[str, Any]], int]:
-        return self._read_record_batch(
-            self.events_path,
-            self.ack_path,
-            self.delivery_path,
-            limit,
-        )
-
-    def read_alert(self) -> tuple[dict[str, Any] | None, int]:
-        alerts, offset = self._read_record_batch(
-            self.alerts_path,
-            self.alert_ack_path,
-            self.alert_delivery_path,
-            1,
-        )
-        return (alerts[0] if alerts else None), offset
-
-    def read_rich_value(self) -> tuple[dict[str, Any] | None, int]:
-        values, offset = self._read_record_batch(
-            self.rich_values_path,
-            self.rich_ack_path,
-            self.rich_delivery_path,
-            1,
-        )
-        return (values[0] if values else None), offset
-
-    def read_artifact(self) -> tuple[dict[str, Any] | None, int]:
-        artifacts, offset = self._read_record_batch(
-            self.artifacts_path,
-            self.artifact_ack_path,
-            self.artifact_delivery_path,
-            1,
-        )
-        return (artifacts[0] if artifacts else None), offset
-
-    def read_trace(self) -> tuple[dict[str, Any] | None, int]:
-        traces, offset = self._read_record_batch(
-            self.traces_path,
-            self.trace_ack_path,
-            self.trace_delivery_path,
-            1,
-        )
-        return (traces[0] if traces else None), offset
-
-    def _read_record_batch(
+    def _replace_metric_layer(
         self,
-        journal_path: Path,
-        ack_path: Path,
-        delivery_path: Path,
-        limit: int,
-    ) -> tuple[list[dict[str, Any]], int]:
+        previous: Mapping[str, float],
+        current: Mapping[str, float],
+        explicit: Mapping[str, Any],
+    ) -> None:
         with self._lock:
-            offset = self._read_ack(ack_path, journal_path)
-            size = journal_path.stat().st_size
-            delivery = self._read_delivery(delivery_path, offset, size)
-            fixed_end = int(delivery["end_offset"]) if delivery is not None else None
-            points: list[dict[str, Any]] = []
-            with journal_path.open("rb") as stream:
-                stream.seek(offset)
-                while len(points) < limit or fixed_end is not None:
-                    if fixed_end is not None and stream.tell() >= fixed_end:
-                        break
-                    line = stream.readline()
-                    if not line:
-                        break
-                    if fixed_end is not None and stream.tell() > fixed_end:
-                        raise DeliveryError(
-                            f"delivery boundary splits a journal record: {delivery_path}"
-                        )
-                    points.append(self._decode_record(line, stream.tell(), journal_path))
-                next_offset = stream.tell()
-            if fixed_end is not None and next_offset != fixed_end:
-                raise DeliveryError(f"delivery boundary is outside journal: {delivery_path}")
-            if points and delivery is None:
-                record_identity = points[0].get("sequence", points[0].get("id"))
-                if record_identity is None:
-                    raise DeliveryError(f"journal record has no durable identity: {journal_path}")
-                delivery = {
-                    "start_offset": offset,
-                    "end_offset": next_offset,
-                    "record_identity": str(record_identity),
-                }
-                _atomic_json_write(delivery_path, delivery)
-            if points:
-                expected_identity = points[0].get("sequence", points[0].get("id"))
-                stored_identity = delivery.get("record_identity", delivery.get("batch_sequence"))
-                if str(stored_identity) != str(expected_identity):
-                    raise DeliveryError(
-                        f"delivery identity does not match journal: {delivery_path}"
-                    )
-            return points, next_offset
-
-    def acknowledge(self, offset: int) -> None:
-        self._acknowledge(self.ack_path, self.delivery_path, offset)
-
-    def acknowledge_alert(self, offset: int) -> None:
-        self._acknowledge(self.alert_ack_path, self.alert_delivery_path, offset)
-
-    def acknowledge_rich_value(self, offset: int) -> None:
-        self._acknowledge(self.rich_ack_path, self.rich_delivery_path, offset)
-
-    def acknowledge_artifact(self, offset: int) -> None:
-        self._acknowledge(self.artifact_ack_path, self.artifact_delivery_path, offset)
-
-    def acknowledge_trace(self, offset: int) -> None:
-        self._acknowledge(self.trace_ack_path, self.trace_delivery_path, offset)
-
-    def _acknowledge(self, ack_path: Path, delivery_path: Path, offset: int) -> None:
-        with self._lock:
-            if delivery_path.exists():
-                delivery = self._read_json_object(delivery_path, "delivery state")
-                if int(delivery.get("end_offset", -1)) != offset:
-                    raise DeliveryError(
-                        f"acknowledgement does not match delivery boundary: {delivery_path}"
-                    )
-            _atomic_text_write(ack_path, str(offset))
-            delivery_path.unlink(missing_ok=True)
-
-    def pending(self) -> bool:
-        return (
-            self.pending_metrics()
-            or self.pending_alerts()
-            or self.pending_rich_values()
-            or self.pending_artifacts()
-            or self.pending_traces()
-        )
-
-    def pending_metrics(self) -> bool:
-        return self._pending(self.ack_path, self.events_path)
-
-    def pending_alerts(self) -> bool:
-        return self._pending(self.alert_ack_path, self.alerts_path)
-
-    def pending_rich_values(self) -> bool:
-        return self._pending(self.rich_ack_path, self.rich_values_path)
-
-    def pending_artifacts(self) -> bool:
-        return self._pending(self.artifact_ack_path, self.artifacts_path)
-
-    def pending_traces(self) -> bool:
-        return self._pending(self.trace_ack_path, self.traces_path)
-
-    def _pending(self, ack_path: Path, journal_path: Path) -> bool:
-        with self._lock:
-            return self._read_ack(ack_path, journal_path) < journal_path.stat().st_size
-
-    def last_point(self) -> dict[str, Any] | None:
-        return self._last_record(self.events_path)
-
-    def last_rich_value(self) -> dict[str, Any] | None:
-        return self._last_record(self.rich_values_path)
-
-    def blob_path(self, digest: str) -> Path:
-        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
-            raise DeliveryError("rich value blob has an invalid SHA-256 digest")
-        return self.blob_root / digest
-
-    def _last_record(self, path: Path) -> dict[str, Any] | None:
-        with self._lock, path.open("rb") as stream:
-            stream.seek(0, os.SEEK_END)
-            end = stream.tell()
-            if end == 0:
-                return None
-            position = end - 1
-            while position > 0:
-                stream.seek(position - 1)
-                if stream.read(1) == b"\n" and position < end - 1:
-                    break
-                position -= 1
-            stream.seek(position)
-            line = stream.readline()
-        return self._decode_record(line, end, path) if line.strip() else None
-
-    def pending_summary(self) -> dict[str, Any]:
-        with self._lock:
-            offset = self._read_ack(self.ack_path, self.events_path)
-            summary: dict[str, Any] = {}
-            known_keys: set[str] = set()
-            with self.events_path.open("rb") as stream:
-                stream.seek(offset)
-                while line := stream.readline():
-                    event = self._decode_record(line, stream.tell(), self.events_path)
-                    metrics = event.get("metrics")
-                    if not isinstance(metrics, dict):
-                        raise DeliveryError(
-                            f"journal event has no metric object: {self.events_path}"
-                        )
-                    summary_metrics = {
-                        key: value
-                        for key, value in metrics.items()
-                        if not key.startswith(_SYSTEM_METRIC_PREFIX)
-                    }
-                    new_keys = summary_metrics.keys() - known_keys
-                    summary.update(summary_metrics)
-                    if new_keys:
-                        known_keys.update(new_keys)
-                        summary = _normalize_document(summary, "summary")
-            return summary
-
-    def _read_delivery(
-        self,
-        delivery_path: Path,
-        offset: int,
-        size: int,
-    ) -> dict[str, Any] | None:
-        if not delivery_path.exists():
-            return None
-        delivery = self._read_json_object(delivery_path, "delivery state")
-        try:
-            start = int(delivery["start_offset"])
-            end = int(delivery["end_offset"])
-            identity = delivery.get("record_identity", delivery.get("batch_sequence"))
-            if not isinstance(identity, (str, int)) or isinstance(identity, bool):
-                raise TypeError
-        except (KeyError, TypeError, ValueError) as error:
-            raise DeliveryError(f"invalid delivery state: {delivery_path}") from error
-        if end <= offset:
-            delivery_path.unlink(missing_ok=True)
-            return None
-        if start != offset or end <= start or end > size:
-            raise DeliveryError(f"delivery state is outside journal: {delivery_path}")
-        return delivery
-
-    def _read_json_object(self, path: Path, name: str) -> dict[str, Any]:
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise DeliveryError(f"invalid {name}: {path}") from error
-        if not isinstance(value, dict):
-            raise DeliveryError(f"invalid {name}: {path}")
-        return value
-
-    def _decode_record(self, line: bytes, offset: int, path: Path) -> dict[str, Any]:
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise DeliveryError(f"invalid journal event ending at byte {offset}: {path}") from error
-        if not isinstance(value, dict):
-            raise DeliveryError(f"invalid journal event ending at byte {offset}: {path}")
-        return value
-
-    def _read_ack(self, ack_path: Path, journal_path: Path) -> int:
-        if not ack_path.exists():
-            return 0
-        try:
-            offset = int(ack_path.read_text(encoding="ascii"))
-        except (OSError, ValueError) as error:
-            raise DeliveryError(f"invalid spool acknowledgement: {ack_path}") from error
-        size = journal_path.stat().st_size
-        if offset < 0 or offset > size:
-            raise DeliveryError(f"spool acknowledgement is outside journal: {ack_path}")
-        return offset
+            for key in previous.keys() - current.keys():
+                if key not in explicit:
+                    self._data.pop(key, None)
+            for key, value in current.items():
+                if key not in explicit:
+                    self._data[key] = value
 
 
 class _DeliveryWorker(threading.Thread):
@@ -551,7 +249,10 @@ class _DeliveryWorker(threading.Thread):
                     self._client.create_trace_span(self._run_id, trace)
                     self._spool.acknowledge_trace(next_offset)
                 elif delivery == "metrics":
-                    points, next_offset = self._spool.read_batch(self._batch_size)
+                    points, next_offset = self._spool.read_batch(
+                        self._batch_size,
+                        request_byte_budget=_MAX_METRIC_REQUEST_BYTES,
+                    )
                     if not points:
                         continue
                     request = {"batch_sequence": points[0]["sequence"], "points": points}
@@ -608,6 +309,7 @@ class Run:
         transport: Any = None,
         sweep_trial_id: str | None = None,
     ) -> None:
+        run_id = _canonical_run_id(run_id)
         batch_size = _validate_batch_size(batch_size, "batch_size")
         if flush_interval < 0:
             raise ValueError("flush_interval cannot be negative")
@@ -633,6 +335,12 @@ class Run:
         self._system_sampler = system_sampler
         self._sweep_trial_id = sweep_trial_id
         self._stop_requested = threading.Event()
+        self._summary_event_offset = 0
+        self._latest_event_offset = 0
+        self._summary_tail_records = 0
+        self._explicit_summary: dict[str, Any] = {}
+        self._metric_summary: dict[str, float] = {}
+        self._summary_truncated = False
         self.config = RunConfig(
             initial_config,
             self._document_lock,
@@ -653,8 +361,18 @@ class Run:
         self._spool = _Spool(spool_root, run_id)
         stored_metadata = self._spool.read_metadata()
         stored_finishing = False
+        stored_explicit_summary: dict[str, Any] = {}
+        stored_metric_summary: dict[str, float] = {}
+        stored_summary_truncated = False
+        stored_summary_event_offset = 0
         if stored_metadata is not None:
             _validate_spool_identity(stored_metadata, project, run_id)
+            (
+                stored_explicit_summary,
+                stored_metric_summary,
+                stored_summary_truncated,
+                stored_summary_event_offset,
+            ) = _stored_summary_snapshot(stored_metadata)
             stored_finished = _metadata_flag(stored_metadata, "finished")
             stored_finishing = _metadata_flag(stored_metadata, "finishing")
             if resume == "never":
@@ -673,9 +391,6 @@ class Run:
                     "run.config.update(..., allow_val_change=True)"
                 )
             self.config._replace(stored_config)
-            self.summary._replace(
-                _normalize_document(stored_metadata.get("summary", {}), "summary")
-            )
             stored_name = stored_metadata.get("name")
             if stored_name is not None and not isinstance(stored_name, str):
                 raise DeliveryError("stored run name must be a string or null")
@@ -697,17 +412,33 @@ class Run:
         ]
         self._last_user_step = max(last_steps) if last_steps else None
         self._next_step = self._last_user_step + 1 if self._last_user_step is not None else 0
-        pending_summary = self._spool.pending_summary()
-        self.summary._replace(
-            _normalize_document({**self.summary.to_dict(), **pending_summary}, "summary")
+        (
+            recovered_metric_summary,
+            recovered_summary_truncated,
+            recovered_event_offset,
+        ) = self._spool.recover_summary(
+            stored_metric_summary,
+            stored_summary_truncated,
+            stored_summary_event_offset,
+            max_tail_records=_SUMMARY_CHECKPOINT_RECORD_INTERVAL,
+            max_tail_bytes=_SUMMARY_RECOVERY_MAX_TAIL_BYTES,
         )
+        self._explicit_summary = stored_explicit_summary
+        self._metric_summary = recovered_metric_summary
+        self._summary_truncated = recovered_summary_truncated
+        self._refresh_summary_view()
+        self._summary_event_offset = recovered_event_offset
+        self._latest_event_offset = recovered_event_offset
         metadata = {
             "format_version": _SPOOL_FORMAT_VERSION,
             "project": project,
             "id": run_id,
             "name": self.name,
             "config": self.config.to_dict(),
-            "summary": self.summary.to_dict(),
+            "explicit_summary": deepcopy(self._explicit_summary),
+            "metric_summary": deepcopy(self._metric_summary),
+            "summary_truncated": self._summary_truncated,
+            "summary_event_offset": self._summary_event_offset,
             "resume": resume,
             "server_url": server_url,
             "batch_size": self._batch_size,
@@ -740,7 +471,12 @@ class Run:
                     and not self._spool.pending()
                 ):
                     existing = self._client.get_run(run_id)
-                    actual_summary = _normalize_document(existing.get("summary", {}), "summary")
+                    (
+                        actual_explicit,
+                        actual_metric,
+                        actual_truncated,
+                    ) = _server_summary_components(existing)
+                    actual_summary = _summary_view(actual_metric, actual_explicit)
                     expected_summary = self.summary.to_dict()
                     if existing.get("state") == "finished" and all(
                         actual_summary.get(key) == value for key, value in expected_summary.items()
@@ -749,12 +485,18 @@ class Run:
                         self.config._replace(
                             _normalize_document(existing.get("config", {}), "config")
                         )
-                        self.summary._replace(actual_summary)
+                        self._explicit_summary = actual_explicit
+                        self._metric_summary = actual_metric
+                        self._summary_truncated = actual_truncated
+                        self._refresh_summary_view()
                         self._spool.update_metadata(
                             {
                                 "name": self.name,
                                 "config": self.config.to_dict(),
-                                "summary": actual_summary,
+                                "explicit_summary": deepcopy(self._explicit_summary),
+                                "metric_summary": deepcopy(self._metric_summary),
+                                "summary_truncated": self._summary_truncated,
+                                "summary_event_offset": self._latest_event_offset,
                                 "finished": True,
                                 "finishing": False,
                             }
@@ -773,18 +515,23 @@ class Run:
             self.config._replace(
                 _normalize_document(server_run.get("config", self.config.to_dict()), "config")
             )
-            server_summary = _normalize_document(
-                server_run.get("summary", {}),
-                "summary",
-            )
-            self.summary._replace(
-                _normalize_document(
-                    {**server_summary, **self.summary.to_dict(), **pending_summary},
-                    "summary",
-                )
-            )
             server_next_sequence = _response_position(response, "next_sequence", minimum=1)
             server_next_step = _response_position(response, "next_step", minimum=0)
+            (
+                server_explicit,
+                server_metric,
+                server_truncated,
+            ) = _server_summary_components(server_run)
+            self._explicit_summary = _normalize_document(
+                {**server_explicit, **self._explicit_summary},
+                "explicit summary",
+            )
+            self._metric_summary, self._summary_truncated = merge_metric_preview(
+                server_metric,
+                self._metric_summary,
+                truncated=server_truncated or self._summary_truncated,
+            )
+            self._refresh_summary_view()
             self._next_sequence = max(self._next_sequence, server_next_sequence)
             self._next_step = max(self._next_step, server_next_step)
             if self._next_step > 0:
@@ -793,7 +540,10 @@ class Run:
                 {
                     "name": self.name,
                     "config": self.config.to_dict(),
-                    "summary": self.summary.to_dict(),
+                    "explicit_summary": deepcopy(self._explicit_summary),
+                    "metric_summary": deepcopy(self._metric_summary),
+                    "summary_truncated": self._summary_truncated,
+                    "summary_event_offset": self._latest_event_offset,
                     "finishing": False,
                 }
             )
@@ -819,8 +569,19 @@ class Run:
     def __enter__(self) -> Run:
         return self
 
-    def __exit__(self, *_: object) -> None:
-        self.finish()
+    def __exit__(self, exception_type: object, exception: object, traceback: object) -> None:
+        if exception is None:
+            self.finish()
+            return
+        try:
+            self.finish()
+        except Exception as cleanup_error:
+            add_note = getattr(exception, "add_note", None)
+            if callable(add_note):
+                add_note(
+                    "Runloom also failed while finishing the run: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
 
     @property
     def finished(self) -> bool:
@@ -833,6 +594,10 @@ class Run:
     @property
     def should_stop(self) -> bool:
         return self._stop_requested.is_set()
+
+    @property
+    def summary_truncated(self) -> bool:
+        return self._summary_truncated
 
     def _set_finish_callback(self, callback: Callable[[Run], None]) -> None:
         self._finish_callback = callback
@@ -876,22 +641,30 @@ class Run:
     def _update_summary(self, updates: dict[str, Any]) -> None:
         with self._log_lock:
             self._ensure_documents_mutable()
-            merged = _normalize_document({**self.summary.to_dict(), **updates}, "summary")
-            authoritative = merged
+            merged = _normalize_document(
+                {**self._explicit_summary, **updates},
+                "explicit summary",
+            )
+            self._explicit_summary = merged
+            self._refresh_summary_view()
+            self._checkpoint_summary()
             if self.mode == "online":
                 assert self._client is not None
                 response = self._client.update_summary(self.id, updates)
-                server_summary = _normalize_document(
-                    response["run"].get("summary", merged),
-                    "summary",
+                server_explicit, server_metric, server_truncated = _server_summary_components(
+                    response["run"]
                 )
-                authoritative = _normalize_document(
-                    {**server_summary, **merged},
-                    "summary",
+                self._explicit_summary = _normalize_document(
+                    {**server_explicit, **merged},
+                    "explicit summary",
                 )
-            self.summary._replace(authoritative)
-            if self._spool is not None:
-                self._spool.update_metadata({"summary": authoritative})
+                self._metric_summary, self._summary_truncated = merge_metric_preview(
+                    server_metric,
+                    self._metric_summary,
+                    truncated=server_truncated or self._summary_truncated,
+                )
+                self._refresh_summary_view()
+            self._checkpoint_summary()
 
     def _ensure_documents_mutable(self) -> None:
         if self._finished or self._finishing:
@@ -908,6 +681,8 @@ class Run:
             metrics, rich_values = _flatten_log_values(data)
             if not metrics and not rich_values:
                 raise ValueError("log data contains no supported values")
+            if metrics:
+                metrics = normalize_metrics(metrics)
             selected_step = self._next_step if step is None else step
             _validate_step(selected_step)
             prepared_values = []
@@ -916,26 +691,28 @@ class Run:
                 for key, value in rich_values:
                     _validate_rich_key(key)
                     prepared_values.append((key, value._prepare(self._spool.blob_root)))
+            timestamp_ms = time.time_ns() // 1_000_000
+            rich_records = [
+                {
+                    "id": uuid7(),
+                    "key": key,
+                    "kind": prepared.kind,
+                    "step": selected_step,
+                    "timestamp_ms": timestamp_ms,
+                    "blob": prepared.blob,
+                    "metadata": _normalize_document(
+                        prepared.metadata,
+                        f"rich value '{key}' metadata",
+                    ),
+                }
+                for key, prepared in prepared_values
+            ]
             if metrics:
                 self._append_metrics(metrics, selected_step, advance_step=False, summarize=True)
-            if prepared_values:
+            if rich_records:
                 assert self._spool is not None
-                timestamp_ms = time.time_ns() // 1_000_000
-                for key, prepared in prepared_values:
-                    self._spool.append_rich_value(
-                        {
-                            "id": uuid7(),
-                            "key": key,
-                            "kind": prepared.kind,
-                            "step": selected_step,
-                            "timestamp_ms": timestamp_ms,
-                            "blob": prepared.blob,
-                            "metadata": _normalize_document(
-                                prepared.metadata,
-                                f"rich value '{key}' metadata",
-                            ),
-                        }
-                    )
+                for record in rich_records:
+                    self._spool.append_rich_value(record)
             self._last_user_step = selected_step
             self._next_step = selected_step + 1
         if self._worker is not None:
@@ -1099,17 +876,35 @@ class Run:
         advance_step: bool,
         summarize: bool,
     ) -> None:
+        normalized_metrics = normalize_metrics(metrics)
+        if self._next_sequence > MAX_SAFE_INTEGER:
+            raise ValueError(f"metric sequence cannot exceed {MAX_SAFE_INTEGER}")
+        if self._spool is not None and self._summary_checkpoint_due():
+            self._checkpoint_summary()
         point = {
             "sequence": self._next_sequence,
             "step": step,
             "timestamp_ms": time.time_ns() // 1_000_000,
-            "metrics": dict(metrics),
+            "metrics": normalized_metrics,
         }
         if self._spool is not None:
-            self._spool.append(point)
+            self._latest_event_offset = self._spool.append(point)
+            self._summary_tail_records += 1
         if summarize:
-            self.summary._merge_local(metrics)
+            previous_metric_summary = self._metric_summary
+            self._metric_summary, self._summary_truncated = merge_metric_preview(
+                self._metric_summary,
+                normalized_metrics,
+                truncated=self._summary_truncated,
+            )
+            self.summary._replace_metric_layer(
+                previous_metric_summary,
+                self._metric_summary,
+                self._explicit_summary,
+            )
         self._next_sequence += 1
+        if self._spool is not None and self._summary_checkpoint_due():
+            self._checkpoint_summary()
         if advance_step:
             self._next_step = step + 1
 
@@ -1144,26 +939,23 @@ class Run:
                 return
             if timeout <= 0:
                 raise ValueError("finish timeout must be positive")
-            explicit_summary = _normalize_document(summary or {}, "summary")
-            final_summary = _normalize_document(
-                {**self.summary.to_dict(), **explicit_summary},
-                "summary",
+            finish_summary = _normalize_document(summary or {}, "explicit summary")
+            self._explicit_summary = _normalize_document(
+                {**self._explicit_summary, **finish_summary},
+                "explicit summary",
             )
+            self._refresh_summary_view()
             self._finishing = True
             if self._spool is not None:
-                self._spool.update_metadata({"finishing": True, "summary": final_summary})
+                self._checkpoint_summary({"finishing": True})
         deadline = time.monotonic() + timeout
         self._stop_system_monitor(timeout)
         if self.mode == "disabled":
-            self.summary._replace(final_summary)
             self._complete()
             return
         assert self._spool is not None
         if self.mode == "offline":
-            self.summary._replace(final_summary)
-            self._spool.update_metadata(
-                {"finished": True, "finishing": False, "summary": final_summary}
-            )
+            self._spool.update_metadata({"finished": True, "finishing": False})
             self._complete()
             return
 
@@ -1177,17 +969,52 @@ class Run:
             if error is not None:
                 message = f"{message}: {error}"
             raise DeliveryError(message)
-        response = self._client.finish_run(self.id, final_summary)
-        authoritative_summary = _normalize_document(
-            response["run"].get("summary", final_summary),
-            "summary",
-        )
-        self.summary._replace(authoritative_summary)
-        self._spool.update_metadata(
-            {"finished": True, "finishing": False, "summary": authoritative_summary}
-        )
+        response = self._client.finish_run(self.id, self._explicit_summary)
+        (
+            self._explicit_summary,
+            self._metric_summary,
+            self._summary_truncated,
+        ) = _server_summary_components(response["run"])
+        self._refresh_summary_view()
+        self._checkpoint_summary({"finished": True, "finishing": False})
         self._client.close()
+        try:
+            self._spool.reclaim_delivered()
+            self._summary_event_offset = 0
+            self._latest_event_offset = 0
+            self._spool.update_metadata({"summary_event_offset": 0})
+        except OSError as error:
+            warnings.warn(
+                f"Runloom could not reclaim the acknowledged spool: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self._complete()
+
+    def _checkpoint_summary(self, updates: Mapping[str, Any] | None = None) -> None:
+        if self._spool is None:
+            return
+        metadata_updates: dict[str, Any] = {
+            "explicit_summary": deepcopy(self._explicit_summary),
+            "metric_summary": deepcopy(self._metric_summary),
+            "summary_truncated": self._summary_truncated,
+            "summary_event_offset": self._latest_event_offset,
+        }
+        if updates is not None:
+            metadata_updates.update(dict(updates))
+        self._spool.update_metadata(metadata_updates)
+        self._summary_event_offset = self._latest_event_offset
+        self._summary_tail_records = 0
+
+    def _summary_checkpoint_due(self) -> bool:
+        return (
+            self._summary_tail_records >= _SUMMARY_CHECKPOINT_RECORD_INTERVAL
+            or self._latest_event_offset - self._summary_event_offset
+            >= _SUMMARY_CHECKPOINT_BYTE_INTERVAL
+        )
+
+    def _refresh_summary_view(self) -> None:
+        self.summary._replace(_summary_view(self._metric_summary, self._explicit_summary))
 
 
 def create_run(
@@ -1215,7 +1042,7 @@ def create_run(
         raise ValueError("resume='must' requires an explicit run_id")
     if mode == "disabled" and resume != "never":
         raise ValueError("disabled mode does not support resume policies")
-    selected_id = run_id or uuid7()
+    selected_id = _canonical_run_id(run_id) if run_id is not None else uuid7()
     selected_spool_root = Path(
         spool_root
         or os.environ.get("RUNLOOM_SPOOL_DIR")
@@ -1247,9 +1074,16 @@ def sync_spool(
     timeout: float = _DEFAULT_FINISH_TIMEOUT,
     transport: Any = None,
 ) -> str:
-    spool_directory = Path(directory)
+    spool_directory = Path(directory).expanduser().resolve()
     if timeout <= 0:
         raise ValueError("sync timeout must be positive")
+    raw_run_id = spool_directory.name
+    try:
+        run_id = _canonical_run_id(raw_run_id)
+    except (TypeError, ValueError) as error:
+        raise DeliveryError("spool directory name must be a canonical UUID") from error
+    if run_id != raw_run_id:
+        raise DeliveryError("spool directory name must be a canonical UUID")
     metadata_path = spool_directory / "run.json"
     if not metadata_path.is_file():
         raise DeliveryError(f"offline run metadata was not found: {metadata_path}")
@@ -1257,12 +1091,27 @@ def sync_spool(
     metadata = spool.read_metadata()
     if metadata is None:
         raise DeliveryError(f"offline run metadata was not found: {spool.metadata_path}")
-    run_id = spool_directory.name
     project = metadata.get("project")
     if not isinstance(project, str) or not project:
         raise DeliveryError("run spool metadata has no valid project")
     _validate_spool_identity(metadata, project, run_id)
+    (
+        explicit_summary,
+        metric_summary,
+        summary_truncated,
+        summary_event_offset,
+    ) = _stored_summary_snapshot(metadata)
+    metric_summary, summary_truncated, _ = spool.recover_summary(
+        metric_summary,
+        summary_truncated,
+        summary_event_offset,
+        max_tail_records=_SUMMARY_CHECKPOINT_RECORD_INTERVAL,
+        max_tail_bytes=_SUMMARY_RECOVERY_MAX_TAIL_BYTES,
+    )
+    expected_summary = _summary_view(metric_summary, explicit_summary)
     finished = _metadata_flag(metadata, "finished")
+    if not finished:
+        raise DeliveryError("sync requires an offline run that has been finished")
     selected_server = server_url if server_url is not None else metadata.get("server_url")
     if not isinstance(selected_server, str) or not selected_server:
         raise DeliveryError("run spool metadata has no valid server URL")
@@ -1281,8 +1130,8 @@ def sync_spool(
             if error.status_code != 409 or not finished:
                 raise
             existing = client.get_run(run_id)
-            expected_summary = _normalize_document(metadata.get("summary", {}), "summary")
-            actual_summary = _normalize_document(existing.get("summary", {}), "summary")
+            actual_explicit, actual_metric, _ = _server_summary_components(existing)
+            actual_summary = _summary_view(actual_metric, actual_explicit)
             if existing.get("state") != "finished" or any(
                 actual_summary.get(key) != value for key, value in expected_summary.items()
             ):
@@ -1309,22 +1158,17 @@ def sync_spool(
             if worker.last_error is not None:
                 message = f"{message}: {worker.last_error}"
             raise DeliveryError(message)
-        if finished:
-            client.finish_run(
-                run_id,
-                _normalize_document(metadata.get("summary", {}), "summary"),
-            )
-        else:
-            summary = _normalize_document(metadata.get("summary", {}), "summary")
-            if summary:
-                client.update_summary(run_id, summary)
+        client.finish_run(
+            run_id,
+            explicit_summary,
+        )
     finally:
         client.close()
     return run_id
 
 
 def _validate_spool_identity(metadata: Mapping[str, Any], project: str, run_id: str) -> None:
-    format_version = metadata.get("format_version", _SPOOL_FORMAT_VERSION)
+    format_version = metadata.get("format_version")
     stored_project = metadata.get("project")
     stored_id = metadata.get("id")
     if (
@@ -1345,10 +1189,87 @@ def _validate_spool_identity(metadata: Mapping[str, Any], project: str, run_id: 
 
 
 def _metadata_flag(metadata: Mapping[str, Any], name: str) -> bool:
-    value = metadata.get(name, False)
+    value = metadata.get(name)
     if not isinstance(value, bool):
         raise DeliveryError(f"run spool metadata field '{name}' must be boolean")
     return value
+
+
+def _stored_summary_snapshot(
+    metadata: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, float], bool, Any]:
+    explicit = metadata.get("explicit_summary")
+    metric = metadata.get("metric_summary")
+    truncated = metadata.get("summary_truncated")
+    if not isinstance(explicit, Mapping):
+        raise DeliveryError("run spool metadata has no explicit summary object")
+    if not isinstance(metric, Mapping):
+        raise DeliveryError("run spool metadata has no metric summary object")
+    if not isinstance(truncated, bool):
+        raise DeliveryError("run spool metadata has no boolean summary truncation flag")
+    try:
+        normalized_explicit = _normalize_document(explicit, "explicit summary")
+        normalized_metric = _normalize_metric_summary(metric, "stored metric summary")
+    except (TypeError, ValueError) as error:
+        raise DeliveryError(f"invalid run spool summary snapshot: {error}") from error
+    if truncated and len(normalized_metric) != MAX_DERIVED_SUMMARY_KEYS:
+        raise DeliveryError("truncated run spool metric summary is incomplete")
+    return (
+        normalized_explicit,
+        normalized_metric,
+        truncated,
+        metadata.get("summary_event_offset"),
+    )
+
+
+def _server_summary_components(
+    run: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, float], bool]:
+    explicit = run.get("explicit_summary")
+    metric = run.get("metric_summary")
+    merged = run.get("summary")
+    truncated = run.get("summary_truncated")
+    if not isinstance(explicit, Mapping) or not isinstance(metric, Mapping):
+        raise DeliveryError("server run response has no summary components")
+    if not isinstance(merged, Mapping) or not isinstance(truncated, bool):
+        raise DeliveryError("server run response has an invalid summary view")
+    try:
+        normalized_explicit = _normalize_document(explicit, "server explicit summary")
+        normalized_metric = _normalize_metric_summary(metric, "server metric summary")
+        normalized_merged = _normalize_document(
+            merged,
+            "server summary view",
+            maximum=2 * _MAX_DOCUMENT_BYTES,
+        )
+    except (TypeError, ValueError) as error:
+        raise DeliveryError(f"server run response has invalid summary data: {error}") from error
+    if truncated and len(normalized_metric) != MAX_DERIVED_SUMMARY_KEYS:
+        raise DeliveryError("server run response has an incomplete truncated metric summary")
+    if normalized_merged != _summary_view(normalized_metric, normalized_explicit):
+        raise DeliveryError("server run response summary does not match its components")
+    return normalized_explicit, normalized_metric, truncated
+
+
+def _normalize_metric_summary(values: Mapping[str, Any], name: str) -> dict[str, float]:
+    if len(values) > MAX_DERIVED_SUMMARY_KEYS:
+        raise ValueError(f"{name} cannot contain more than {MAX_DERIVED_SUMMARY_KEYS} keys")
+    if not values:
+        return {}
+    normalized = normalize_metrics(values)
+    if any(key.startswith("system/") for key in values):
+        raise ValueError(f"{name} cannot contain system metrics")
+    return normalized
+
+
+def _summary_view(
+    metric_summary: Mapping[str, float],
+    explicit_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _normalize_document(
+        {**metric_summary, **explicit_summary},
+        "summary view",
+        maximum=2 * _MAX_DOCUMENT_BYTES,
+    )
 
 
 def _validate_batch_size(value: Any, name: str) -> int:
@@ -1359,9 +1280,23 @@ def _validate_batch_size(value: Any, name: str) -> int:
     return value
 
 
+def _canonical_run_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise TypeError("run_id must be a UUID string")
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as error:
+        raise ValueError("run_id must be a valid UUID") from error
+
+
 def _response_position(response: Mapping[str, Any], name: str, *, minimum: int) -> int:
     value = response.get(name)
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > MAX_SAFE_INTEGER
+    ):
         raise DeliveryError(
             f"server create response has no valid {name}; server and SDK versions may differ"
         )
@@ -1386,8 +1321,8 @@ def _system_monitor_interval(value: float | None) -> float | None:
 def _validate_step(value: Any) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("step must be an integer")
-    if value < 0:
-        raise ValueError("step cannot be negative")
+    if value < 0 or value > MAX_SAFE_INTEGER:
+        raise ValueError(f"step must be between 0 and {MAX_SAFE_INTEGER}")
 
 
 def _validate_alert(title: Any, text: Any, level: Any) -> tuple[str, str, str]:
@@ -1414,56 +1349,102 @@ def _validate_alert(title: Any, text: Any, level: Any) -> tuple[str, str, str]:
     return title, text, normalized_level
 
 
-def _flatten_metrics(data: Mapping[str, Any], prefix: str = "") -> dict[str, float]:
-    flattened: dict[str, float] = {}
-    for raw_key, value in data.items():
-        key = f"{prefix}/{raw_key}" if prefix else str(raw_key)
-        if isinstance(value, Mapping):
-            flattened.update(_flatten_metrics(value, key))
-        elif isinstance(value, bool):
-            flattened[key] = float(value)
-        elif isinstance(value, (int, float)):
-            number = float(value)
-            if not math.isfinite(number):
-                raise ValueError(f"metric '{key}' must be finite")
-            flattened[key] = number
-        else:
-            raise TypeError(
-                f"metric '{key}' has unsupported type {type(value).__name__}; "
-                "rich values are not implemented yet"
-            )
-    return flattened
+def _flatten_metrics(data: Mapping[str, Any]) -> dict[str, float]:
+    metrics, _ = _flatten_values(data, allow_rich=False)
+    return metrics
 
 
 def _flatten_log_values(
     data: Mapping[str, Any],
-    prefix: str = "",
+) -> tuple[dict[str, float], list[tuple[str, RichValue]]]:
+    return _flatten_values(data, allow_rich=True)
+
+
+def _flatten_values(
+    data: Mapping[str, Any],
+    *,
+    allow_rich: bool,
 ) -> tuple[dict[str, float], list[tuple[str, RichValue]]]:
     if not isinstance(data, Mapping):
         raise TypeError("log data must be a mapping")
     metrics: dict[str, float] = {}
     rich_values: list[tuple[str, RichValue]] = []
-    for raw_key, value in data.items():
-        key = f"{prefix}/{raw_key}" if prefix else str(raw_key)
+    seen_keys: set[str] = set()
+    visited_nodes = 1
+    stack: list[tuple[Iterator[tuple[Any, Any]], str, int]] = [(iter(data.items()), "", 0)]
+    while stack:
+        iterator, prefix, depth = stack[-1]
+        try:
+            raw_key, value = next(iterator)
+        except StopIteration:
+            stack.pop()
+            continue
+        visited_nodes += 1
+        if visited_nodes > _MAX_LOG_VALUE_NODES:
+            raise ValueError(f"log data cannot exceed {_MAX_LOG_VALUE_NODES} traversed value nodes")
+        if not isinstance(raw_key, str):
+            raise TypeError(f"log keys must be strings, got {type(raw_key).__name__}")
+        key = f"{prefix}/{raw_key}" if prefix else raw_key
+        _validate_flattened_log_key(key)
         if isinstance(value, Mapping):
-            nested_metrics, nested_rich_values = _flatten_log_values(value, key)
-            metrics.update(nested_metrics)
-            rich_values.extend(nested_rich_values)
+            if depth >= _MAX_LOG_VALUE_DEPTH:
+                raise ValueError(f"log data nesting exceeds {_MAX_LOG_VALUE_DEPTH} levels at {key}")
+            stack.append((iter(value.items()), key, depth + 1))
         elif isinstance(value, RichValue):
+            if not allow_rich:
+                raise TypeError(f"system metric '{key}' cannot contain a rich value")
+            _reserve_flattened_key(key, seen_keys)
+            if len(rich_values) >= _MAX_RICH_VALUES_PER_LOG:
+                raise ValueError(
+                    f"one log call cannot contain more than {_MAX_RICH_VALUES_PER_LOG} rich values"
+                )
             rich_values.append((key, value))
         elif isinstance(value, bool):
+            _reserve_flattened_key(key, seen_keys)
+            if len(metrics) >= MAX_METRICS_PER_POINT:
+                raise ValueError(
+                    f"a metric point must contain 1 to {MAX_METRICS_PER_POINT} metrics"
+                )
             metrics[key] = float(value)
         elif isinstance(value, (int, float)):
-            number = float(value)
-            if not math.isfinite(number):
-                raise ValueError(f"metric '{key}' must be finite")
-            metrics[key] = number
+            _reserve_flattened_key(key, seen_keys)
+            if len(metrics) >= MAX_METRICS_PER_POINT:
+                raise ValueError(
+                    f"a metric point must contain 1 to {MAX_METRICS_PER_POINT} metrics"
+                )
+            metrics[key] = _finite_metric_number(value, key)
         else:
             raise TypeError(
                 f"metric '{key}' has unsupported type {type(value).__name__}; "
                 "use a native Runloom rich value"
             )
     return metrics, rich_values
+
+
+def _validate_flattened_log_key(key: str) -> None:
+    encoded = key.encode("utf-8")
+    if (
+        not encoded
+        or len(encoded) > 256
+        or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in key)
+    ):
+        raise ValueError("flattened log keys must contain 1 to 256 non-control bytes")
+
+
+def _reserve_flattened_key(key: str, seen: set[str]) -> None:
+    if key in seen:
+        raise ValueError(f"flattened log key collision: {key!r}")
+    seen.add(key)
+
+
+def _finite_metric_number(value: int | float, key: str) -> float:
+    try:
+        number = float(value)
+    except OverflowError as error:
+        raise ValueError(f"metric '{key}' must be finite") from error
+    if not math.isfinite(number):
+        raise ValueError(f"metric '{key}' must be finite")
+    return number
 
 
 def _validate_rich_key(key: str) -> None:
@@ -1483,62 +1464,21 @@ def _collect_document_updates(
 ) -> dict[str, Any]:
     if values is not None and not isinstance(values, Mapping):
         raise TypeError(f"{name} updates must be a mapping")
-    combined = dict(values or {})
+    combined = _normalize_document(values or {}, name)
     combined.update(kwargs)
     return _normalize_document(combined, name)
 
 
-def _normalize_document(values: Mapping[str, Any], name: str) -> dict[str, Any]:
-    if not isinstance(values, Mapping):
-        raise TypeError(f"{name} must be a mapping")
-    normalized: dict[str, Any] = {}
-    for key, value in values.items():
-        if not isinstance(key, str):
-            raise TypeError(f"{name} keys must be strings, got {type(key).__name__}")
-        normalized[key] = _normalize_json_value(value, f"{name}.{key}")
-    encoded = json.dumps(
-        normalized,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    if len(encoded) > _MAX_DOCUMENT_BYTES:
-        raise ValueError(f"serialized {name} exceeds {_MAX_DOCUMENT_BYTES} bytes")
-    return normalized
-
-
-def _normalize_json_value(value: Any, path: str) -> Any:
-    if value is None or isinstance(value, (str, bool)):
-        return value
-    if isinstance(value, int):
-        if value < -(2**63) or value > 2**64 - 1:
-            raise ValueError(f"{path} integer is outside the JSON server range")
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError(f"{path} must be finite")
-        return value
-    if isinstance(value, Mapping):
-        normalized: dict[str, Any] = {}
-        for key, nested in value.items():
-            if not isinstance(key, str):
-                raise TypeError(f"{path} keys must be strings, got {type(key).__name__}")
-            normalized[key] = _normalize_json_value(nested, f"{path}.{key}")
-        return normalized
-    if isinstance(value, (list, tuple)):
-        return [_normalize_json_value(item, f"{path}[{index}]") for index, item in enumerate(value)]
-    raise TypeError(f"{path} has unsupported JSON type {type(value).__name__}")
-
-
-def _atomic_json_write(path: Path, value: dict[str, Any]) -> None:
-    _atomic_text_write(path, json.dumps(value, indent=2, sort_keys=True, allow_nan=False))
-
-
-def _atomic_text_write(path: Path, value: str) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        stream.write(value)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+def _normalize_document(
+    values: Mapping[str, Any],
+    name: str,
+    *,
+    maximum: int = _MAX_DOCUMENT_BYTES,
+) -> dict[str, Any]:
+    return normalize_json_object(
+        values,
+        name,
+        maximum,
+        maximum_depth=_MAX_DOCUMENT_DEPTH,
+        maximum_nodes=_MAX_DOCUMENT_NODES,
+    )

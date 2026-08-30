@@ -19,12 +19,33 @@ history.
 
 ## Decision
 
-The Python spool is a versioned lifecycle record. It stores run identity,
-config, summary, batch size, finish intent, and metric events. Before an HTTP
-upload, it atomically records the selected journal byte range and batch
-sequence. Retries read that fixed range exactly. The acknowledgement advances
-only after a successful response, then the delivery record is removed. A stale
-delivery record whose range is already acknowledged is safe to discard.
+The Python spool is a versioned lifecycle record. Format version 2 stores run
+identity, config, the explicit summary, the bounded metric-derived summary
+preview and truncation flag, batch size, finish intent, and metric events. The
+summary snapshot carries a `summary_event_offset` that must be an exact journal
+record boundary. The SDK checkpoints the current preview and offset every 128
+metric records or 512 KiB of journal growth, and whenever explicit summary or
+finish state changes. Recovery never uses the delivery acknowledgement as a
+summary cursor: it validates the snapshot boundary and scans at most the
+bounded crash tail after that offset. Missing, malformed, unbounded, or
+non-record-boundary offsets fail visibly; there is no older spool fallback.
+
+Before a metric HTTP upload, the spool atomically records the selected journal
+byte range, first sequence, canonical request-body size, and SHA-256 digest.
+Selection is bounded by both the configured point count and an exact 1,750,000
+byte canonical-JSON body budget below the server's 2 MiB limit. Retries read the
+fixed range and must reproduce the stored body identity. The acknowledgement
+advances only after a successful response, then the delivery record is removed.
+A stale delivery record whose range is already acknowledged is safe to discard.
+
+Metric points are validated before the fsynced append against the HTTP
+contract: 1 to 256 values, UTF-8 keys of 1 to 256 bytes without Unicode control
+characters, and finite numeric values. The automatic summary is not a retention
+path. It deterministically keeps the lexicographically smallest 256 distinct
+non-system metric keys and a sticky truncation signal, while metric history and
+key discovery remain lossless. Explicit summary values have their own 256 KiB
+budget, override the preview in the merged read view, and are the only summary
+values sent by the SDK's finish request.
 
 Run creation responses contain authoritative `next_sequence` and `next_step`
 fields. On resume, the server projects sequence and step from the final row of
@@ -43,8 +64,9 @@ that a previously lost response committed successfully.
 
 Metric delivery is at least once at the transport boundary and exactly once in
 logical storage for identical retries. Appending new local points cannot alter
-an in-flight batch. Offline runs restore their document state and metric-derived
-summary, and repeated sync of a finished spool is safe.
+an in-flight batch. Offline runs restore explicit summary state and a bounded
+metric-derived preview without scanning the complete journal, and repeated sync
+of a finished spool is safe.
 
 The spool format is now an explicit compatibility boundary. Unknown versions,
 identity mismatches, corrupt delivery ranges, and missing server resume cursors

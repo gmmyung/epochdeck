@@ -2,7 +2,9 @@
 
 The feature checklist and compatibility definitions live in
 [`compatibility.md`](compatibility.md). Milestones describe implementation order,
-not a reduction in the final parity goal.
+not a reduction in the final parity goal. A checked item means its first supported
+contract exists; it does not waive the correctness, performance, accessibility,
+or operational acceptance criteria for that contract.
 
 ## Milestone 0: foundation
 
@@ -61,4 +63,4 @@ not a reduction in the final parity goal.
 - [x] Single-binary build with embedded dashboard.
 - [x] Tailnet-only deployment and systemd documentation.
 - [x] Coordinated catalog, segments, and blob backup/restore.
-- [x] Slow-query diagnostics, bounded telemetry, and explicit pre-alpha schema checks.
+- [x] Slow-query diagnostics, bounded telemetry, and disposable pre-alpha storage operations.

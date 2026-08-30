@@ -149,10 +149,25 @@ describe("multi-run chart series", () => {
       "none",
       0.15,
     );
+    const loadedWithoutPoints = prepareMetricSeries(
+      {
+        runId: "empty",
+        runName: "Empty",
+        color: "#333333",
+        available: true,
+        historyResolved: true,
+      },
+      "loss",
+      "none",
+      0.15,
+    );
 
     expect(unloaded.status).toBe("not-loaded");
     expect(missing.status).toBe("no-data");
-    expect(closestSeriesPoints([unloaded, missing], 0, "linear", 0, 1, "linear")).toEqual([]);
+    expect(loadedWithoutPoints.status).toBe("no-data");
+    expect(
+      closestSeriesPoints([unloaded, missing, loadedWithoutPoints], 0, "linear", 0, 1, "linear"),
+    ).toEqual([]);
   });
 
   it("assigns deterministic visual patterns and canvas dash arrays", () => {

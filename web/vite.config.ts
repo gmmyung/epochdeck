@@ -5,6 +5,9 @@ export default defineConfig(({ mode }) => {
   const environment = loadEnv(mode, ".", "RUNLOOM_");
   return {
     plugins: [svelte()],
+    resolve: {
+      conditions: mode === "test" ? ["browser"] : undefined,
+    },
     server: {
       host: "127.0.0.1",
       port: 5173,

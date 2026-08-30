@@ -36,11 +36,11 @@ W&B-compatible Python SDK / importers
                   |
                   v
           Rust ingestion service
-            |-- SQLite catalog and journal       SSD
+            |-- SQLite catalog and manifests     SSD
             |-- Arrow/Parquet metric segments    SSD
             `-- content-addressed rich-data CAS  HDD/ZFS
 
-Browser -> metric-aware query API -> columnar response -> virtualized charts
+Browser -> metric-aware query API -> columnar response -> lazy paged Canvas charts
 ```
 
 The backend is Rust with Tokio and Axum. Apache Arrow and Parquet form the
@@ -62,6 +62,11 @@ just bootstrap
 just check
 just single-binary
 ```
+
+Run `just bootstrap` once after cloning and whenever a lockfile changes. It
+fetches the locked Rust dependencies and installs the locked Python and
+dashboard dependencies; subsequent incremental checks and single-binary builds
+do not reinstall them.
 
 Run the API and dashboard in separate terminals:
 
@@ -115,8 +120,14 @@ runloom sync ~/.local/share/runloom/spool/<run-id>
 
 Metric history accepts finite numbers and booleans. Config and summary documents
 accept bounded JSON values, including strings, booleans, nulls, arrays, and
-nested objects. Unsupported metric object types fail explicitly; native rich
-values use the types below.
+nested objects. Each Python SDK document is capped at 256 KiB, 64 nesting
+levels, and 65,536 JSON value nodes; invalid input fails before durable
+journaling. Integer document values must stay within the exact signed JSON-safe
+range `-9007199254740991` through `9007199254740991`. Unsupported metric object
+types fail explicitly; native rich values use the types below. One log call
+accepts at most 256 scalar metrics and 256 rich values across 64 nested mapping
+levels and 65,536 traversed values. Flattened paths must be unique string keys;
+booleans are stored canonically as `0.0` or `1.0`.
 
 Rich log values use `Image`, `Audio`, `Video`, `Table`, and `Histogram`.
 Runloom copies their bytes into the durable local spool, streams uploads without
@@ -158,7 +169,11 @@ with run.trace("answer", kind="llm", attributes={"model": "local-model"}) as spa
 
 Trace IDs and parent span IDs preserve call trees. Complete JSON inputs,
 outputs, and messages use content-addressed blob storage; SQLite indexes only
-bounded metadata and previews for responsive dashboard search.
+bounded metadata and previews for responsive dashboard search. The Python SDK
+accepts at most 256 KiB of trace attributes and 16 MiB of complete JSON payload
+per span. Attributes and the aggregate payload also allow at most 64 nesting
+levels and 65,536 JSON value nodes, rejecting invalid documents before durable
+journaling.
 
 Query runs without loading an entire project:
 
@@ -258,14 +273,25 @@ uv run --project python --with wandb runloom import-wandb gyungmin bello-mujoco 
   --workers 4
 ```
 
-The importer derives stable Runloom IDs from W&B run paths and sends scalar
+The importer derives stable Runloom IDs from terminal W&B runs and sends scalar
 history in deterministic batches. Sparse high-step histories adapt their scan
 window to avoid issuing millions of empty W&B requests. A response lost after
 commit is replayed exactly; completed runs are skipped on the next invocation.
+Because W&B materializes a complete step window before yielding it, the current
+importer requires an authoritative `historyLineCount` of at most 100,000 rows;
+larger or unbounded histories fail explicitly instead of risking an unbounded
+response. The checkpoint also binds the original file-inclusion choice.
+One process owns the checkpoint, Ctrl-C cancels queued work, and only already
+active W&B SDK calls may still finish during shutdown. Re-run the same command
+to resume contiguous acknowledged watermarks.
+
 W&B run files and logged artifacts, including checkpoints, are streamed into
-CAS with durable progress and a fixed four-artifact transfer window. Image,
-audio, and video history references become native Runloom rich values while
-their original files remain preserved.
+CAS with durable progress and bounded parallel transfer windows. Logged
+artifacts retain their canonical W&B `vN` version; run-file shards use ordinary
+automatic Runloom versions. Image, audio, and video history references are
+downloaded and uploaded in parallel as native Runloom rich values while their
+original files remain preserved. Temporary disk usage is bounded by active
+transfers rather than the complete artifact.
 Unsupported non-scalar history cells are counted in the imported summary rather
 than silently presented as scalar metrics. W&B registry-wide and input-artifact
 lineage remain outside this importer surface.
@@ -276,9 +302,13 @@ Create a complete portable project bundle:
 uv run --project python runloom export bello-mujoco ./bello-mujoco.runloom-export
 ```
 
-The exporter scans raw metrics in cursor pages, downloads CAS content once,
+Before exporting, finish every selected run and quiesce all project writers. The
+exporter captures the opaque project mutation token before traversal and verifies
+it afterward; any project-visible change aborts without publishing. It scans raw
+metrics in cursor pages, downloads CAS content once,
 includes alerts, rich values, traces, artifact links, reports, sweeps, and
-trials, and atomically publishes the directory only after every digest verifies.
+trials, then fsyncs and atomically publishes the private directory only after
+every digest verifies.
 See [Export format](docs/export-format.md).
 
 ## Repository layout

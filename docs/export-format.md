@@ -4,6 +4,12 @@ A `runloom export` bundle is a portable directory for one project. Format
 version 1 contains only JSON, JSON Lines, and original content-addressed bytes.
 No file requires SQLite, Parquet, or a running Runloom server to inspect.
 
+Portable export requires every selected run to be finished and all project
+writers to be quiesced. A running run is rejected. The exporter captures the
+opaque project mutation token before traversal and verifies it afterward; any
+project-visible change, including a transient create-delete, aborts without
+publishing a bundle.
+
 ```text
 manifest.json
 reports.jsonl
@@ -25,11 +31,19 @@ full-resolution history response with sequence, step, timestamp, and aligned
 metric arrays. Following the pages in file order reconstructs every stored
 point without dashboard sampling.
 
+`sweeps.jsonl` contains complete sweep definitions, and each
+`sweep-trials.jsonl` record contains its sweep ID and complete trial record.
+The exporter hydrates these from their lightweight list summaries without
+holding the project-wide collections in memory.
+
 The top-level manifest is written last and records the format version, project,
 creation time, and resource counts. Export takes place in a sibling temporary
 directory. Every blob is size-checked and SHA-256 verified before the directory
 is atomically renamed to the requested destination. An existing destination is
-never merged or overwritten.
+never merged or overwritten. All bundle files are fsynced before rename and the
+destination parent is fsynced afterward. Export directories are mode `0700` and
+files are mode `0600`; grant broader filesystem access explicitly when a bundle
+is meant to be shared.
 
 Only referenced CAS content belongs to the portable project: rich values, trace
 payloads, and artifact entries. Orphaned upload objects have no project

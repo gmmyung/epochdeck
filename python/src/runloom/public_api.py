@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
+from runloom._json_normalization import normalize_json_object, normalize_json_value
+from runloom._pagination import next_paired_cursor, next_text_cursor
+from runloom._protocol import DeliveryProtocolError
 from runloom.client import RunloomClient
+
+_MAX_DOCUMENT_BYTES = 256 * 1024
+_MAX_DOCUMENT_FILTERS = 32
+_MAX_FILTER_KEY_BYTES = 256
+_MAX_FILTER_FIELDS = _MAX_DOCUMENT_FILTERS * 2 + 4
 
 
 class Api:
@@ -30,9 +38,15 @@ class Api:
     def close(self) -> None:
         self.client.close()
 
-    def projects(self, *, per_page: int = 100) -> list[dict[str, Any]]:
+    def projects(self, *, per_page: int = 100) -> Iterator[dict[str, Any]]:
         _validate_page_size(per_page)
-        return deepcopy(self.client.projects(limit=per_page)["projects"])
+        return (
+            deepcopy(project)
+            for project in _cursor_objects(
+                lambda before: self.client.projects(before=before, limit=per_page),
+                "projects",
+            )
+        )
 
     def run(self, path: str) -> PublicRun:
         project, run_id = _parse_run_path(path)
@@ -63,9 +77,15 @@ class Api:
         query["limit"] = per_page
         return RunCollection(self.client, query)
 
-    def reports(self, project: str, *, per_page: int = 100) -> list[dict[str, Any]]:
+    def reports(self, project: str, *, per_page: int = 100) -> Iterator[dict[str, Any]]:
         _validate_page_size(per_page)
-        return deepcopy(self.client.reports(project, limit=per_page)["reports"])
+        return (
+            deepcopy(self.client.get_report(_record_id(summary, "report")))
+            for summary in _cursor_objects(
+                lambda before: self.client.reports(project, before=before, limit=per_page),
+                "reports",
+            )
+        )
 
     def report(self, report_id: str) -> dict[str, Any]:
         return deepcopy(self.client.get_report(report_id))
@@ -85,7 +105,7 @@ class Api:
                 "id": id,
                 "name": name,
                 "description": description,
-                "layout": deepcopy(dict(layout)),
+                "layout": _normalize_report_layout(layout),
             },
         )
         return deepcopy(response["report"])
@@ -104,7 +124,7 @@ class Api:
                 {
                     "name": name,
                     "description": description,
-                    "layout": deepcopy(dict(layout)),
+                    "layout": _normalize_report_layout(layout),
                 },
             )
         )
@@ -128,11 +148,17 @@ class RunCollection:
             for record in records:
                 if not isinstance(record, dict):
                     raise TypeError("Runloom query response contains an invalid run")
-                yield PublicRun(self._client, record)
-            cursor = response.get("next_before")
+                run_id = _record_id(record, "run")
+                yield PublicRun(self._client, self._client.get_run(run_id))
+            cursor = next_text_cursor(
+                response,
+                field="next_before",
+                previous=query.get("before"),
+                context="Runloom run query response",
+            )
             if cursor is None:
                 return
-            query["before"] = str(cursor)
+            query["before"] = cursor
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +206,7 @@ class PublicRun:
             raise ValueError("history requires at least one metric key")
         if not 1 <= samples <= 5_000:
             raise ValueError("history samples must be between 1 and 5000")
-        response = self._client.history(self.id, keys=list(keys), limit=samples)
+        response = self._client.history(self.id, keys=list(keys), max_points=samples)
         return _history_rows(response, keys)
 
     def scan_history(
@@ -205,37 +231,101 @@ class PublicRun:
             next_after = response.get("next_after")
             if next_after is None:
                 return
-            after = int(next_after)
+            if (
+                isinstance(next_after, bool)
+                or not isinstance(next_after, int)
+                or (after is not None and next_after <= after)
+            ):
+                raise DeliveryProtocolError("history response cursor did not advance")
+            after = next_after
 
-    def artifacts(self) -> list[dict[str, Any]]:
-        return deepcopy(self._client.run_artifacts(self.id)["artifacts"])
+    def artifacts(self, *, page_size: int = 100) -> Iterator[dict[str, Any]]:
+        _validate_page_size(page_size)
+        return _artifact_records(self._client, self.id, page_size)
 
     def traces(self, *, query: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        return deepcopy(self._client.trace_spans(self.id, q=query, limit=limit)["spans"])
+        _validate_page_size(limit)
+        response = self._client.trace_spans(self.id, q=query, limit=limit)
+        spans = response.get("spans")
+        if not isinstance(spans, list) or not all(isinstance(span, dict) for span in spans):
+            raise TypeError("Runloom trace response has no span list")
+        return [
+            deepcopy(self._client.get_trace_span(_record_id(span, "trace span"))) for span in spans
+        ]
 
 
 def _compile_filters(filters: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(filters, Mapping):
+        raise TypeError("run filters must be a mapping")
     query: dict[str, Any] = {"config_equals": {}, "summary_equals": {}}
-    for key, value in filters.items():
+    config_count = 0
+    summary_count = 0
+    for index, (key, value) in enumerate(filters.items()):
+        if index >= _MAX_FILTER_FIELDS:
+            raise ValueError(f"run filters cannot contain more than {_MAX_FILTER_FIELDS} fields")
+        if not isinstance(key, str):
+            raise TypeError("run filter names must be strings")
         if key == "project":
-            query["project"] = _filter_text(value, key)
+            query["project"] = _filter_text(value, key, 128)
         elif key == "state":
             if value not in {"running", "finished"}:
                 raise ValueError("state filter must be 'running' or 'finished'")
             query["state"] = value
         elif key in {"name", "display_name"}:
-            query["name"] = _filter_text(value, key)
+            query["name"] = _filter_text(value, key, 256)
         elif key == "name_contains":
-            query["name_contains"] = _filter_text(value, key)
+            query["name_contains"] = _filter_text(value, key, 256)
         elif key.startswith("config."):
-            _reject_filter_operator(value, key)
-            query["config_equals"][key.removeprefix("config.")] = deepcopy(value)
+            config_count += 1
+            if config_count > _MAX_DOCUMENT_FILTERS:
+                raise ValueError(
+                    f"run filters cannot contain more than {_MAX_DOCUMENT_FILTERS} config fields"
+                )
+            document_key = key.removeprefix("config.")
+            _validate_filter_document_key(document_key)
+            normalized = normalize_json_value(value, f"{key} filter", _MAX_DOCUMENT_BYTES)
+            _reject_filter_operator(normalized, key)
+            query["config_equals"][document_key] = normalized
         elif key.startswith("summary."):
-            _reject_filter_operator(value, key)
-            query["summary_equals"][key.removeprefix("summary.")] = deepcopy(value)
+            summary_count += 1
+            if summary_count > _MAX_DOCUMENT_FILTERS:
+                raise ValueError(
+                    f"run filters cannot contain more than {_MAX_DOCUMENT_FILTERS} summary fields"
+                )
+            document_key = key.removeprefix("summary.")
+            _validate_filter_document_key(document_key)
+            normalized = normalize_json_value(value, f"{key} filter", _MAX_DOCUMENT_BYTES)
+            _reject_filter_operator(normalized, key)
+            query["summary_equals"][document_key] = normalized
         else:
             raise ValueError(f"unsupported run filter: {key}")
+    query["config_equals"] = normalize_json_object(
+        query["config_equals"],
+        "config filters",
+        _MAX_DOCUMENT_BYTES,
+    )
+    query["summary_equals"] = normalize_json_object(
+        query["summary_equals"],
+        "summary filters",
+        _MAX_DOCUMENT_BYTES,
+    )
     return query
+
+
+def _normalize_report_layout(layout: Mapping[str, Any]) -> dict[str, Any]:
+    return normalize_json_object(layout, "report layout", _MAX_DOCUMENT_BYTES)
+
+
+def _validate_filter_document_key(value: str) -> None:
+    encoded = value.encode("utf-8")
+    if (
+        not encoded
+        or len(encoded) > _MAX_FILTER_KEY_BYTES
+        or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value)
+    ):
+        raise ValueError(
+            f"run query document keys must contain 1 to {_MAX_FILTER_KEY_BYTES} non-control bytes"
+        )
 
 
 def _reject_filter_operator(value: Any, name: str) -> None:
@@ -243,9 +333,16 @@ def _reject_filter_operator(value: Any, name: str) -> None:
         raise ValueError(f"unsupported comparison operator in filter: {name}")
 
 
-def _filter_text(value: Any, name: str) -> str:
-    if not isinstance(value, str) or not value:
+def _filter_text(value: Any, name: str, maximum: int) -> str:
+    if not isinstance(value, str):
         raise TypeError(f"{name} filter must be a non-empty string")
+    encoded = value.encode("utf-8")
+    if (
+        not encoded
+        or len(encoded) > maximum
+        or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value)
+    ):
+        raise ValueError(f"{name} filter must contain 1 to {maximum} non-control bytes")
     return value
 
 
@@ -263,18 +360,98 @@ def _validate_page_size(value: int) -> None:
         raise ValueError("per_page must be between 1 and 200")
 
 
+def _cursor_objects(
+    request: Callable[[str | None], dict[str, Any]],
+    field: str,
+) -> Iterator[dict[str, Any]]:
+    before: str | None = None
+    while True:
+        response = request(before)
+        records = response.get(field)
+        if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
+            raise TypeError(f"Runloom response has no {field} object list")
+        yield from records
+        before = next_text_cursor(
+            response,
+            field="next_before",
+            previous=before,
+            context=f"Runloom {field} response",
+        )
+        if before is None:
+            return
+
+
+def _artifact_records(
+    client: RunloomClient,
+    run_id: str,
+    page_size: int,
+) -> Iterator[dict[str, Any]]:
+    before: str | None = None
+    before_relation: Literal["input", "output"] | None = None
+    while True:
+        response = client.run_artifacts(
+            run_id,
+            before=before,
+            before_relation=before_relation,
+            limit=page_size,
+        )
+        page = response.get("artifacts")
+        if not isinstance(page, list) or not all(isinstance(item, dict) for item in page):
+            raise TypeError("Runloom artifact response has no artifact list")
+        for linked in page:
+            summary = linked.get("artifact")
+            if not isinstance(summary, dict):
+                raise TypeError("Runloom artifact link has no artifact summary")
+            detail = client.get_artifact(_record_id(summary, "artifact"))
+            full_link = deepcopy(linked)
+            full_link["artifact"] = deepcopy(detail)
+            yield full_link
+        cursor = next_paired_cursor(
+            response,
+            previous=(before, before_relation)
+            if before is not None and before_relation is not None
+            else None,
+            context="Runloom artifact response",
+        )
+        if cursor is None:
+            return
+        before, before_relation = cursor
+
+
+def _record_id(record: Mapping[str, Any], name: str) -> str:
+    identity = record.get("id")
+    if not isinstance(identity, str) or not identity:
+        raise TypeError(f"Runloom {name} has no non-empty ID")
+    return identity
+
+
 def _history_rows(response: Mapping[str, Any], keys: Sequence[str]) -> list[dict[str, Any]]:
-    sequence = response.get("sequence", [])
-    step = response.get("step", [])
-    timestamp = response.get("timestamp_ms", [])
-    metrics = response.get("metrics", {})
-    rows = []
+    sequence = response.get("sequence")
+    step = response.get("step")
+    timestamp = response.get("timestamp_ms")
+    metrics = response.get("metrics")
+    if not all(isinstance(column, list) for column in (sequence, step, timestamp)):
+        raise DeliveryProtocolError("history response has invalid scalar columns")
+    assert isinstance(sequence, list)
+    assert isinstance(step, list)
+    assert isinstance(timestamp, list)
+    if len(step) != len(sequence) or len(timestamp) != len(sequence):
+        raise DeliveryProtocolError("history response columns are not aligned")
+    if not isinstance(metrics, Mapping):
+        raise DeliveryProtocolError("history response has no metric columns")
+    columns: dict[str, list[Any]] = {}
+    for key in keys:
+        column = metrics.get(key)
+        if not isinstance(column, list) or len(column) != len(sequence):
+            raise DeliveryProtocolError("history response columns are not aligned")
+        columns[key] = column
+    rows: list[dict[str, Any]] = []
     for index, sequence_value in enumerate(sequence):
         row = {
             "_sequence": sequence_value,
             "_step": step[index],
             "_timestamp_ms": timestamp[index],
         }
-        row.update({key: metrics[key][index] for key in keys})
+        row.update({key: columns[key][index] for key in keys})
         rows.append(row)
     return rows

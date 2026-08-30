@@ -11,14 +11,20 @@
     type RunArtifact,
   } from "./api";
   import {
+    ARTIFACT_ITEM_PAGE_SIZE,
     artifactBreadcrumbs,
     artifactDirectoryItems,
+    artifactItemPage,
     artifactTotalSize,
     type ArtifactBrowserItem,
     type ArtifactBreadcrumb,
   } from "./artifact-browser";
 
   export let artifacts: RunArtifact[];
+  export let details: Record<string, Artifact> = {};
+  export let detailLoading = new Set<string>();
+  export let detailErrors: Record<string, string> = {};
+  export let onselect: (artifactId: string) => void = () => {};
 
   let activeKey = "";
   let orderedArtifacts: RunArtifact[] = [];
@@ -26,12 +32,30 @@
   let currentDirectory = "";
   let tabRail: HTMLElement;
   let selectedLink: RunArtifact | undefined;
+  let selectedArtifact: Artifact | undefined;
   let items: ArtifactBrowserItem[] = [];
   let breadcrumbs: ArtifactBreadcrumb[] = [];
   let selectedEntry: ArtifactEntry | undefined;
   let narrowLayout = false;
+  let visibleItemOffset = 0;
+  let itemLocation = "";
+  let visibleItems: ArtifactBrowserItem[] = [];
+  const requestedArtifactIds = new Set<string>();
 
   $: orderedArtifacts = [...artifacts].sort(compareArtifactLinks);
+  $: {
+    const visibleIds = new Set(artifacts.map((linked) => linked.artifact.id));
+    for (const artifactId of requestedArtifactIds) {
+      if (
+        !visibleIds.has(artifactId) ||
+        details[artifactId] ||
+        detailErrors[artifactId] ||
+        !detailLoading.has(artifactId)
+      ) {
+        requestedArtifactIds.delete(artifactId);
+      }
+    }
+  }
   $: if (orderedArtifacts.length === 0) activeKey = "";
   $: if (
     orderedArtifacts.length > 0 &&
@@ -40,15 +64,23 @@
     activeKey = linkKey(orderedArtifacts[0]);
   }
   $: selectedLink = orderedArtifacts.find((linked) => linkKey(linked) === activeKey);
+  $: selectedArtifact = selectedLink ? details[selectedLink.artifact.id] : undefined;
+  $: if (selectedLink) requestDetail(selectedLink.artifact.id);
   $: if (activeKey !== previousActiveKey) {
     previousActiveKey = activeKey;
     currentDirectory = "";
     selectedEntry = undefined;
   }
-  $: items = selectedLink
-    ? artifactDirectoryItems(selectedLink.artifact.entries, currentDirectory)
+  $: items = selectedArtifact
+    ? artifactDirectoryItems(selectedArtifact.entries, currentDirectory)
     : [];
   $: breadcrumbs = artifactBreadcrumbs(currentDirectory);
+  $: if (`${activeKey}\0${currentDirectory}` !== itemLocation) {
+    itemLocation = `${activeKey}\0${currentDirectory}`;
+    visibleItemOffset = 0;
+    selectedEntry = undefined;
+  }
+  $: visibleItems = artifactItemPage(items, ARTIFACT_ITEM_PAGE_SIZE, visibleItemOffset);
 
   onMount(() => {
     const media = window.matchMedia("(max-width: 760px)");
@@ -68,6 +100,18 @@
 
   function chooseArtifact(linked: RunArtifact): void {
     activeKey = linkKey(linked);
+  }
+
+  function requestDetail(artifactId: string): void {
+    if (
+      details[artifactId] ||
+      detailLoading.has(artifactId) ||
+      requestedArtifactIds.has(artifactId)
+    ) {
+      return;
+    }
+    requestedArtifactIds.add(artifactId);
+    onselect(artifactId);
   }
 
   function handleTabKey(event: KeyboardEvent, index: number): void {
@@ -91,7 +135,15 @@
   }
 
   function openItem(item: ArtifactBrowserItem): void {
-    if (item.kind === "directory") currentDirectory = item.path;
+    if (item.kind === "directory") {
+      currentDirectory = item.path;
+      selectedEntry = undefined;
+    }
+  }
+
+  function changeItemPage(offset: number): void {
+    visibleItemOffset = Math.max(0, offset);
+    selectedEntry = undefined;
   }
 
   function formatBytes(value: number): string {
@@ -106,7 +158,7 @@
     return `${size.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unit]}`;
   }
 
-  function archiveName(artifact: Artifact): string {
+  function archiveName(artifact: Pick<Artifact, "name" | "version">): string {
     return `${artifact.name}-v${artifact.version}.zip`;
   }
 
@@ -163,9 +215,9 @@
             <span>{selectedLink.artifact.type}</span>
           </div>
           <p>
-            {selectedLink.artifact.entries.length.toLocaleString()} files · {formatBytes(
-              artifactTotalSize(selectedLink.artifact.entries),
-            )}
+            {selectedLink.artifact.entry_count.toLocaleString()} files{selectedArtifact
+              ? ` · ${formatBytes(artifactTotalSize(selectedArtifact.entries))}`
+              : ""}
           </p>
         </div>
         <a
@@ -178,95 +230,130 @@
         </a>
       </header>
 
-      {#if selectedLink.artifact.aliases.length > 0}
+      {#if detailErrors[selectedLink.artifact.id]}
+        <div class="resource-error" role="alert">
+          <span>{detailErrors[selectedLink.artifact.id]}</span>
+          <button type="button" onclick={() => onselect(selectedLink.artifact.id)}
+            >Retry manifest</button
+          >
+        </div>
+      {:else if detailLoading.has(selectedLink.artifact.id) && !selectedArtifact}
+        <div class="artifact-loading" role="status">Loading artifact manifest…</div>
+      {/if}
+
+      {#if selectedArtifact && selectedArtifact.aliases.length > 0}
         <div class="aliases" aria-label="Artifact aliases">
-          {#each selectedLink.artifact.aliases as alias}<span>{alias}</span>{/each}
+          {#each selectedArtifact.aliases as alias}<span>{alias}</span>{/each}
         </div>
       {/if}
-      {#if selectedLink.artifact.description}
-        <p class="description">{selectedLink.artifact.description}</p>
+      {#if selectedArtifact?.description}
+        <p class="description">{selectedArtifact.description}</p>
       {/if}
-      {#if Object.keys(selectedLink.artifact.metadata).length > 0}
+      {#if selectedArtifact && Object.keys(selectedArtifact.metadata).length > 0}
         <details class="artifact-metadata">
           <summary>Metadata</summary>
           <div class="metadata-tree">
-            <JsonTreeNode name="" value={selectedLink.artifact.metadata} root />
+            <JsonTreeNode name="" value={selectedArtifact.metadata} root />
           </div>
         </details>
       {/if}
 
-      <nav class="breadcrumbs" aria-label="Artifact file path">
-        {#each breadcrumbs as breadcrumb, index (breadcrumb.path)}
-          {#if index > 0}<Icon name="chevron-right" size={12} />{/if}
-          <button
-            type="button"
-            aria-current={index === breadcrumbs.length - 1 ? "page" : undefined}
-            onclick={() => (currentDirectory = breadcrumb.path)}
-          >
-            {breadcrumb.label}
-          </button>
-        {/each}
-      </nav>
+      {#if selectedArtifact}
+        <nav class="breadcrumbs" aria-label="Artifact file path">
+          {#each breadcrumbs as breadcrumb, index (breadcrumb.path)}
+            {#if index > 0}<Icon name="chevron-right" size={12} />{/if}
+            <button
+              type="button"
+              aria-current={index === breadcrumbs.length - 1 ? "page" : undefined}
+              onclick={() => (currentDirectory = breadcrumb.path)}
+            >
+              {breadcrumb.label}
+            </button>
+          {/each}
+        </nav>
 
-      <div class="file-table-wrap">
-        <table class="file-table">
-          <thead>
-            <tr><th>Name</th><th>Size</th><th><span class="sr-only">Actions</span></th></tr>
-          </thead>
-          <tbody>
-            {#each items as item (item.path)}
-              <tr>
-                <td>
-                  {#if item.kind === "directory"}
-                    <button
-                      class="file-name directory"
-                      type="button"
-                      onclick={() => openItem(item)}
-                    >
-                      <Icon name="folder" size={16} />
-                      <span>{item.name}</span>
-                      <small>{item.fileCount.toLocaleString()} files</small>
-                    </button>
-                  {:else}
-                    <button
-                      class="file-name file"
-                      class:active={selectedEntry?.path === item.entry.path}
-                      type="button"
-                      onclick={() => (selectedEntry = item.entry)}
-                    >
-                      <Icon name="file" size={16} />
-                      <span>{item.name}</span>
-                    </button>
-                  {/if}
-                </td>
-                <td class="size">{formatBytes(item.size)}</td>
-                <td class="actions">
-                  {#if item.kind === "file"}
-                    <a
-                      class="icon-button file-download"
-                      href={artifactFileUrl(selectedLink.artifact.id, item.entry.path)}
-                      download={item.entry.blob.file_name ?? item.name}
-                      aria-label={`Download ${item.entry.path}`}
-                    >
-                      <Icon name="download" size={15} />
-                    </a>
-                  {/if}
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-        {#if items.length === 0}
-          <div class="empty-directory">This directory is empty.</div>
-        {/if}
-      </div>
-      {#if selectedEntry}
-        <div class="file-details">
-          <strong>{selectedEntry.path}</strong>
-          <span>{selectedEntry.blob.mime_type}</span>
-          <span>{formatBytes(selectedEntry.blob.size)}</span>
-          <code>{selectedEntry.blob.digest}</code>
+        <div class="file-table-wrap">
+          <table class="file-table">
+            <thead>
+              <tr><th>Name</th><th>Size</th><th><span class="sr-only">Actions</span></th></tr>
+            </thead>
+            <tbody>
+              {#each visibleItems as item (item.path)}
+                <tr>
+                  <td>
+                    {#if item.kind === "directory"}
+                      <button
+                        class="file-name directory"
+                        type="button"
+                        onclick={() => openItem(item)}
+                      >
+                        <Icon name="folder" size={16} />
+                        <span>{item.name}</span>
+                        <small>{item.fileCount.toLocaleString()} files</small>
+                      </button>
+                    {:else}
+                      <button
+                        class="file-name file"
+                        class:active={selectedEntry?.path === item.entry.path}
+                        type="button"
+                        aria-pressed={selectedEntry?.path === item.entry.path}
+                        onclick={() => (selectedEntry = item.entry)}
+                      >
+                        <Icon name="file" size={16} />
+                        <span>{item.name}</span>
+                      </button>
+                    {/if}
+                  </td>
+                  <td class="size">{formatBytes(item.size)}</td>
+                  <td class="actions">
+                    {#if item.kind === "file"}
+                      <a
+                        class="icon-button file-download"
+                        href={artifactFileUrl(selectedLink.artifact.id, item.entry.path)}
+                        download={item.entry.blob.file_name ?? item.name}
+                        aria-label={`Download ${item.entry.path}`}
+                      >
+                        <Icon name="download" size={15} />
+                      </a>
+                    {/if}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+          {#if items.length === 0}
+            <div class="empty-directory">This directory is empty.</div>
+          {:else if items.length > ARTIFACT_ITEM_PAGE_SIZE}
+            <nav class="file-pagination" aria-label="Artifact file pages">
+              <button
+                type="button"
+                disabled={visibleItemOffset === 0}
+                onclick={() => changeItemPage(visibleItemOffset - ARTIFACT_ITEM_PAGE_SIZE)}
+                >Previous</button
+              >
+              <span>
+                {(visibleItemOffset + 1).toLocaleString()}–{Math.min(
+                  visibleItemOffset + visibleItems.length,
+                  items.length,
+                ).toLocaleString()} of {items.length.toLocaleString()}
+              </span>
+              <button
+                type="button"
+                disabled={visibleItemOffset + ARTIFACT_ITEM_PAGE_SIZE >= items.length}
+                onclick={() => changeItemPage(visibleItemOffset + ARTIFACT_ITEM_PAGE_SIZE)}
+                >Next</button
+              >
+            </nav>
+          {/if}
         </div>
+        {#if selectedEntry}
+          <div class="file-details">
+            <strong>{selectedEntry.path}</strong>
+            <span>{selectedEntry.blob.mime_type}</span>
+            <span>{formatBytes(selectedEntry.blob.size)}</span>
+            <code>{selectedEntry.blob.digest}</code>
+          </div>
+        {/if}
       {/if}
     </div>
   </div>
@@ -340,7 +427,7 @@
   }
 
   .artifact-tabs small {
-    font-size: 9px;
+    font-size: 11px;
   }
 
   .artifact-panel {
@@ -379,7 +466,7 @@
   .artifact-title span,
   .aliases span {
     color: var(--muted);
-    font-size: 9px;
+    font-size: 11px;
     letter-spacing: 0.03em;
     text-transform: uppercase;
   }
@@ -488,7 +575,7 @@
     z-index: 1;
     background: var(--panel);
     color: var(--muted);
-    font-size: 9px;
+    font-size: 11px;
     font-weight: 500;
     text-transform: uppercase;
   }
@@ -521,7 +608,7 @@
   .file-name small {
     flex: 0 0 auto;
     color: var(--muted);
-    font-size: 9px;
+    font-size: 11px;
   }
 
   .file-name.directory {
@@ -567,6 +654,25 @@
     font-size: 11px;
   }
 
+  .file-pagination {
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin: 10px auto;
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .file-pagination button {
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--muted);
+    font-size: 11px;
+  }
+
   .file-details {
     min-width: 0;
     display: flex;
@@ -576,7 +682,7 @@
     padding: 10px 8px;
     border-top: 1px solid var(--line);
     color: var(--muted);
-    font-size: 9px;
+    font-size: 11px;
   }
 
   .file-details strong {

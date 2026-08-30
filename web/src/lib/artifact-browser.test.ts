@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import type { ArtifactEntry } from "./api";
-import { artifactBreadcrumbs, artifactDirectoryItems, artifactTotalSize } from "./artifact-browser";
+import {
+  ARTIFACT_ITEM_PAGE_SIZE,
+  artifactBreadcrumbs,
+  artifactDirectoryItems,
+  artifactItemPage,
+  artifactTotalSize,
+} from "./artifact-browser";
 
 function entry(path: string, size: number): ArtifactEntry {
   return {
@@ -53,5 +59,19 @@ describe("artifactDirectoryItems", () => {
       { label: "params", path: "checkpoint/params" },
     ]);
     expect(artifactTotalSize(entries)).toBe(37);
+  });
+
+  it("bounds the number of file rows instantiated at once", () => {
+    const items = artifactDirectoryItems(
+      Array.from({ length: ARTIFACT_ITEM_PAGE_SIZE + 50 }, (_, index) =>
+        entry(`file-${index}.bin`, index),
+      ),
+      "",
+    );
+
+    expect(artifactItemPage(items, ARTIFACT_ITEM_PAGE_SIZE)).toHaveLength(ARTIFACT_ITEM_PAGE_SIZE);
+    expect(artifactItemPage(items, ARTIFACT_ITEM_PAGE_SIZE, ARTIFACT_ITEM_PAGE_SIZE)).toHaveLength(
+      50,
+    );
   });
 });

@@ -22,6 +22,17 @@ export type ArtifactFileItem = {
 };
 
 export type ArtifactBrowserItem = ArtifactDirectoryItem | ArtifactFileItem;
+export const ARTIFACT_ITEM_PAGE_SIZE = 200;
+
+export function artifactItemPage(
+  items: readonly ArtifactBrowserItem[],
+  visibleCount: number,
+  offset = 0,
+): ArtifactBrowserItem[] {
+  const boundedCount = Math.max(0, Math.floor(visibleCount));
+  const boundedOffset = Math.max(0, Math.floor(offset));
+  return items.slice(boundedOffset, boundedOffset + boundedCount);
+}
 
 export function artifactDirectoryItems(
   entries: ArtifactEntry[],

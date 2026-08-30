@@ -16,6 +16,7 @@ export type MetricChartSeries = {
   available: boolean;
   pattern?: SeriesPattern;
   history?: ChartHistory;
+  historyResolved?: boolean;
   loading?: boolean;
 };
 
@@ -88,9 +89,11 @@ export function prepareMetricSeries(
         ? "no-data"
         : input.loading
           ? "loading"
-          : input.history === undefined
-            ? "not-loaded"
-            : "no-data",
+          : input.historyResolved
+            ? "no-data"
+            : input.history === undefined
+              ? "not-loaded"
+              : "no-data",
     buckets,
     x,
     steps,

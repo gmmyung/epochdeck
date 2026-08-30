@@ -15,12 +15,20 @@ Sweep definitions and trials are transactional SQLite records. Each sweep owns a
 monotonic `next_index`. Grid scheduling interprets that index as mixed-radix
 digits over sorted parameter names; random scheduling hashes the sweep ID,
 index, and parameter name. Both select directly from finite typed value lists
-and use constant memory per claim.
+and use constant memory per claim. A definition accepts at most 64 parameters,
+256 values per parameter, and 256 KiB of parameter JSON. The SDK enforces those
+bounds while iterating, rejects unknown definition fields, and normalizes every
+value through the shared depth, node, and JSON-safe-integer contract before the
+request is materialized.
 
-An agent claim has a 60-second lease until it binds a run. Expired unbound claims
-are reassigned with their original configuration. Run creation verifies project
-ownership and atomically changes the trial from claimed to running. Terminal
-completion accepts only completed, failed, or stopped and is idempotent.
+An agent claim has a renewable 60-second lease before and after it binds a run.
+Run creation verifies project ownership and atomically changes the trial from
+claimed to running. The owning agent heartbeats while training. Expired claimed
+or running trials are reassigned with their original configuration and any bound
+run ID, allowing the replacement agent to resume the same Runloom run. Heartbeat
+and terminal updates include the agent ID and reject stale owners. Terminal
+completion accepts only completed, failed, or stopped and is idempotent for the
+current owner.
 
 Optional early termination uses a median rule after a configured step and peer
 count. Metric ingestion updates the linked trial and returns a stop bit in the
@@ -33,7 +41,9 @@ Multiple agent processes can share a scheduler without an external queue. A
 search space can be combinatorially large without consuming proportional memory
 or catalog rows. Random schedules are reproducible for a definition and index.
 Stop delivery follows the same retry semantics as metrics and adds no polling
-load.
+load. Heartbeats add one bounded request per active agent lease interval; the
+Python agent persists its current trial so process restarts do not rely solely on
+lease expiry.
 
 The current search-space contract deliberately supports finite `values` only.
 Continuous distributions and Hyperband need explicit sampling and rung

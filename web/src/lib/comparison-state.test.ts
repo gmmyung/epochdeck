@@ -2,17 +2,18 @@ import { describe, expect, it } from "vitest";
 
 import {
   MAX_SELECTED_RUNS,
-  METRIC_CHART_PAGE_SIZE,
   comparisonCacheKey,
   comparisonBucketBudget,
-  metricPage,
-  metricAvailability,
   normalizeRunSelection,
   planComparisonBatches,
   readComparisonUrl,
   runStyle,
   writeComparisonUrl,
 } from "./comparison-state";
+
+const RUN_A = "00000000-0000-7000-8000-000000000001";
+const RUN_B = "00000000-0000-7000-8000-000000000002";
+const REPORT = "00000000-0000-7000-8000-000000000003";
 
 describe("comparison state", () => {
   it("keeps an ordered, valid, bounded run selection and repairs its primary run", () => {
@@ -23,19 +24,6 @@ describe("comparison state", () => {
     expect(normalized.runIds).toHaveLength(MAX_SELECTED_RUNS);
     expect(normalized.runIds.slice(0, 3)).toEqual(["run-2", "run-0", "run-1"]);
     expect(normalized.primaryRunId).toBe("run-2");
-  });
-
-  it("builds union and intersection catalogs with availability counts", () => {
-    const keys = { a: ["loss", "reward"], b: ["loss", "speed"], c: ["loss", "reward"] };
-
-    expect(metricAvailability(["a", "b", "c"], keys, "union")).toEqual([
-      { key: "loss", available: 3, total: 3 },
-      { key: "reward", available: 2, total: 3 },
-      { key: "speed", available: 1, total: 3 },
-    ]);
-    expect(metricAvailability(["a", "b", "c"], keys, "intersection")).toEqual([
-      { key: "loss", available: 3, total: 3 },
-    ]);
   });
 
   it("keeps every overlay request inside the server cell budget", () => {
@@ -67,18 +55,6 @@ describe("comparison state", () => {
     expect(coarse).not.toBe(detailed);
   });
 
-  it("paginates instantiated metric charts with a hard 24-chart bound", () => {
-    const metrics = Array.from({ length: 55 }, (_, index) => `metric-${index}`);
-    const middle = metricPage(metrics, 1);
-    const clamped = metricPage(metrics, 99);
-
-    expect(middle.values).toHaveLength(METRIC_CHART_PAGE_SIZE);
-    expect(middle.values[0]).toBe("metric-24");
-    expect(clamped.page).toBe(2);
-    expect(clamped.values).toHaveLength(7);
-    expect(metricPage(metrics, Number.NaN).page).toBe(0);
-  });
-
   it("assigns the same visual identity regardless of selection order", () => {
     expect(runStyle("run-a")).toEqual(runStyle("run-a"));
     expect(runStyle("run-a")).not.toEqual(runStyle("run-b"));
@@ -88,12 +64,14 @@ describe("comparison state", () => {
     const tabs = new Set(["summary", "metrics"] as const);
     const written = writeComparisonUrl(new URL("https://runloom.test/?unrelated=kept"), {
       project: "robot learning",
-      runIds: ["second", "first"],
+      reportId: REPORT,
+      runIds: [RUN_B, RUN_A],
       runSelectionSpecified: true,
-      primaryRunId: "first",
+      primaryRunId: RUN_A,
       tab: "metrics" as const,
       metricMode: "intersection",
       search: "train/loss",
+      metricAfter: "train/loss",
       alignment: "elapsed-time",
       chartMetric: "train/loss",
       chartViewport: { minimum: 12.5, maximum: 87.5 },
@@ -102,16 +80,20 @@ describe("comparison state", () => {
 
     expect(restored).toEqual({
       project: "robot learning",
-      runIds: ["second", "first"],
+      reportId: REPORT,
+      runIds: [RUN_B, RUN_A],
       runSelectionSpecified: true,
-      primaryRunId: "first",
+      primaryRunId: RUN_A,
       tab: "metrics",
       metricMode: "intersection",
       search: "train/loss",
+      metricAfter: "train/loss",
       alignment: "elapsed-time",
       chartMetric: "train/loss",
       chartViewport: { minimum: 12.5, maximum: 87.5 },
     });
+    expect(written.searchParams.get("metric_after")).toBe("train/loss");
+    expect(written.searchParams.has("metricPage")).toBe(false);
     expect(written.searchParams.get("unrelated")).toBe("kept");
 
     const invalid = readComparisonUrl(
@@ -122,6 +104,8 @@ describe("comparison state", () => {
     expect(invalid.tab).toBe("summary");
     expect(invalid.metricMode).toBe("union");
     expect(invalid.alignment).toBe("step");
+    expect(invalid.reportId).toBeNull();
+    expect(invalid.metricAfter).toBeNull();
     expect(invalid.chartMetric).toBeNull();
     expect(invalid.chartViewport).toBeNull();
     expect(
@@ -141,12 +125,14 @@ describe("comparison state", () => {
 
     const cleared = writeComparisonUrl(new URL("https://runloom.test/?chart=loss&xmin=1&xmax=2"), {
       project: "p",
+      reportId: null,
       runIds: [],
       runSelectionSpecified: true,
       primaryRunId: null,
       tab: "metrics",
       metricMode: "union",
       search: "",
+      metricAfter: null,
       alignment: "step",
       chartMetric: null,
       chartViewport: null,
@@ -156,16 +142,39 @@ describe("comparison state", () => {
     expect(cleared.searchParams.has("xmax")).toBe(false);
   });
 
+  it("bounds and validates untrusted deep-link fields before orchestration", () => {
+    const url = new URL("https://runloom.test/");
+    for (let index = 0; index < 30; index += 1) {
+      url.searchParams.append("run", `00000000-0000-7000-8000-${String(index).padStart(12, "0")}`);
+    }
+    url.searchParams.append("run", RUN_A);
+    url.searchParams.set("project", "p".repeat(129));
+    url.searchParams.set("report", "not-a-uuid");
+    url.searchParams.set("search", "s".repeat(257));
+    url.searchParams.set("metric_after", `loss\u0085hidden`);
+
+    const state = readComparisonUrl(url, new Set(["metrics"] as const), "metrics");
+
+    expect(state.runIds).toHaveLength(MAX_SELECTED_RUNS);
+    expect(new Set(state.runIds).size).toBe(MAX_SELECTED_RUNS);
+    expect(state.project).toBeNull();
+    expect(state.reportId).toBeNull();
+    expect(state.search).toBe("");
+    expect(state.metricAfter).toBeNull();
+  });
+
   it("restores viewport history from range A to B and then full range", () => {
     const tabs = new Set(["metrics"] as const);
     const state = {
       project: "p",
-      runIds: ["run-a"],
+      reportId: null,
+      runIds: [RUN_A],
       runSelectionSpecified: true,
-      primaryRunId: "run-a",
+      primaryRunId: RUN_A,
       tab: "metrics" as const,
       metricMode: "union" as const,
       search: "",
+      metricAfter: null,
       alignment: "step" as const,
       chartMetric: "loss",
       chartViewport: { minimum: 10, maximum: 20 },

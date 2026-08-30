@@ -40,11 +40,13 @@ storage, and authentication.
 
 ## Pre-alpha change policy
 
-- Do not preserve backward compatibility for Runloom's pre-alpha Python API,
-  HTTP payloads, catalog schema, spool format, or stored data unless the user
-  explicitly asks for it.
-- Prefer replacing a weak design directly over aliases, dual reads/writes,
-  backfills, compatibility shims, or migration scaffolding.
+- Treat Runloom's internal catalog and stored pre-alpha data as disposable.
+  Keep one current definition without internal schema generations, upgrade
+  logic, or shape guards.
+- Do not preserve backward compatibility for the pre-alpha Python API, HTTP
+  payloads, spool format, or stored data unless the user explicitly asks for it.
+- Prefer replacing a weak design directly over aliases or compatibility
+  scaffolding.
 - Keep the `/api/v1` namespace. It is the current protocol boundary, not a
   promise that every pre-alpha shape inside it is frozen.
 - Tests and documentation describe only the current supported shape. Remove
