@@ -118,7 +118,12 @@ def test_runs_command_rejects_untyped_filter_values() -> None:
 
 
 def test_export_help_states_consistency_preconditions() -> None:
-    result = CliRunner().invoke(app, ["export", "--help"], terminal_width=160)
+    result = CliRunner().invoke(
+        app,
+        ["export", "--help"],
+        terminal_width=160,
+        color=False,
+    )
 
     assert result.exit_code == 0
     help_text = " ".join(result.stdout.split())
