@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 from typer.testing import CliRunner
 
 from epochdeck import __version__
 from epochdeck.cli import app
+
+ANSI_CONTROL_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def test_version_is_available_without_server_state() -> None:
@@ -126,7 +129,7 @@ def test_export_help_states_consistency_preconditions() -> None:
     )
 
     assert result.exit_code == 0
-    help_text = " ".join(result.stdout.split())
+    help_text = " ".join(ANSI_CONTROL_SEQUENCE.sub("", result.stdout).split())
     assert "every selected run is finished and project writers are quiesced" in help_text
     assert "opaque project mutation token is captured before traversal" in help_text
     assert "verified afterward" in help_text
