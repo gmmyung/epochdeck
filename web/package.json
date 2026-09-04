@@ -11,7 +11,10 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "svelte": "^5.0.0"
+    "@lucide/svelte": "^1.39.0",
+    "bits-ui": "^2.19.0",
+    "svelte": "^5.0.0",
+    "uplot": "^1.6.32"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^6.0.0",

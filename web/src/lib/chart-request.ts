@@ -1,4 +1,4 @@
-import type { ChartHistoryViewport } from "./api";
+import type { ChartHistory, ChartHistoryViewport, ComparisonChartHistory } from "./api";
 
 export function normalizeChartViewport(
   stepMin: number | null,
@@ -17,9 +17,20 @@ export function chartViewportKey(viewport: ChartHistoryViewport | null): string 
   return viewport ? `${viewport.stepMin}:${viewport.stepMax}` : "all";
 }
 
-export function metricChartRequestKey(
-  revision: number,
+export function preserveNavigableHistory<T extends ChartHistory | ComparisonChartHistory>(
+  previous: T | undefined,
+  response: T,
   viewport: ChartHistoryViewport | null,
-): string {
-  return `${revision}:${chartViewportKey(viewport)}`;
+): T {
+  if (!viewport || !previous || historyHasSamples(response)) return response;
+  return previous;
+}
+
+function historyHasSamples(history: ChartHistory | ComparisonChartHistory): boolean {
+  const series = "series" in history ? history.series : Object.values(history.metrics);
+  return series.some((item) =>
+    item.last_x.some(
+      (coordinate, index) => Number.isFinite(coordinate) && Number.isFinite(item.last[index]),
+    ),
+  );
 }

@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_SELECTED_RUNS,
   comparisonCacheKey,
-  comparisonBucketBudget,
   normalizeRunSelection,
   planComparisonBatches,
   readComparisonUrl,
@@ -27,9 +26,17 @@ describe("comparison state", () => {
   });
 
   it("keeps every overlay request inside the server cell budget", () => {
-    expect(comparisonBucketBudget(1, 2_000)).toBe(2_000);
-    expect(comparisonBucketBudget(12, 2_000)).toBe(1_666);
-    expect(() => comparisonBucketBudget(0, 2_000)).toThrow(/positive integer/);
+    const singleSeries = planComparisonBatches([{ metric: "loss", runIds: ["run-a"] }], 2_000);
+    const twelveSeries = planComparisonBatches(
+      [{ metric: "loss", runIds: Array.from({ length: 12 }, (_, index) => `run-${index}`) }],
+      2_000,
+    );
+
+    expect(singleSeries[0].maxBuckets).toBe(2_000);
+    expect(twelveSeries[0].maxBuckets).toBe(1_666);
+    expect(() => planComparisonBatches([{ metric: "loss", runIds: ["run-a"] }], 0)).toThrow(
+      /positive integer/,
+    );
   });
 
   it("plans multiple visible metrics into bounded multi-series requests", () => {
@@ -41,10 +48,13 @@ describe("comparison state", () => {
 
     expect(batches).toHaveLength(2);
     expect(batches[0].candidates).toHaveLength(16);
-    expect(batches[0].seriesCount).toBe(32);
-    expect(batches[0].seriesCount * batches[0].maxBuckets).toBeLessThanOrEqual(20_000);
+    const seriesCounts = batches.map((batch) =>
+      batch.candidates.reduce((total, candidate) => total + candidate.runIds.length, 0),
+    );
+    expect(seriesCounts[0]).toBe(32);
+    expect(seriesCounts[0] * batches[0].maxBuckets).toBeLessThanOrEqual(20_000);
     expect(batches[1].candidates).toHaveLength(4);
-    expect(batches.every((batch) => batch.seriesCount <= 32)).toBe(true);
+    expect(seriesCounts.every((count) => count <= 32)).toBe(true);
   });
 
   it("keys comparison batches by their actual bucket budget", () => {

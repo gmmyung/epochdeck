@@ -7,6 +7,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import tomllib
 
@@ -17,7 +18,7 @@ SEMVER_PRERELEASE = re.compile(
 )
 
 
-def load_toml(path: Path) -> dict[str, object]:
+def load_toml(path: Path) -> dict[str, Any]:
     with path.open("rb") as source:
         return tomllib.load(source)
 
@@ -48,7 +49,7 @@ def pep440_version(semver: str) -> str:
     return f"{match.group('base')}{marker}{match.group('number')}"
 
 
-def main() -> int:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Check EpochDeck release version consistency."
     )
@@ -63,7 +64,115 @@ def main() -> int:
         action="store_true",
         help="Require resolved release metadata, licensing, and changelog state.",
     )
-    arguments = parser.parse_args()
+    return parser.parse_args()
+
+
+def cargo_lock_failures(
+    cargo: dict[str, Any],
+    cargo_lock: dict[str, Any],
+    release_version: str,
+) -> list[str]:
+    workspace_names = {
+        load_toml(ROOT / member / "Cargo.toml")["package"]["name"]
+        for member in cargo["workspace"]["members"]
+    }
+    locked_versions = {
+        package["name"]: package["version"]
+        for package in cargo_lock["package"]
+        if package.get("name") in workspace_names
+    }
+    return [
+        f"Cargo.lock {name} version is {locked_versions.get(name)!r}, "
+        f"expected {release_version!r}"
+        for name in sorted(workspace_names)
+        if locked_versions.get(name) != release_version
+    ]
+
+
+def python_lock_failures(
+    python_project: dict[str, Any],
+    python_lock: dict[str, Any],
+    expected_version: str,
+) -> list[str]:
+    editable_packages = [
+        package
+        for package in python_lock["package"]
+        if package.get("source") == {"editable": "."}
+    ]
+    if len(editable_packages) != 1:
+        return [
+            f"python/uv.lock has {len(editable_packages)} editable project entries, expected one"
+        ]
+
+    locked_python = editable_packages[0]
+    distribution_name = python_project["project"]["name"]
+    failures = []
+    if locked_python.get("name") != distribution_name:
+        failures.append(
+            f"python/uv.lock project name is {locked_python.get('name')!r}, "
+            f"expected {distribution_name!r}"
+        )
+    if locked_python.get("version") != expected_version:
+        failures.append(
+            f"python/uv.lock project version is {locked_python.get('version')!r}, "
+            f"expected {expected_version!r}"
+        )
+    return failures
+
+
+def release_ready_failures(
+    cargo: dict[str, Any],
+    python_project: dict[str, Any],
+    release_version: str,
+) -> list[str]:
+    failures = []
+    cargo_license = cargo["workspace"]["package"].get("license")
+    python_license = python_project["project"].get("license")
+    root_license = ROOT / "LICENSE"
+    packaged_python_license = ROOT / "python" / "LICENSE"
+    if not root_license.is_file():
+        failures.append("LICENSE is missing")
+    if not packaged_python_license.is_file():
+        failures.append("python/LICENSE is missing")
+    if (
+        root_license.is_file()
+        and packaged_python_license.is_file()
+        and root_license.read_bytes() != packaged_python_license.read_bytes()
+    ):
+        failures.append("python/LICENSE does not match the root LICENSE")
+    if not isinstance(cargo_license, str) or not cargo_license.strip():
+        failures.append("Cargo workspace license metadata is unresolved")
+    if python_license != cargo_license:
+        failures.append(
+            f"Python license is {python_license!r}, expected Cargo license {cargo_license!r}"
+        )
+    if python_project["project"].get("license-files") != ["LICENSE"]:
+        failures.append("Python license-files must be exactly ['LICENSE']")
+    for member in cargo["workspace"]["members"]:
+        package = load_toml(ROOT / member / "Cargo.toml")["package"]
+        if package.get("license") != {"workspace": True}:
+            failures.append(f"{member}/Cargo.toml must inherit the workspace license")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    if "distribution filename will be finalized" in readme:
+        failures.append(
+            "Python distribution identity is still marked unresolved in README.md"
+        )
+    if "License is intentionally undecided" in readme:
+        failures.append("project license is still marked unresolved in README.md")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    release_heading = re.compile(
+        rf"^## \[{re.escape(release_version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
+        re.MULTILINE,
+    )
+    if release_heading.search(changelog) is None:
+        failures.append(
+            f"CHANGELOG.md needs a dated [{release_version}] release heading"
+        )
+    return failures
+
+
+def main() -> int:
+    arguments = parse_args()
 
     cargo = load_toml(ROOT / "Cargo.toml")
     cargo_lock = load_toml(ROOT / "Cargo.lock")
@@ -79,46 +188,8 @@ def main() -> int:
     source_python = python_version_from_source(
         ROOT / "python" / "src" / "epochdeck" / "__init__.py"
     )
-    failures = []
-    workspace_names = set()
-    for member in cargo["workspace"]["members"]:
-        manifest = load_toml(ROOT / member / "Cargo.toml")
-        workspace_names.add(manifest["package"]["name"])
-    locked_workspace_versions = {
-        package["name"]: package["version"]
-        for package in cargo_lock["package"]
-        if package.get("name") in workspace_names
-    }
-    for package_name in sorted(workspace_names):
-        locked_version = locked_workspace_versions.get(package_name)
-        if locked_version != release_version:
-            failures.append(
-                f"Cargo.lock {package_name} version is {locked_version!r}, "
-                f"expected {release_version!r}"
-            )
-
-    distribution_name = python_project["project"]["name"]
-    editable_packages = [
-        package
-        for package in python_lock["package"]
-        if package.get("source") == {"editable": "."}
-    ]
-    if len(editable_packages) != 1:
-        failures.append(
-            f"python/uv.lock has {len(editable_packages)} editable project entries, expected one"
-        )
-    else:
-        locked_python = editable_packages[0]
-        if locked_python.get("name") != distribution_name:
-            failures.append(
-                f"python/uv.lock project name is {locked_python.get('name')!r}, "
-                f"expected {distribution_name!r}"
-            )
-        if locked_python.get("version") != expected_python:
-            failures.append(
-                f"python/uv.lock project version is {locked_python.get('version')!r}, "
-                f"expected {expected_python!r}"
-            )
+    failures = cargo_lock_failures(cargo, cargo_lock, release_version)
+    failures.extend(python_lock_failures(python_project, python_lock, expected_python))
 
     if web.get("version") != release_version:
         failures.append(
@@ -147,50 +218,7 @@ def main() -> int:
         if not notes.is_file():
             failures.append(f"release notes are missing: {notes.relative_to(ROOT)}")
     if arguments.require_release_ready:
-        cargo_license = cargo["workspace"]["package"].get("license")
-        python_license = python_project["project"].get("license")
-        root_license = ROOT / "LICENSE"
-        packaged_python_license = ROOT / "python" / "LICENSE"
-        if not root_license.is_file():
-            failures.append("LICENSE is missing")
-        if not packaged_python_license.is_file():
-            failures.append("python/LICENSE is missing")
-        if (
-            root_license.is_file()
-            and packaged_python_license.is_file()
-            and root_license.read_bytes() != packaged_python_license.read_bytes()
-        ):
-            failures.append("python/LICENSE does not match the root LICENSE")
-        if not isinstance(cargo_license, str) or not cargo_license.strip():
-            failures.append("Cargo workspace license metadata is unresolved")
-        if python_license != cargo_license:
-            failures.append(
-                f"Python license is {python_license!r}, expected Cargo license {cargo_license!r}"
-            )
-        if python_project["project"].get("license-files") != ["LICENSE"]:
-            failures.append("Python license-files must be exactly ['LICENSE']")
-        for member in cargo["workspace"]["members"]:
-            package = load_toml(ROOT / member / "Cargo.toml")["package"]
-            if package.get("license") != {"workspace": True}:
-                failures.append(
-                    f"{member}/Cargo.toml must inherit the workspace license"
-                )
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        if "distribution filename will be finalized" in readme:
-            failures.append(
-                "Python distribution identity is still marked unresolved in README.md"
-            )
-        if "License is intentionally undecided" in readme:
-            failures.append("project license is still marked unresolved in README.md")
-        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        release_heading = re.compile(
-            rf"^## \[{re.escape(release_version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
-            re.MULTILINE,
-        )
-        if release_heading.search(changelog) is None:
-            failures.append(
-                f"CHANGELOG.md needs a dated [{release_version}] release heading"
-            )
+        failures.extend(release_ready_failures(cargo, python_project, release_version))
     if failures:
         for failure in failures:
             print(f"release version error: {failure}", file=sys.stderr)

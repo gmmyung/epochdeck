@@ -106,7 +106,7 @@ class Trace:
     def __enter__(self) -> Trace:
         return self
 
-    def __exit__(self, exception_type: object, exception: object, traceback: object) -> None:
+    def __exit__(self, exception_type: object, exception: object, _traceback: object) -> None:
         if exception is None:
             self.finish(status="ok")
         else:

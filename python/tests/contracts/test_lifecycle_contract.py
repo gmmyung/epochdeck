@@ -11,8 +11,8 @@ import pytest
 
 import epochdeck
 from epochdeck import DeliveryError
+from epochdeck._run import create_run, sync_spool
 from epochdeck._summary import merge_metric_preview
-from epochdeck.run import create_run, sync_spool
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "scalar_lifecycle.json").read_text(encoding="utf-8")

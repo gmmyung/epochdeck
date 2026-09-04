@@ -1,4 +1,4 @@
-export type PlayableVideo = {
+type PlayableVideo = {
   play: () => Promise<void>;
   pause: () => void;
 };

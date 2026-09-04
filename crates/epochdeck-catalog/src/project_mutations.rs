@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 struct MutationTable {
     name: &'static str,
     inserted_project: &'static str,
@@ -80,7 +82,7 @@ const TABLES: &[MutationTable] = &[
     },
 ];
 
-pub(crate) fn trigger_schema() -> String {
+pub(super) fn trigger_schema() -> String {
     let mut schema = String::new();
     for table in TABLES {
         for (event, project) in [
@@ -88,13 +90,15 @@ pub(crate) fn trigger_schema() -> String {
             ("update", table.updated_project),
             ("delete", table.deleted_project),
         ] {
-            schema.push_str(&format!(
+            write!(
+                schema,
                 "CREATE TRIGGER IF NOT EXISTS project_mutation_{}_{event} \
                  AFTER {event} ON {} BEGIN \
                  UPDATE projects SET mutation_revision = mutation_revision + 1 \
                  WHERE id = {project}; END;",
                 table.name, table.name
-            ));
+            )
+            .expect("writing SQL into a String cannot fail");
         }
     }
     schema

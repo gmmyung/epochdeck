@@ -1,6 +1,6 @@
 import type { ScaleMode, SmoothingMode } from "./chart-data";
 
-export type ChartPreferences = {
+type ChartPreferences = {
   displayMode: "band" | "line";
   smoothingMode: SmoothingMode;
   smoothingAmount: number;

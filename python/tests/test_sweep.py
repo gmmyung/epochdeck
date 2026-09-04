@@ -8,7 +8,7 @@ import pytest
 
 import epochdeck
 from epochdeck import SweepEarlyStop
-from epochdeck.run import create_run
+from epochdeck._run import create_run
 from epochdeck.sweep import _MAX_AGENT_STATE_BYTES, _AgentState, _normalize_sweep
 
 

@@ -1,9 +1,9 @@
 import type { ReportPanel } from "./api";
 
-export const MAX_REPORT_PANELS_PER_PAGE = 12;
-export const MAX_REPORT_CHARTS_PER_PAGE = 24;
+const MAX_REPORT_PANELS_PER_PAGE = 12;
+const MAX_REPORT_CHARTS_PER_PAGE = 24;
 
-export type ReportPanelPage = {
+type ReportPanelPage = {
   panels: ReportPanel[];
   chartCount: number;
 };

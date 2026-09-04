@@ -234,24 +234,6 @@ export class RunResourceController {
     }
   }
 
-  async refresh(tab: RunTab, context: RunResourceContext): Promise<string | null> {
-    if (tab === "configuration" || tab === "metrics") return null;
-    context = this.requestContext(context);
-    const generation = this.generation;
-    try {
-      const patch = await this.loadNewest(tab, context);
-      if (!this.isCurrent(generation, context.signal)) return null;
-      this.state = { ...this.state, ...patch, errors: withoutKey(this.state.errors, tab) };
-      this.emit();
-      return null;
-    } catch (reason) {
-      if (!this.isCurrent(generation, context.signal)) return null;
-      const message = reasonMessage(reason);
-      this.setError(tab, message);
-      return message;
-    }
-  }
-
   /** Marks hidden rich-resource tabs stale and refreshes the visible loaded tab in place. */
   async applyResourceRevision(tab: RunTab, context: RunResourceContext): Promise<string | null> {
     const revisionTabs = new Set<RunTab>(["summary", "media", "traces", "artifacts"]);
@@ -800,28 +782,7 @@ export class RunResourceController {
   }
 
   private emit(): void {
-    this.publish({
-      ...this.state,
-      alerts: [...this.state.alerts],
-      richKeys: [...this.state.richKeys],
-      richValues: [...this.state.richValues],
-      richValueDetails: { ...this.state.richValueDetails },
-      richDetailLoading: new Set(this.state.richDetailLoading),
-      richDetailErrors: { ...this.state.richDetailErrors },
-      artifacts: [...this.state.artifacts],
-      artifactDetails: { ...this.state.artifactDetails },
-      artifactDetailLoading: new Set(this.state.artifactDetailLoading),
-      artifactDetailErrors: { ...this.state.artifactDetailErrors },
-      traces: [...this.state.traces],
-      traceDetails: { ...this.state.traceDetails },
-      traceDetailLoading: new Set(this.state.traceDetailLoading),
-      traceDetailErrors: { ...this.state.traceDetailErrors },
-      loadedTabs: new Set(this.state.loadedTabs),
-      loadingTabs: new Set(this.state.loadingTabs),
-      errors: { ...this.state.errors },
-      loadedMoreTabs: new Set(this.state.loadedMoreTabs),
-      truncatedTabs: new Set(this.state.truncatedTabs),
-    });
+    this.publish(this.state);
   }
 }
 

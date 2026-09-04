@@ -56,7 +56,7 @@ use epochdeck_protocol::{
 };
 use epochdeck_storage::{
     BlobInstallation, BlobStore, ChartAxisExtent, ChartAxisExtentScanner, ChartCoordinate,
-    ChartHistorySampler, ChartSamplingSpec, ChartStepExtent, ChartStepExtentScanner, MetricStore,
+    ChartHistorySampler, ChartSamplingSpec, ChartStepExtent, ChartStepExtentScanner,
     MinMaxHistorySampler, SegmentInstallation, SegmentSource, SegmentTail, StorageError,
 };
 use futures_util::StreamExt;
@@ -72,7 +72,8 @@ use tokio::sync::{
 use tower::ServiceExt;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeFile;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 use dashboard::{dashboard_config, dashboard_logo};
 use diagnostics::collect_storage_root_diagnostics;
@@ -138,7 +139,7 @@ struct AppState {
     download_stream_permits: Arc<Semaphore>,
     chart_series_cache: Arc<Mutex<ChartSeriesCache>>,
     chart_axis_extent_cache: Arc<Mutex<ChartAxisExtentCache>>,
-    telemetry: Arc<RequestTelemetry>,
+    request_metrics: Arc<RequestMetrics>,
 }
 
 impl AppState {
@@ -148,7 +149,7 @@ impl AppState {
         blobs: BlobStore,
         dashboard: DashboardConfig,
         chart_axis_extent_cache: Arc<Mutex<ChartAxisExtentCache>>,
-        telemetry: Arc<RequestTelemetry>,
+        request_metrics: Arc<RequestMetrics>,
     ) -> Self {
         Self {
             catalog,
@@ -169,7 +170,7 @@ impl AppState {
             download_stream_permits: Arc::new(Semaphore::new(DOWNLOAD_STREAM_LIMIT)),
             chart_series_cache: Arc::new(Mutex::new(ChartSeriesCache::default())),
             chart_axis_extent_cache,
-            telemetry,
+            request_metrics,
         }
     }
 }
@@ -391,7 +392,7 @@ fn chart_series_cache_bytes(key: &ChartSeriesCacheKey, history: &ChartMetricHist
 }
 
 #[derive(Debug)]
-struct RequestTelemetry {
+struct RequestMetrics {
     started_at: Instant,
     slow_threshold: Duration,
     requests_total: AtomicU64,
@@ -405,7 +406,7 @@ struct RequestTelemetry {
     recent_slow_requests: Mutex<VecDeque<SlowRequestRecord>>,
 }
 
-impl RequestTelemetry {
+impl RequestMetrics {
     fn from_environment() -> Self {
         let threshold_ms = std::env::var("EPOCHDECK_SLOW_REQUEST_MS")
             .ok()
@@ -432,67 +433,26 @@ impl RequestTelemetry {
     }
 }
 
-pub fn app(catalog: Catalog, metrics: MetricStore) -> Router {
-    let blob_root = metrics
-        .root()
-        .parent()
-        .unwrap_or_else(|| metrics.root())
-        .join("blobs");
-    app_with_runtime_and_blobs(
-        catalog,
-        MetricRuntime::new(metrics),
-        BlobStore::new(blob_root),
-        DashboardConfig::default(),
-    )
-}
-
-pub fn app_with_runtime(catalog: Catalog, metrics: MetricRuntime) -> Router {
-    let blob_root = metrics
-        .store()
-        .root()
-        .parent()
-        .unwrap_or_else(|| metrics.store().root())
-        .join("blobs");
-    app_with_runtime_and_blobs(
-        catalog,
-        metrics,
-        BlobStore::new(blob_root),
-        DashboardConfig::default(),
-    )
-}
-
-pub fn app_with_runtime_and_blobs(
+pub fn app(
     catalog: Catalog,
     metrics: MetricRuntime,
     blobs: BlobStore,
     dashboard: DashboardConfig,
 ) -> Router {
-    app_with_axis_extent_cache(
-        catalog,
-        metrics,
-        blobs,
-        dashboard,
-        Arc::new(Mutex::new(ChartAxisExtentCache::default())),
-    )
-}
-
-fn app_with_axis_extent_cache(
-    catalog: Catalog,
-    metrics: MetricRuntime,
-    blobs: BlobStore,
-    dashboard: DashboardConfig,
-    chart_axis_extent_cache: Arc<Mutex<ChartAxisExtentCache>>,
-) -> Router {
-    let telemetry = Arc::new(RequestTelemetry::from_environment());
     let state = AppState::new(
         catalog,
         metrics,
         blobs,
         dashboard,
-        chart_axis_extent_cache,
-        Arc::clone(&telemetry),
+        Arc::new(Mutex::new(ChartAxisExtentCache::default())),
+        Arc::new(RequestMetrics::from_environment()),
     );
+    build_router(state)
+}
+
+fn build_router(state: AppState) -> Router {
     let admission_state = state.clone();
+    let request_metrics = Arc::clone(&state.request_metrics);
     let router = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/dashboard/config", get(dashboard_config))
@@ -596,13 +556,22 @@ fn app_with_axis_extent_cache(
     router
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_request(())
+                .on_response(DefaultOnResponse::new().level(Level::INFO))
+                .on_failure(()),
+        )
         .layer(middleware::from_fn_with_state(
             admission_state,
             admit_api_request,
         ))
         .layer(middleware::from_fn(add_security_headers))
-        .layer(middleware::from_fn_with_state(telemetry, record_request))
+        .layer(middleware::from_fn_with_state(
+            request_metrics,
+            record_request_metrics,
+        ))
 }
 
 async fn admit_api_request(
@@ -621,7 +590,7 @@ async fn admit_api_request(
     };
     let Ok(permit) = Arc::clone(admission).try_acquire_owned() else {
         state
-            .telemetry
+            .request_metrics
             .requests_rejected_total
             .fetch_add(1, Ordering::Relaxed);
         return HttpError::busy("server request capacity is exhausted; retry later")
@@ -694,7 +663,7 @@ async fn embedded_dashboard(uri: Uri) -> Response {
     response
 }
 
-struct ActiveRequestGuard(Arc<RequestTelemetry>);
+struct ActiveRequestGuard(Arc<RequestMetrics>);
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
@@ -702,14 +671,18 @@ impl Drop for ActiveRequestGuard {
     }
 }
 
-async fn record_request(
-    State(telemetry): State<Arc<RequestTelemetry>>,
+async fn record_request_metrics(
+    State(request_metrics): State<Arc<RequestMetrics>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    telemetry.requests_total.fetch_add(1, Ordering::Relaxed);
-    telemetry.requests_active.fetch_add(1, Ordering::Relaxed);
-    let _active_guard = ActiveRequestGuard(Arc::clone(&telemetry));
+    request_metrics
+        .requests_total
+        .fetch_add(1, Ordering::Relaxed);
+    request_metrics
+        .requests_active
+        .fetch_add(1, Ordering::Relaxed);
+    let _active_guard = ActiveRequestGuard(Arc::clone(&request_metrics));
     let method = request.method().to_string();
     let path = truncate_diagnostic_path(request.uri().path());
     let history_query = path.ends_with("/history")
@@ -718,47 +691,46 @@ async fn record_request(
     let started_at = Instant::now();
     let response = next.run(request).await;
     let elapsed = started_at.elapsed();
-    let duration_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+    let duration_ms = duration_millis(elapsed);
     let status = response.status();
     if status.is_server_error() {
-        telemetry
+        request_metrics
             .server_errors_total
             .fetch_add(1, Ordering::Relaxed);
     }
     if history_query {
-        telemetry
+        request_metrics
             .history_queries_total
             .fetch_add(1, Ordering::Relaxed);
-        telemetry
+        request_metrics
             .history_query_duration_ms_total
             .fetch_add(duration_ms, Ordering::Relaxed);
-        telemetry
+        request_metrics
             .history_query_duration_ms_max
             .fetch_max(duration_ms, Ordering::Relaxed);
     }
-    if elapsed >= telemetry.slow_threshold {
-        telemetry
+    if elapsed >= request_metrics.slow_threshold {
+        request_metrics
             .slow_requests_total
             .fetch_add(1, Ordering::Relaxed);
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
+        let timestamp_ms = duration_millis(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        );
         let record = SlowRequestRecord {
-            method: method.clone(),
-            path: path.clone(),
+            method,
+            path,
             status: status.as_u16(),
             duration_ms,
             timestamp_ms,
         };
-        if let Ok(mut recent) = telemetry.recent_slow_requests.lock() {
+        if let Ok(mut recent) = request_metrics.recent_slow_requests.lock() {
             if recent.len() == MAX_RECENT_SLOW_REQUESTS {
                 recent.pop_front();
             }
             recent.push_back(record);
         }
-        tracing::warn!(%method, %path, status = status.as_u16(), duration_ms, "slow request");
     }
     response
 }
@@ -774,11 +746,15 @@ fn truncate_diagnostic_path(value: &str) -> String {
     value[..end].to_owned()
 }
 
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 async fn diagnostics(
     State(state): State<AppState>,
 ) -> Result<Json<DiagnosticsResponse>, HttpError> {
-    let telemetry = &state.telemetry;
-    let recent_slow_requests = telemetry
+    let request_metrics = &state.request_metrics;
+    let recent_slow_requests = request_metrics
         .recent_slow_requests
         .lock()
         .map(|recent| recent.iter().cloned().collect())
@@ -795,21 +771,22 @@ async fn diagnostics(
     Ok(Json(DiagnosticsResponse {
         service: "epochdeck".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        uptime_seconds: telemetry.started_at.elapsed().as_secs(),
-        requests_total: telemetry.requests_total.load(Ordering::Relaxed),
-        requests_active: telemetry.requests_active.load(Ordering::Relaxed),
-        requests_rejected_total: telemetry.requests_rejected_total.load(Ordering::Relaxed),
-        server_errors_total: telemetry.server_errors_total.load(Ordering::Relaxed),
-        slow_requests_total: telemetry.slow_requests_total.load(Ordering::Relaxed),
-        slow_request_threshold_ms: telemetry
-            .slow_threshold
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64,
-        history_queries_total: telemetry.history_queries_total.load(Ordering::Relaxed),
-        history_query_duration_ms_total: telemetry
+        uptime_seconds: request_metrics.started_at.elapsed().as_secs(),
+        requests_total: request_metrics.requests_total.load(Ordering::Relaxed),
+        requests_active: request_metrics.requests_active.load(Ordering::Relaxed),
+        requests_rejected_total: request_metrics
+            .requests_rejected_total
+            .load(Ordering::Relaxed),
+        server_errors_total: request_metrics.server_errors_total.load(Ordering::Relaxed),
+        slow_requests_total: request_metrics.slow_requests_total.load(Ordering::Relaxed),
+        slow_request_threshold_ms: duration_millis(request_metrics.slow_threshold),
+        history_queries_total: request_metrics
+            .history_queries_total
+            .load(Ordering::Relaxed),
+        history_query_duration_ms_total: request_metrics
             .history_query_duration_ms_total
             .load(Ordering::Relaxed),
-        history_query_duration_ms_max: telemetry
+        history_query_duration_ms_max: request_metrics
             .history_query_duration_ms_max
             .load(Ordering::Relaxed),
         request_admission_limit: REQUEST_ADMISSION_LIMIT,
@@ -4178,10 +4155,39 @@ mod tests {
         AppState, BLOB_UPLOAD_WORKERS, CHART_AXIS_EXTENT_CACHE_MAX_ENTRIES,
         CHART_SERIES_CACHE_MAX_ENTRIES, CachedChartOrigin, ChartAxisExtentCache,
         ChartAxisExtentCacheKey, ChartSeriesCache, ChartSeriesCacheKey, CompactionConfig,
-        CompactionError, CompactionOutcome, DashboardConfig, MetricRuntime, RequestTelemetry, app,
-        app_with_axis_extent_cache, app_with_runtime, app_with_runtime_and_blobs, compact_once,
-        create_artifact, ingest_batch, mutation_lock_index, process_ingest_batch, upload_blob,
+        CompactionError, CompactionOutcome, DashboardConfig, MetricRuntime, RequestMetrics, app,
+        build_router, compact_once, create_artifact, ingest_batch, mutation_lock_index,
+        process_ingest_batch, upload_blob,
     };
+
+    fn test_app(catalog: Catalog, metrics: MetricStore) -> Router {
+        let blob_root = metrics
+            .root()
+            .parent()
+            .unwrap_or_else(|| metrics.root())
+            .join("blobs");
+        app(
+            catalog,
+            MetricRuntime::new(metrics),
+            BlobStore::new(blob_root),
+            DashboardConfig::default(),
+        )
+    }
+
+    fn app_with_runtime(catalog: Catalog, metrics: MetricRuntime) -> Router {
+        let blob_root = metrics
+            .store()
+            .root()
+            .parent()
+            .unwrap_or_else(|| metrics.store().root())
+            .join("blobs");
+        app(
+            catalog,
+            metrics,
+            BlobStore::new(blob_root),
+            DashboardConfig::default(),
+        )
+    }
 
     #[test]
     fn chart_axis_extent_cache_is_bounded_and_caches_missing_metrics() {
@@ -4413,7 +4419,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let maximum = epochdeck_protocol::MAX_JSON_SAFE_INTEGER;
         let safe_response = router
             .clone()
@@ -4480,7 +4486,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let created: CreateRunResponse = response_json(
             router
                 .clone()
@@ -4538,7 +4544,7 @@ mod tests {
         let metrics_root = directory.path().join("metrics");
         std::fs::create_dir_all(&metrics_root)?;
         std::fs::create_dir_all(directory.path().join("blobs"))?;
-        let router = app(catalog, MetricStore::new(metrics_root));
+        let router = test_app(catalog, MetricStore::new(metrics_root));
         let response = router
             .clone()
             .oneshot(Request::get("/api/v1/health").body(Body::empty())?)
@@ -4615,7 +4621,7 @@ mod tests {
     async fn dashboard_config_serves_bounded_same_origin_svg_branding()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
-        let default_router = app(
+        let default_router = test_app(
             Catalog::open(directory.path().join("default-catalog.sqlite3")).await?,
             MetricStore::new(directory.path().join("default-metrics")),
         );
@@ -4640,7 +4646,7 @@ mod tests {
         let logo_path = directory.path().join("logo.svg");
         std::fs::write(&logo_path, logo_bytes)?;
         let dashboard = DashboardConfig::new("#A1b2C3", Some(&logo_path))?;
-        let router = app_with_runtime_and_blobs(
+        let router = app(
             Catalog::open(directory.path().join("custom-catalog.sqlite3")).await?,
             MetricRuntime::new(MetricStore::new(directory.path().join("custom-metrics"))),
             BlobStore::new(directory.path().join("custom-blobs")),
@@ -4685,7 +4691,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         for path in ["/", "/projects/demo"] {
             let response = router
                 .clone()
@@ -4737,7 +4743,7 @@ mod tests {
             BlobStore::new(directory.path().join("blobs")),
             DashboardConfig::default(),
             Arc::new(Mutex::new(ChartAxisExtentCache::default())),
-            Arc::new(RequestTelemetry::from_environment()),
+            Arc::new(RequestMetrics::from_environment()),
         );
         let router = Router::new()
             .route("/api/v1/heavy", post(parse_json))
@@ -4786,7 +4792,7 @@ mod tests {
         assert_eq!(rejected_health.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             state
-                .telemetry
+                .request_metrics
                 .requests_rejected_total
                 .load(Ordering::Relaxed),
             2
@@ -4815,47 +4821,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_telemetry_keeps_bounded_slow_history_diagnostics()
+    async fn request_metrics_keep_bounded_slow_history_diagnostics()
     -> Result<(), Box<dyn std::error::Error>> {
-        let telemetry = Arc::new(super::RequestTelemetry::new(Duration::ZERO));
+        let request_metrics = Arc::new(super::RequestMetrics::new(Duration::ZERO));
         let router = axum::Router::new()
             .route(
                 "/api/v1/runs/example/history",
                 axum::routing::get(|| async {}),
             )
             .layer(axum::middleware::from_fn_with_state(
-                Arc::clone(&telemetry),
-                super::record_request,
+                Arc::clone(&request_metrics),
+                super::record_request_metrics,
             ));
         let response = router
             .oneshot(Request::get("/api/v1/runs/example/history").body(Body::empty())?)
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            telemetry
+            request_metrics
                 .requests_total
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
         assert_eq!(
-            telemetry
+            request_metrics
                 .requests_active
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
         assert_eq!(
-            telemetry
+            request_metrics
                 .slow_requests_total
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
         assert_eq!(
-            telemetry
+            request_metrics
                 .history_queries_total
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-        let recent = telemetry
+        let recent = request_metrics
             .recent_slow_requests
             .lock()
             .map_err(|_| std::io::Error::other("slow request diagnostics lock was poisoned"))?;
@@ -4868,7 +4874,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let mut created_ids = Vec::new();
         for (name, seed) in [("alpha", 1), ("beta", 2), ("beta-eval", 2)] {
             let mut config = BTreeMap::from([
@@ -5163,7 +5169,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let mut runs = Vec::new();
         for name in ["first", "second"] {
             let created: CreateRunResponse = response_json(
@@ -5235,6 +5241,7 @@ mod tests {
         assert_eq!(first.keys[0].key, "loss");
         assert_eq!(first.keys[0].run_ids.len(), 2);
         assert_eq!(first.next_after.as_deref(), Some("loss"));
+        assert_eq!(first.total_count, 3);
 
         let second: ProjectMetricCatalogResponse = response_json(
             router
@@ -5262,6 +5269,7 @@ mod tests {
             vec!["reward", "throughput"]
         );
         assert_eq!(second.next_after, None);
+        assert_eq!(second.total_count, 3);
 
         let intersection: ProjectMetricCatalogResponse = response_json(
             router
@@ -5282,6 +5290,7 @@ mod tests {
         .await?;
         assert_eq!(intersection.keys.len(), 1);
         assert_eq!(intersection.keys[0].key, "loss");
+        assert_eq!(intersection.total_count, 1);
 
         let foreign_cursor = router
             .clone()
@@ -5305,7 +5314,7 @@ mod tests {
     async fn public_inputs_reject_unknown_fields() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let unknown_body = router
             .clone()
             .oneshot(
@@ -5330,7 +5339,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
 
         let stable_id = RunId::new();
         let stable_request = CreateRunRequest {
@@ -5480,7 +5489,7 @@ mod tests {
                 .await?;
             run_ids.push(run.id);
         }
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let path_a = format!("/api/v1/runs/{}/artifacts", run_ids[0]);
         let path_b = format!("/api/v1/runs/{}/artifacts", run_ids[1]);
 
@@ -5637,7 +5646,7 @@ mod tests {
             blobs,
             DashboardConfig::default(),
             Arc::new(Mutex::new(ChartAxisExtentCache::default())),
-            Arc::new(RequestTelemetry::from_environment()),
+            Arc::new(RequestMetrics::from_environment()),
         );
         let (run, _) = catalog
             .create_or_resume_run(
@@ -5695,7 +5704,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let content = b"concurrent-content-addressed-blob";
         let digest = format!("{:x}", Sha256::digest(content));
         let path = format!("/api/v1/blobs/{digest}");
@@ -5825,7 +5834,7 @@ mod tests {
             blobs.clone(),
             DashboardConfig::default(),
             Arc::new(Mutex::new(ChartAxisExtentCache::default())),
-            Arc::new(RequestTelemetry::from_environment()),
+            Arc::new(RequestMetrics::from_environment()),
         );
         let held = Arc::clone(&state.blob_upload_permits)
             .acquire_many_owned((BLOB_UPLOAD_WORKERS - 1) as u32)
@@ -5884,7 +5893,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let mut run_ids = Vec::new();
         for name in ["config-race", "resource-race"] {
             let created: CreateRunResponse = response_json(
@@ -5966,7 +5975,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let sweep: CreateSweepResponse = response_json(
             router
                 .clone()
@@ -6073,7 +6082,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let sweep_request = CreateSweepRequest {
             id: None,
             name: Some("optimizer-search".to_owned()),
@@ -6282,7 +6291,7 @@ mod tests {
     async fn reports_persist_bounded_dashboard_layouts() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let run: CreateRunResponse = response_json(
             router
                 .clone()
@@ -6453,7 +6462,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let created: CreateRunResponse = response_json(
             router
                 .clone()
@@ -6596,13 +6605,14 @@ mod tests {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
         let axis_extent_cache = Arc::new(Mutex::new(ChartAxisExtentCache::default()));
-        let router = app_with_axis_extent_cache(
+        let router = build_router(AppState::new(
             catalog,
             MetricRuntime::new(MetricStore::new(directory.path().join("metrics"))),
             BlobStore::new(directory.path().join("blobs")),
             DashboardConfig::default(),
             Arc::clone(&axis_extent_cache),
-        );
+            Arc::new(RequestMetrics::from_environment()),
+        ));
         let create_run = |name: &str| CreateRunRequest {
             id: None,
             name: Some(name.to_owned()),
@@ -6934,7 +6944,7 @@ mod tests {
             blobs,
             DashboardConfig::default(),
             Arc::new(Mutex::new(ChartAxisExtentCache::default())),
-            Arc::new(RequestTelemetry::from_environment()),
+            Arc::new(RequestMetrics::from_environment()),
         );
         let (run, _) = catalog
             .create_or_resume_run(
@@ -7015,7 +7025,7 @@ mod tests {
             blobs,
             DashboardConfig::default(),
             Arc::new(Mutex::new(ChartAxisExtentCache::default())),
-            Arc::new(RequestTelemetry::from_environment()),
+            Arc::new(RequestMetrics::from_environment()),
         );
         let (run, _) = catalog
             .create_or_resume_run(
@@ -7074,7 +7084,7 @@ mod tests {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
         let metrics_root = directory.path().join("metrics");
-        let router = app(catalog.clone(), MetricStore::new(&metrics_root));
+        let router = test_app(catalog.clone(), MetricStore::new(&metrics_root));
         let created: CreateRunResponse = response_json(
             router
                 .clone()
@@ -7141,7 +7151,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).await?;
-        let router = app(catalog, MetricStore::new(directory.path().join("metrics")));
+        let router = test_app(catalog, MetricStore::new(directory.path().join("metrics")));
         let create = CreateRunRequest {
             id: None,
             name: Some("fast-run".to_owned()),

@@ -1,4 +1,4 @@
-export type LiveRefreshTask = () => void;
+type LiveRefreshTask = () => void;
 
 type TimerHandle = ReturnType<typeof globalThis.setTimeout>;
 
@@ -44,15 +44,11 @@ export class LiveRefreshCoordinator {
     this.cancelTimer();
   }
 
-  get pendingCount(): number {
-    return this.pending.size;
-  }
-
   private drain(): void {
     this.cancelTimer();
     const now = Date.now();
     const ready: LiveRefreshTask[] = [];
-    for (const [identity, pending] of [...this.pending]) {
+    for (const [identity, pending] of this.pending) {
       const lastDispatch = this.lastDispatch.get(identity);
       const dueAt = pending.urgent
         ? now

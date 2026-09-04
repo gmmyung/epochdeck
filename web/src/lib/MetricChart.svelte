@@ -1,27 +1,13 @@
-<script module lang="ts">
-  let modalBodyLockCount = 0;
-
-  function acquireModalBodyLock(): void {
-    modalBodyLockCount += 1;
-    document.body.classList.add("chart-modal-open");
-  }
-
-  function releaseModalBodyLock(): void {
-    modalBodyLockCount = Math.max(0, modalBodyLockCount - 1);
-    if (modalBodyLockCount === 0) document.body.classList.remove("chart-modal-open");
-  }
-</script>
-
 <script lang="ts">
+  import { Dialog } from "bits-ui";
   import { onMount } from "svelte";
 
   import { readChartPreferences, rememberChartPreferences } from "./chart-preferences";
-  import { axisTicks, type ScaleMode, type SmoothingMode } from "./chart-data";
+  import { type ScaleMode, type SmoothingMode } from "./chart-data";
   import { formatDurationMs } from "./resource-state";
   import {
     closestSeriesPoints,
-    contiguousBucketRanges,
-    lineDash,
+    hasDrawableSeriesInRange,
     metricChartViewportKey,
     prepareMetricSeries,
     runSetIdentity,
@@ -29,12 +15,13 @@
     type MetricChartSeries,
     type PreparedMetricSeries,
     type SeriesHoverPoint,
-    type SeriesPattern,
     type XAlignment,
   } from "./chart-series";
   import Icon from "./Icon.svelte";
   import {
     boundedDomain,
+    clampDomainToBounds,
+    clampPannedDomainToBounds,
     configuredChartViewport as configuredDomain,
     fromScreenX,
     fromScreenY,
@@ -44,6 +31,7 @@
     transformScale as transformed,
     validateChartAxes as validateAxes,
     viewportFromSelection,
+    zoomHorizontalViewport,
     type Domain,
     type Drag,
     type Frame,
@@ -51,6 +39,7 @@
     type Viewport,
   } from "./metric-chart-viewport";
   import MetricChartSettings from "./MetricChartSettings.svelte";
+  import { boundedCanvasPixelRatio, UPlotRenderer } from "./uplot-renderer";
 
   export let metric: string;
   export let identity = metric;
@@ -71,9 +60,6 @@
   type InteractionMode = "pan" | "select";
   type DisplayMode = "band" | "line";
 
-  const CANVAS_PIXEL_BUDGET = 8_000_000;
-  const CANVAS_DIMENSION_LIMIT = 4_096;
-  const CANVAS_DPR_LIMIT = 2;
   const DEFAULT_PREFERENCES = {
     displayMode: "band" as const,
     smoothingMode: "none" as const,
@@ -88,7 +74,7 @@
 
   let card: HTMLElement;
   let canvas: HTMLCanvasElement;
-  let plotCanvas: HTMLCanvasElement;
+  let plotTarget: HTMLDivElement;
   let expandButton: HTMLButtonElement;
   let visible = false;
   let layoutRevision = 0;
@@ -111,14 +97,18 @@
   let hoverPosition: Point | null = null;
   let pendingPointer: Point | null = null;
   let pointerFrame: number | null = null;
+  let pendingWheel: { point: Point; exponent: number } | null = null;
+  let wheelFrame: number | null = null;
   let viewportRequestTimer: number | null = null;
   let tooltip: HTMLElement | null = null;
   let tooltipPositionFrame: number | null = null;
   let tooltipHideTimer: number | null = null;
-  let tooltipHovered = false;
+  let tooltipFocused = false;
   let tooltipPositioned = false;
   let preferenceIdentity = "";
   let synchronizedParentViewportKey = "";
+  let navigationDomainKey = "";
+  let navigationX: Domain | null = null;
   let activeAlignment = xAlignment;
   let seriesIdentity = "";
   let hiddenRunIds = new Set<string>();
@@ -137,13 +127,8 @@
   let anyPending = false;
   let expanded = false;
   let settingsOpen = false;
-  let mounted = false;
-  let focusTrapActive = false;
-  let ownsModalBodyLock = false;
   let restoreFocusElement: HTMLElement | null = null;
-  let inertedElements: Array<{ element: HTMLElement; wasInert: boolean }> = [];
-
-  $: updateLayerListeners(expanded);
+  const plotRenderer = new UPlotRenderer();
 
   $: if (identity !== preferenceIdentity) {
     clearViewportRequest();
@@ -222,6 +207,12 @@
     yMinimum,
     yMaximum,
   );
+  $: synchronizeNavigationDomain(
+    JSON.stringify([identity, seriesIdentity, activeAlignment, xScale, xMinimum, xMaximum]),
+    parentViewport,
+    configuredViewport,
+    series.some((item) => item.loading),
+  );
   $: synchronizeParentViewport(
     JSON.stringify([
       identity,
@@ -262,7 +253,6 @@
   }
 
   onMount(() => {
-    mounted = true;
     const observer = new IntersectionObserver(
       (entries) => {
         const nextVisible = entries.some((entry) => entry.isIntersecting);
@@ -286,10 +276,7 @@
     theme.addEventListener("change", redraw);
     window.addEventListener("resize", repositionTooltip);
     window.addEventListener("scroll", repositionTooltip, true);
-    updateLayerListeners(expanded);
     return () => {
-      mounted = false;
-      updateLayerListeners(false);
       visible = false;
       onvisibilitychange(metric, false);
       observer.disconnect();
@@ -298,24 +285,27 @@
       window.removeEventListener("resize", repositionTooltip);
       window.removeEventListener("scroll", repositionTooltip, true);
       if (pointerFrame !== null) window.cancelAnimationFrame(pointerFrame);
+      clearPendingWheel();
       clearTooltipTimers();
       clearViewportRequest();
-      setSurroundingContentInert(false);
-      setModalBodyLock(false);
+      plotRenderer.destroy();
     };
   });
 
-  $: if (plotCanvas && visible && renderableSeries.length > 0 && layoutRevision >= 0) {
-    drawChart(
-      plotCanvas,
-      renderableSeries,
-      displayMode,
-      xScale,
-      yScale,
-      configuredViewport,
-      viewport,
-      activeHighlightedRunId,
-    );
+  $: if (plotTarget && visible && renderableSeries.length > 0 && layoutRevision >= 0) {
+    const currentViewport = viewport ?? configuredViewport;
+    frame = currentViewport
+      ? plotRenderer.render(plotTarget, {
+          candidates: renderableSeries,
+          displayMode,
+          xScale,
+          yScale,
+          viewport: currentViewport,
+          highlightedRunId: activeHighlightedRunId,
+          formatX: formatHorizontalAxis,
+          formatY: formatAxis,
+        })
+      : null;
   }
 
   $: if (canvas && visible && frame && renderableSeries.length > 0 && overlayRevision >= 0) {
@@ -327,91 +317,6 @@
     overlayRevision += 1;
   }
 
-  function drawChart(
-    target: HTMLCanvasElement,
-    candidates: PreparedMetricSeries[],
-    display: DisplayMode,
-    horizontalScale: ScaleMode,
-    verticalScale: ScaleMode,
-    configured: Viewport | null,
-    activeViewport: Viewport | null,
-    highlighted: string | null,
-  ): void {
-    const width = Math.max(target.clientWidth, 1);
-    const height = Math.max(target.clientHeight, 1);
-    const requestedRatio = Math.min(window.devicePixelRatio || 1, CANVAS_DPR_LIMIT);
-    const pixelBudgetRatio = Math.sqrt(CANVAS_PIXEL_BUDGET / (width * height));
-    const dimensionRatio = Math.min(
-      CANVAS_DIMENSION_LIMIT / width,
-      CANVAS_DIMENSION_LIMIT / height,
-    );
-    const ratio = Math.max(0.01, Math.min(requestedRatio, pixelBudgetRatio, dimensionRatio));
-    const pixelWidth = Math.floor(width * ratio);
-    const pixelHeight = Math.floor(height * ratio);
-    if (target.width !== pixelWidth) target.width = pixelWidth;
-    if (target.height !== pixelHeight) target.height = pixelHeight;
-    const context = target.getContext("2d");
-    if (!context) return;
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.clearRect(0, 0, target.width, target.height);
-    context.setTransform(ratio, 0, 0, ratio, 0, 0);
-    const current = activeViewport ?? configured;
-    if (!current) {
-      frame = null;
-      return;
-    }
-
-    const padding = { top: 12, right: 18, bottom: 32, left: 58 };
-    const currentFrame: Frame = { width, height, padding, x: current.x, y: current.y };
-    frame = currentFrame;
-    const styles = getComputedStyle(target);
-    const gridColor = styles.getPropertyValue("--chart-grid").trim() || "#d9dde0";
-    const mutedColor = styles.getPropertyValue("--muted").trim() || "#596168";
-    const plotWidth = Math.max(width - padding.left - padding.right, 1);
-    const plotHeight = Math.max(height - padding.top - padding.bottom, 1);
-
-    drawAxes(context, currentFrame, horizontalScale, verticalScale, gridColor, mutedColor);
-
-    context.save();
-    context.beginPath();
-    context.rect(padding.left, padding.top, plotWidth, plotHeight);
-    context.clip();
-
-    for (const candidate of candidates) {
-      const emphasized = highlighted === null || highlighted === candidate.runId;
-      if (display === "band") {
-        drawBand(
-          context,
-          candidate.buckets,
-          candidate.x,
-          candidate.minimum,
-          candidate.maximum,
-          currentFrame,
-          horizontalScale,
-          verticalScale,
-          candidate.color,
-          emphasized ? 0.13 : 0.025,
-        );
-      }
-      drawLine(
-        context,
-        candidate.buckets,
-        candidate.x,
-        candidate.smoothed,
-        currentFrame,
-        horizontalScale,
-        verticalScale,
-        candidate.color,
-        candidate.pattern,
-        emphasized ? 1 : 0.16,
-        emphasized ? 1.7 : 1.2,
-      );
-    }
-
-    context.globalAlpha = 1;
-    context.restore();
-  }
-
   function drawInteraction(
     target: HTMLCanvasElement,
     activeFrame: Frame,
@@ -421,13 +326,7 @@
     activeDrag: Drag | null,
   ): void {
     const { width, height, padding } = activeFrame;
-    const requestedRatio = Math.min(window.devicePixelRatio || 1, CANVAS_DPR_LIMIT);
-    const pixelBudgetRatio = Math.sqrt(CANVAS_PIXEL_BUDGET / (width * height));
-    const dimensionRatio = Math.min(
-      CANVAS_DIMENSION_LIMIT / width,
-      CANVAS_DIMENSION_LIMIT / height,
-    );
-    const ratio = Math.max(0.01, Math.min(requestedRatio, pixelBudgetRatio, dimensionRatio));
+    const ratio = boundedCanvasPixelRatio(width, height);
     const pixelWidth = Math.floor(width * ratio);
     const pixelHeight = Math.floor(height * ratio);
     if (target.width !== pixelWidth) target.width = pixelWidth;
@@ -438,7 +337,6 @@
     context.clearRect(0, 0, target.width, target.height);
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
     const styles = getComputedStyle(target);
-    const mutedColor = styles.getPropertyValue("--muted").trim() || "#596168";
     const accentColor = styles.getPropertyValue("--accent").trim() || "#2766ad";
     const plotWidth = Math.max(width - padding.left - padding.right, 1);
     const plotHeight = Math.max(height - padding.top - padding.bottom, 1);
@@ -468,9 +366,10 @@
       (horizontalScale !== "log" || activeHoverX > 0)
     ) {
       const x = toScreenX(activeHoverX, activeFrame, horizontalScale);
-      context.globalAlpha = 1;
-      context.strokeStyle = mutedColor;
-      context.setLineDash([3, 3]);
+      context.globalAlpha = 0.72;
+      context.strokeStyle = accentColor;
+      context.lineWidth = 1.25;
+      context.setLineDash([4, 3]);
       context.beginPath();
       context.moveTo(x, padding.top);
       context.lineTo(x, height - padding.bottom);
@@ -479,147 +378,6 @@
     }
     context.globalAlpha = 1;
     context.restore();
-  }
-
-  function drawAxes(
-    context: CanvasRenderingContext2D,
-    activeFrame: Frame,
-    horizontalScale: ScaleMode,
-    verticalScale: ScaleMode,
-    gridColor: string,
-    mutedColor: string,
-  ): void {
-    const { width, height, padding } = activeFrame;
-    const plotWidth = Math.max(width - padding.left - padding.right, 1);
-    context.font = "10px system-ui, sans-serif";
-    context.lineWidth = 1;
-    context.strokeStyle = gridColor;
-    context.fillStyle = mutedColor;
-    const yTicks = axisTicks(activeFrame.y.minimum, activeFrame.y.maximum, 5, verticalScale);
-    for (const tick of yTicks) {
-      const y = toScreenY(tick, activeFrame, verticalScale);
-      context.beginPath();
-      context.moveTo(padding.left, y);
-      context.lineTo(width - padding.right, y);
-      context.stroke();
-      const label = formatAxis(tick);
-      context.fillText(label, padding.left - context.measureText(label).width - 8, y + 3);
-    }
-
-    const tickCount = Math.max(4, Math.min(10, Math.floor(plotWidth / 100)));
-    const xTicks = axisTicks(
-      activeFrame.x.minimum,
-      activeFrame.x.maximum,
-      tickCount,
-      horizontalScale,
-    );
-    for (const [index, tick] of xTicks.entries()) {
-      const x = toScreenX(tick, activeFrame, horizontalScale);
-      context.beginPath();
-      context.moveTo(x, padding.top);
-      context.lineTo(x, height - padding.bottom);
-      context.stroke();
-      const label = formatHorizontalAxis(tick);
-      const measured = context.measureText(label).width;
-      const labelX =
-        index === 0
-          ? Math.max(x, padding.left)
-          : index === xTicks.length - 1
-            ? Math.min(x - measured, width - padding.right - measured)
-            : x - measured / 2;
-      context.fillText(label, labelX, height - 9);
-    }
-  }
-
-  function drawBand(
-    context: CanvasRenderingContext2D,
-    buckets: number[],
-    xValues: number[],
-    lower: Array<number | null>,
-    upper: Array<number | null>,
-    activeFrame: Frame,
-    horizontalScale: ScaleMode,
-    verticalScale: ScaleMode,
-    color: string,
-    opacity: number,
-  ): void {
-    context.fillStyle = color;
-    context.globalAlpha = opacity;
-    const valid = xValues.map(
-      (x, index) =>
-        validPoint(x, lower[index], horizontalScale, verticalScale) &&
-        validPoint(x, upper[index], horizontalScale, verticalScale),
-    );
-    for (const { start, end } of contiguousBucketRanges(buckets, valid)) {
-      context.beginPath();
-      for (let point = start; point < end; point += 1) {
-        const x = toScreenX(xValues[point], activeFrame, horizontalScale);
-        const y = toScreenY(upper[point] as number, activeFrame, verticalScale);
-        if (point === start) context.moveTo(x, y);
-        else context.lineTo(x, y);
-      }
-      for (let point = end - 1; point >= start; point -= 1) {
-        context.lineTo(
-          toScreenX(xValues[point], activeFrame, horizontalScale),
-          toScreenY(lower[point] as number, activeFrame, verticalScale),
-        );
-      }
-      context.closePath();
-      context.fill();
-    }
-    context.globalAlpha = 1;
-  }
-
-  function drawLine(
-    context: CanvasRenderingContext2D,
-    buckets: number[],
-    xValues: number[],
-    values: Array<number | null>,
-    activeFrame: Frame,
-    horizontalScale: ScaleMode,
-    verticalScale: ScaleMode,
-    color: string,
-    pattern: SeriesPattern,
-    opacity: number,
-    width: number,
-  ): void {
-    context.strokeStyle = color;
-    context.lineWidth = width;
-    context.lineJoin = "round";
-    context.globalAlpha = opacity;
-    context.setLineDash(lineDash(pattern));
-    context.beginPath();
-    const valid = xValues.map((x, index) =>
-      validPoint(x, values[index], horizontalScale, verticalScale),
-    );
-    for (const { start, end } of contiguousBucketRanges(buckets, valid)) {
-      for (let index = start; index < end; index += 1) {
-        const x = toScreenX(xValues[index], activeFrame, horizontalScale);
-        const y = toScreenY(values[index] as number, activeFrame, verticalScale);
-        if (index === start) context.moveTo(x, y);
-        else context.lineTo(x, y);
-      }
-    }
-    context.stroke();
-    context.setLineDash([]);
-    context.globalAlpha = 1;
-  }
-
-  function validPoint(
-    x: number | undefined,
-    y: number | null | undefined,
-    horizontalScale: ScaleMode,
-    verticalScale: ScaleMode,
-  ): boolean {
-    return (
-      x !== undefined &&
-      Number.isFinite(x) &&
-      y !== null &&
-      y !== undefined &&
-      Number.isFinite(y) &&
-      (horizontalScale !== "log" || x > 0) &&
-      (verticalScale !== "log" || y > 0)
-    );
   }
 
   function topLayerTooltip(node: HTMLElement): { destroy: () => void } {
@@ -650,7 +408,7 @@
       const viewportHeight = document.documentElement.clientHeight;
       const margin = 8;
       const gap = 12;
-      const width = Math.max(240, Math.min(420, viewportWidth - margin * 2));
+      const width = Math.max(220, Math.min(320, viewportWidth - margin * 2));
       const maximumHeight = Math.max(120, viewportHeight - margin * 2);
       target.style.width = `${width}px`;
       target.style.maxHeight = `${maximumHeight}px`;
@@ -695,7 +453,7 @@
     cancelTooltipHide();
     tooltipHideTimer = window.setTimeout(() => {
       tooltipHideTimer = null;
-      if (tooltipHovered || tooltip?.contains(document.activeElement)) return;
+      if (tooltipFocused || tooltip?.contains(document.activeElement)) return;
       clearTooltip();
     }, 140);
   }
@@ -708,13 +466,13 @@
     overlayRevision += 1;
   }
 
-  function tooltipEnter(): void {
-    tooltipHovered = true;
+  function tooltipFocusIn(): void {
+    tooltipFocused = true;
     cancelTooltipHide();
   }
 
-  function tooltipLeave(): void {
-    tooltipHovered = false;
+  function tooltipFocusOut(): void {
+    tooltipFocused = false;
     scheduleTooltipHide();
   }
 
@@ -782,7 +540,7 @@
         y: distanceY >= 6 ? selectedViewport.y : completed.viewport.y,
       };
     }
-    if (interactionMode === "pan" || viewport !== null) scheduleViewportRequest(viewport);
+    if (viewport !== null) scheduleViewportRequest(viewport);
     overlayRevision += 1;
   }
 
@@ -802,39 +560,74 @@
     const yMaximum = transformed(drag.viewport.y.maximum, yScale);
     const xShift = (-(point.x - drag.start.x) / plotWidth) * (xMaximum - xMinimum);
     const yShift = ((point.y - drag.start.y) / plotHeight) * (yMaximum - yMinimum);
-    viewport = {
-      x: boundedDomain(xMinimum + xShift, xMaximum + xShift, xScale),
+    const shiftedX = boundedDomain(xMinimum + xShift, xMaximum + xShift, xScale);
+    const nextViewport = {
+      x: navigationX ? clampPannedDomainToBounds(shiftedX, navigationX, xScale) : shiftedX,
       y: boundedDomain(yMinimum + yShift, yMaximum + yShift, yScale),
     };
+    if (domainsEqual(nextViewport.x, frame.x) && domainsEqual(nextViewport.y, frame.y)) return;
+    viewport = nextViewport;
   }
 
   function wheel(event: WheelEvent): void {
-    if (!frame || !insidePlot(canvasPoint(event), frame)) return;
+    const point = canvasPoint(event);
+    if (!frame || !insidePlot(point, frame)) return;
     event.preventDefault();
-    zoomAt(canvasPoint(event), Math.exp(Math.max(-1, Math.min(1, event.deltaY / 240))));
+    const exponent = Math.max(-1, Math.min(1, event.deltaY / 240));
+    pendingWheel = {
+      point,
+      exponent: (pendingWheel?.exponent ?? 0) + exponent,
+    };
+    if (wheelFrame !== null) return;
+    wheelFrame = window.requestAnimationFrame(() => {
+      wheelFrame = null;
+      const pending = pendingWheel;
+      pendingWheel = null;
+      if (pending) zoomAt(pending.point, Math.exp(pending.exponent));
+    });
   }
 
   function zoomAt(point: Point, factor: number): void {
     if (!frame) return;
-    const anchorX = transformed(fromScreenX(point.x, frame, xScale), xScale);
-    const anchorY = transformed(fromScreenY(point.y, frame, yScale), yScale);
-    const xMinimum = transformed(frame.x.minimum, xScale);
-    const xMaximum = transformed(frame.x.maximum, xScale);
-    const yMinimum = transformed(frame.y.minimum, yScale);
-    const yMaximum = transformed(frame.y.maximum, yScale);
-    const boundedFactor = Math.max(0.05, Math.min(20, factor));
-    viewport = {
-      x: boundedDomain(
-        anchorX + (xMinimum - anchorX) * boundedFactor,
-        anchorX + (xMaximum - anchorX) * boundedFactor,
-        xScale,
-      ),
-      y: boundedDomain(
-        anchorY + (yMinimum - anchorY) * boundedFactor,
-        anchorY + (yMaximum - anchorY) * boundedFactor,
+    let nextViewport = zoomHorizontalViewport(frame, point.x, xScale, factor);
+    if (
+      factor < 1 &&
+      !hasDrawableSeriesInRange(
+        renderableSeries,
+        nextViewport.x.minimum,
+        nextViewport.x.maximum,
         yScale,
-      ),
-    };
+      )
+    ) {
+      let invalidFactor = factor;
+      let validFactor = 1;
+      nextViewport = { x: frame.x, y: frame.y };
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const candidateFactor = (invalidFactor + validFactor) / 2;
+        const candidate = zoomHorizontalViewport(frame, point.x, xScale, candidateFactor);
+        if (
+          hasDrawableSeriesInRange(
+            renderableSeries,
+            candidate.x.minimum,
+            candidate.x.maximum,
+            yScale,
+          )
+        ) {
+          nextViewport = candidate;
+          validFactor = candidateFactor;
+        } else {
+          invalidFactor = candidateFactor;
+        }
+      }
+    }
+    if (factor > 1 && navigationX) {
+      nextViewport = {
+        x: clampDomainToBounds(nextViewport.x, navigationX),
+        y: nextViewport.y,
+      };
+    }
+    if (domainsEqual(nextViewport.x, frame.x)) return;
+    viewport = nextViewport;
     scheduleViewportRequest(viewport);
     overlayRevision += 1;
   }
@@ -905,8 +698,9 @@
   }
 
   function resetTransientState(): void {
+    clearPendingWheel();
     clearTooltipTimers();
-    tooltipHovered = false;
+    tooltipFocused = false;
     tooltipPositioned = false;
     viewport = null;
     drag = null;
@@ -954,11 +748,31 @@
     overlayRevision += 1;
   }
 
+  function synchronizeNavigationDomain(
+    key: string,
+    parent: MetricChartViewport | null,
+    configured: Viewport | null,
+    loading: boolean,
+  ): void {
+    if (key !== navigationDomainKey) {
+      navigationDomainKey = key;
+      navigationX = null;
+    }
+    if (parent !== null || configured === null || loading) return;
+    navigationX = navigationX
+      ? {
+          minimum: Math.min(navigationX.minimum, configured.x.minimum),
+          maximum: Math.max(navigationX.maximum, configured.x.maximum),
+        }
+      : { ...configured.x };
+  }
+
   function domainsEqual(left: Domain, right: Domain): boolean {
     return left.minimum === right.minimum && left.maximum === right.maximum;
   }
 
   function resetPointerState(): void {
+    clearPendingWheel();
     drag = null;
     hoverX = null;
     hoverPosition = null;
@@ -975,6 +789,13 @@
     if (viewportRequestTimer === null) return;
     window.clearTimeout(viewportRequestTimer);
     viewportRequestTimer = null;
+  }
+
+  function clearPendingWheel(): void {
+    pendingWheel = null;
+    if (wheelFrame === null) return;
+    window.cancelAnimationFrame(wheelFrame);
+    wheelFrame = null;
   }
 
   function scheduleViewportRequest(next: Viewport | null, immediate = false): void {
@@ -1017,21 +838,17 @@
     overlayRevision += 1;
   }
 
-  function toggleExpanded(): void {
-    const nextExpanded = !expanded;
+  function setExpanded(nextExpanded: boolean): void {
+    if (nextExpanded === expanded) return;
     settingsOpen = false;
     if (nextExpanded) {
       restoreFocusElement =
         document.activeElement instanceof HTMLElement ? document.activeElement : null;
     }
     expanded = nextExpanded;
-    setModalBodyLock(expanded);
-    setSurroundingContentInert(expanded);
     window.requestAnimationFrame(() => {
       redrawAll();
-      if (expanded) {
-        expandButton?.focus();
-      } else {
+      if (!expanded) {
         const target = restoreFocusElement;
         restoreFocusElement = null;
         if (target?.isConnected) target.focus();
@@ -1039,108 +856,13 @@
     });
   }
 
-  function cardKeydown(event: KeyboardEvent): void {
-    if (event.key === "Tab" && expanded) {
-      trapFocus(event);
-      return;
-    }
-    if (event.key !== "Escape" || !expanded) return;
-    toggleExpanded();
+  function toggleExpanded(): void {
+    setExpanded(!expanded);
+  }
+
+  function focusExpandButton(event: Event): void {
     event.preventDefault();
-    event.stopPropagation();
-  }
-
-  function updateLayerListeners(enlarged: boolean): void {
-    const trapActive = mounted && enlarged;
-    if (trapActive !== focusTrapActive) {
-      focusTrapActive = trapActive;
-      if (trapActive) {
-        window.addEventListener("keydown", cardKeydown);
-        document.addEventListener("focusin", documentFocusIn);
-      } else {
-        window.removeEventListener("keydown", cardKeydown);
-        document.removeEventListener("focusin", documentFocusIn);
-      }
-    }
-  }
-
-  function trapFocus(event: KeyboardEvent): void {
-    const focusable = focusableElements();
-    if (focusable.length === 0) {
-      event.preventDefault();
-      expandButton?.focus();
-      return;
-    }
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    const active = document.activeElement;
-    if (!chartLayerContains(active) || active === card) {
-      event.preventDefault();
-      (event.shiftKey ? last : first).focus();
-    } else if (event.shiftKey && active === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && active === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }
-
-  function documentFocusIn(event: FocusEvent): void {
-    if (!expanded || chartLayerContains(event.target)) return;
-    (focusableElements()[0] ?? expandButton)?.focus();
-  }
-
-  function focusableElements(): HTMLElement[] {
-    const cardElements = Array.from(
-      card.querySelectorAll<HTMLElement>(
-        'button:not([disabled]):not([tabindex="-1"]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])',
-      ),
-    );
-    const tooltipElements = tooltip
-      ? Array.from(
-          tooltip.querySelectorAll<HTMLElement>(
-            'button:not([disabled]):not([tabindex="-1"]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-          ),
-        )
-      : [];
-    return [...cardElements, ...tooltipElements].filter(
-      (element) => element.getClientRects().length > 0,
-    );
-  }
-
-  function chartLayerContains(target: EventTarget | null): boolean {
-    return target instanceof Node && (card.contains(target) || Boolean(tooltip?.contains(target)));
-  }
-
-  function setModalBodyLock(locked: boolean): void {
-    if (locked === ownsModalBodyLock) return;
-    ownsModalBodyLock = locked;
-    if (locked) acquireModalBodyLock();
-    else releaseModalBodyLock();
-  }
-
-  function setSurroundingContentInert(inert: boolean): void {
-    for (const { element, wasInert } of inertedElements) element.inert = wasInert;
-    inertedElements = [];
-    if (!inert) return;
-
-    let branch: HTMLElement = card;
-    while (branch.parentElement && branch.parentElement !== document.body) {
-      const parent = branch.parentElement;
-      for (const sibling of parent.children) {
-        if (
-          sibling === branch ||
-          !(sibling instanceof HTMLElement) ||
-          sibling.classList.contains("chart-modal-backdrop")
-        ) {
-          continue;
-        }
-        inertedElements.push({ element: sibling, wasInert: sibling.inert });
-        sibling.inert = true;
-      }
-      branch = parent;
-    }
+    expandButton?.focus();
   }
 
   function alignmentLabel(alignment: XAlignment): string {
@@ -1169,215 +891,228 @@
   }
 </script>
 
-{#if expanded}
-  <button
-    class="chart-modal-backdrop"
-    type="button"
-    aria-hidden="true"
-    tabindex="-1"
-    onclick={toggleExpanded}
-  ></button>
-{/if}
-<article
-  bind:this={card}
-  class="metric-chart-card comparison-chart"
-  class:expanded
-  class:tooltip-open={hoverPoints.length > 0 && hoverPosition !== null}
-  role={expanded ? "dialog" : undefined}
-  aria-modal={expanded ? "true" : undefined}
-  aria-keyshortcuts={expanded ? "Escape" : undefined}
-  aria-label={`${title ?? metric} metric comparison panel`}
->
-  <div class="chart-heading">
-    <div class="chart-title">
-      <strong>{title ?? metric}</strong>
-      <small>{availableRunCount} {availableRunCount === 1 ? "run" : "runs"}</small>
-      {#if anyLoading}<span class="loading-label">updating</span>{/if}
-    </div>
-    <div class="chart-actions" role="toolbar" aria-label="Chart mouse actions">
-      <button
-        type="button"
-        class:active={interactionMode === "pan"}
-        aria-label="Pan chart"
-        aria-pressed={interactionMode === "pan"}
-        onclick={() => setInteraction("pan")}><Icon name="hand" size={14} /></button
+<Dialog.Root open={expanded} onOpenChange={setExpanded}>
+  {#if expanded}
+    <Dialog.Portal>
+      <Dialog.Overlay class="chart-modal-backdrop" />
+    </Dialog.Portal>
+  {/if}
+  <Dialog.Content
+    forceMount
+    onOpenAutoFocus={focusExpandButton}
+    onCloseAutoFocus={(event) => event.preventDefault()}
+  >
+    {#snippet child({ props, open })}
+      <article
+        {...open ? props : {}}
+        bind:this={card}
+        class="metric-chart-card comparison-chart"
+        class:expanded
+        class:tooltip-open={hoverPoints.length > 0 && hoverPosition !== null}
+        aria-keyshortcuts={expanded ? "Escape" : undefined}
+        aria-label={`${title ?? metric} metric comparison panel`}
       >
-      <button
-        type="button"
-        class:active={interactionMode === "select"}
-        aria-label="Zoom to selected region"
-        aria-pressed={interactionMode === "select"}
-        onclick={() => setInteraction("select")}><Icon name="select" size={14} /></button
-      >
-      <button type="button" aria-label="Reset chart view" onclick={resetView}
-        ><Icon name="reset" size={14} /></button
-      >
-      <button
-        bind:this={expandButton}
-        type="button"
-        aria-label={expanded ? "Collapse chart" : "Enlarge chart"}
-        onclick={toggleExpanded}><Icon name={expanded ? "minimize" : "expand"} size={14} /></button
-      >
-      <MetricChartSettings
-        bind:open={settingsOpen}
-        bind:displayMode
-        bind:smoothingMode
-        bind:smoothingAmount
-        {xAlignment}
-        bind:xScale
-        bind:yScale
-        bind:xMinimum
-        bind:xMaximum
-        bind:yMinimum
-        bind:yMaximum
-        {axisWarning}
-        onviewchange={resetView}
-      />
-    </div>
-  </div>
-
-  {#if legendSeries.length > 0}
-    <div class="chart-legend" role="list" aria-label="Compared runs">
-      {#each legendSeries as item (item.runId)}
-        {@const status = statusLabel(item)}
-        <div
-          class="legend-entry"
-          class:hidden={hiddenRunIds.has(item.runId)}
-          class:highlighted={activeHighlightedRunId === item.runId}
-          role="listitem"
-          onmouseenter={() => highlightRun(item.runId)}
-          onmouseleave={() => highlightRun(null)}
-          onfocusin={() => highlightRun(item.runId)}
-          onfocusout={(event) => {
-            if (
-              !(event.relatedTarget instanceof Node) ||
-              !event.currentTarget.contains(event.relatedTarget)
-            ) {
-              highlightRun(null);
-            }
-          }}
-        >
-          <button
-            class="legend-toggle"
-            type="button"
-            aria-label={`${hiddenRunIds.has(item.runId) ? "Show" : "Hide"} ${item.runName} (${item.runId.slice(0, 8)})`}
-            aria-pressed={!hiddenRunIds.has(item.runId)}
-            onclick={() => toggleRun(item.runId)}
-          >
-            <span
-              class={`series-swatch pattern-${item.pattern}`}
-              style={`--series-color: ${item.color}`}
-              aria-hidden="true"
-            ></span>
-            <span class="legend-name" title={item.runName}>{item.runName}</span>
-            {#if status}<small class:no-data={item.status === "no-data"}>{status}</small>{/if}
-          </button>
+        <div class="chart-heading">
+          <div class="chart-title">
+            <Dialog.Title level={3}>
+              {#snippet child({ props: titleProps })}
+                <strong {...titleProps}>{title ?? metric}</strong>
+              {/snippet}
+            </Dialog.Title>
+            <small>{availableRunCount} {availableRunCount === 1 ? "run" : "runs"}</small>
+            {#if anyLoading}<span class="loading-label">updating</span>{/if}
+          </div>
+          <div class="chart-actions" role="toolbar" aria-label="Chart mouse actions">
+            <button
+              type="button"
+              class:active={interactionMode === "pan"}
+              aria-label="Pan chart"
+              aria-pressed={interactionMode === "pan"}
+              onclick={() => setInteraction("pan")}><Icon name="hand" size={14} /></button
+            >
+            <button
+              type="button"
+              class:active={interactionMode === "select"}
+              aria-label="Zoom to selected region"
+              aria-pressed={interactionMode === "select"}
+              onclick={() => setInteraction("select")}><Icon name="select" size={14} /></button
+            >
+            <button type="button" aria-label="Reset chart view" onclick={resetView}
+              ><Icon name="reset" size={14} /></button
+            >
+            <button
+              bind:this={expandButton}
+              type="button"
+              aria-label={expanded ? "Collapse chart" : "Enlarge chart"}
+              onclick={toggleExpanded}
+              ><Icon name={expanded ? "minimize" : "expand"} size={14} /></button
+            >
+            <MetricChartSettings
+              bind:open={settingsOpen}
+              bind:displayMode
+              bind:smoothingMode
+              bind:smoothingAmount
+              {xAlignment}
+              bind:xScale
+              bind:yScale
+              bind:xMinimum
+              bind:xMaximum
+              bind:yMinimum
+              bind:yMaximum
+              {axisWarning}
+              onviewchange={resetView}
+            />
+          </div>
         </div>
-      {/each}
-      {#if legendSeries.some((item) => hiddenRunIds.has(item.runId))}
-        <button class="legend-show-all" type="button" onclick={showAllRuns}>show all</button>
-      {/if}
-    </div>
-  {/if}
 
-  {#if loadError}
-    <div class="chart-load-error" role="alert">
-      <span>{loadError}</span>
-      <button type="button" onclick={() => onretry(metric)}>Retry</button>
-    </div>
-  {/if}
-
-  {#if renderableSeries.length > 0}
-    <div class={`chart-canvas-wrap chart-mode-${interactionMode}`}>
-      <canvas bind:this={plotCanvas} class="chart-plot-canvas" aria-hidden="true"></canvas>
-      <canvas
-        bind:this={canvas}
-        class="chart-interaction-canvas"
-        tabindex="0"
-        aria-label={`${metric} comparison history chart. Use left and right arrows to inspect points, plus and minus to zoom, and zero to reset.`}
-        onpointerdown={pointerDown}
-        onpointermove={pointerMove}
-        onpointerup={pointerUp}
-        onpointercancel={pointerCancel}
-        onpointerleave={pointerLeave}
-        onwheel={wheel}
-        onkeydown={chartKeydown}
-      ></canvas>
-      <span class="visually-hidden" aria-live="polite">
-        {#if hoverPoints.length > 0}
-          {metric}, {hoverPoints.length} runs near x {formatHorizontalAxis(hoverX ?? 0)}.
-          {#each hoverPoints as point}
-            {point.series.runName}, value {formatAxis(point.smoothed)}, step
-            {formatAxis(point.step)}.
-          {/each}
+        {#if legendSeries.length > 0}
+          <div class="chart-legend" role="list" aria-label="Compared runs">
+            {#each legendSeries as item (item.runId)}
+              {@const status = statusLabel(item)}
+              <div
+                class="legend-entry"
+                class:hidden={hiddenRunIds.has(item.runId)}
+                class:highlighted={activeHighlightedRunId === item.runId}
+                role="listitem"
+                onmouseenter={() => highlightRun(item.runId)}
+                onmouseleave={() => highlightRun(null)}
+                onfocusin={() => highlightRun(item.runId)}
+                onfocusout={(event) => {
+                  if (
+                    !(event.relatedTarget instanceof Node) ||
+                    !event.currentTarget.contains(event.relatedTarget)
+                  ) {
+                    highlightRun(null);
+                  }
+                }}
+              >
+                <button
+                  class="legend-toggle"
+                  type="button"
+                  aria-label={`${hiddenRunIds.has(item.runId) ? "Show" : "Hide"} ${item.runName} (${item.runId.slice(0, 8)})`}
+                  aria-pressed={!hiddenRunIds.has(item.runId)}
+                  onclick={() => toggleRun(item.runId)}
+                >
+                  <span
+                    class={`series-swatch pattern-${item.pattern}`}
+                    style={`--series-color: ${item.color}`}
+                    aria-hidden="true"
+                  ></span>
+                  <span class="legend-name" title={item.runName}>{item.runName}</span>
+                  {#if status}<small class:no-data={item.status === "no-data"}>{status}</small>{/if}
+                </button>
+              </div>
+            {/each}
+            {#if legendSeries.some((item) => hiddenRunIds.has(item.runId))}
+              <button class="legend-show-all" type="button" onclick={showAllRuns}>show all</button>
+            {/if}
+          </div>
         {/if}
-      </span>
-      {#if hoverPoints.length > 0 && hoverPosition}
-        <div
-          bind:this={tooltip}
-          use:topLayerTooltip
-          class="chart-tooltip comparison-tooltip"
-          class:positioned={tooltipPositioned}
-          popover="manual"
-          role="tooltip"
-          onpointerenter={tooltipEnter}
-          onpointerleave={tooltipLeave}
-          onfocusin={tooltipEnter}
-          onfocusout={tooltipLeave}
-        >
-          <div class="tooltip-heading">
-            <strong>{metric}</strong>
-            <span>{alignmentLabel(xAlignment)} {formatHorizontalAxis(hoverX ?? 0)}</span>
+
+        {#if loadError}
+          <div class="chart-load-error" role="alert">
+            <span>{loadError}</span>
+            <button type="button" onclick={() => onretry(metric)}>Retry</button>
           </div>
-          <!-- svelte-ignore a11y_no_noninteractive_tabindex (scrollable comparison data needs keyboard focus) -->
-          <div class="tooltip-table-wrap" role="region" tabindex="0" aria-label="Comparison values">
-            <table>
-              <caption class="visually-hidden">
-                Nearest value and source step for each visible run
-              </caption>
-              <thead>
-                <tr>
-                  <th scope="col">Run</th>
-                  <th scope="col">Value</th>
-                  <th scope="col">Step</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each hoverPoints as point (point.series.runId)}
-                  <tr
-                    class:deemphasized={activeHighlightedRunId &&
-                      activeHighlightedRunId !== point.series.runId}
-                  >
-                    <th scope="row" title={point.series.runName}>
-                      <span class="tooltip-series">
-                        <span
-                          class={`series-swatch pattern-${point.series.pattern}`}
-                          style={`--series-color: ${point.series.color}`}
-                          aria-hidden="true"
-                        ></span>
-                        <span class="tooltip-run-name">{point.series.runName}</span>
-                      </span>
-                    </th>
-                    <td>{formatAxis(point.smoothed)}</td>
-                    <td>{formatAxis(point.step)}</td>
-                  </tr>
+        {/if}
+
+        {#if renderableSeries.length > 0}
+          <div class={`chart-canvas-wrap chart-mode-${interactionMode}`}>
+            <div bind:this={plotTarget} class="chart-uplot" aria-hidden="true"></div>
+            <canvas
+              bind:this={canvas}
+              class="chart-interaction-canvas"
+              tabindex="0"
+              aria-label={`${metric} comparison history chart. Use left and right arrows to inspect points, plus and minus to zoom, and zero to reset.`}
+              onpointerdown={pointerDown}
+              onpointermove={pointerMove}
+              onpointerup={pointerUp}
+              onpointercancel={pointerCancel}
+              onpointerleave={pointerLeave}
+              onwheel={wheel}
+              onkeydown={chartKeydown}
+            ></canvas>
+            <span class="visually-hidden" aria-live="polite">
+              {#if hoverPoints.length > 0}
+                {metric}, {hoverPoints.length} runs near x {formatHorizontalAxis(hoverX ?? 0)}.
+                {#each hoverPoints as point}
+                  {point.series.runName}, value {formatAxis(point.smoothed)}, step
+                  {formatAxis(point.step)}.
                 {/each}
-              </tbody>
-            </table>
+              {/if}
+            </span>
+            {#if hoverPoints.length > 0 && hoverPosition}
+              <div
+                bind:this={tooltip}
+                use:topLayerTooltip
+                class="chart-tooltip comparison-tooltip"
+                class:positioned={tooltipPositioned}
+                popover="manual"
+                role="tooltip"
+                onfocusin={tooltipFocusIn}
+                onfocusout={tooltipFocusOut}
+              >
+                <div class="tooltip-heading">
+                  <strong>{metric}</strong>
+                  <span>{alignmentLabel(xAlignment)} {formatHorizontalAxis(hoverX ?? 0)}</span>
+                </div>
+                <!-- svelte-ignore a11y_no_noninteractive_tabindex (scrollable comparison data needs keyboard focus) -->
+                <div
+                  class="tooltip-table-wrap"
+                  role="region"
+                  tabindex="0"
+                  aria-label="Comparison values"
+                >
+                  <table>
+                    <caption class="visually-hidden">
+                      Nearest value and source step for each visible run
+                    </caption>
+                    <thead>
+                      <tr>
+                        <th scope="col">Run</th>
+                        <th scope="col">Value</th>
+                        <th scope="col">Step</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {#each hoverPoints as point (point.series.runId)}
+                        <tr
+                          class:deemphasized={activeHighlightedRunId &&
+                            activeHighlightedRunId !== point.series.runId}
+                        >
+                          <th scope="row" title={point.series.runName}>
+                            <span class="tooltip-series">
+                              <span
+                                class={`series-swatch pattern-${point.series.pattern}`}
+                                style={`--series-color: ${point.series.color}`}
+                                aria-hidden="true"
+                              ></span>
+                              <span class="tooltip-run-name">{point.series.runName}</span>
+                            </span>
+                          </th>
+                          <td>{formatAxis(point.smoothed)}</td>
+                          <td>{formatAxis(point.step)}</td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            {/if}
           </div>
-        </div>
-      {/if}
-    </div>
-  {:else if loadError}
-    <div class="chart-placeholder">History could not be loaded.</div>
-  {:else if series.length === 0}
-    <div class="chart-placeholder">Select at least one run to compare.</div>
-  {:else if anyPending}
-    <div class="chart-placeholder">Loading bounded histories…</div>
-  {:else}
-    <div class="chart-placeholder">This metric has no data in the visible runs.</div>
-  {/if}
-</article>
+        {:else if loadError}
+          <div class="chart-placeholder">History could not be loaded.</div>
+        {:else if series.length === 0}
+          <div class="chart-placeholder">Select at least one run to compare.</div>
+        {:else if anyPending}
+          <div class="chart-placeholder">Loading bounded histories…</div>
+        {:else}
+          <div class="chart-placeholder">This metric has no data in the visible runs.</div>
+        {/if}
+      </article>
+    {/snippet}
+  </Dialog.Content>
+</Dialog.Root>
 
 <style>
   .comparison-chart {
@@ -1403,12 +1138,45 @@
     font-weight: 500;
   }
 
+  .chart-actions {
+    z-index: 1;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-2px);
+    transition:
+      opacity 120ms ease,
+      transform 120ms ease;
+  }
+
+  .comparison-chart:hover .chart-actions,
+  .comparison-chart:focus-within .chart-actions,
+  .comparison-chart.expanded .chart-actions,
+  .comparison-chart:has(:global(.chart-settings[open])) .chart-actions {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+
+  @media (hover: none), (pointer: coarse) {
+    .chart-actions {
+      opacity: 1;
+      pointer-events: auto;
+      transform: none;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chart-actions {
+      transition: none;
+    }
+  }
+
   .chart-legend {
-    min-height: 35px;
+    min-height: 32px;
     display: flex;
     gap: 4px;
     align-items: center;
-    padding: 4px 0 7px;
+    padding: 2px 0 8px;
     overflow-x: auto;
     scrollbar-width: thin;
   }
@@ -1418,13 +1186,12 @@
     display: flex;
     flex: 0 1 250px;
     align-items: stretch;
-    border: 1px solid transparent;
-    background: var(--control-bg);
+    background: transparent;
   }
 
   .legend-entry:hover,
   .legend-entry.highlighted {
-    border-color: var(--line);
+    background: var(--button-hover);
   }
 
   .legend-entry.hidden {
@@ -1452,7 +1219,6 @@
 
   .legend-toggle:hover,
   .legend-show-all:hover {
-    background: var(--button-hover);
     color: var(--text);
   }
 
@@ -1514,6 +1280,17 @@
     flex: 1;
   }
 
+  .chart-uplot {
+    width: 100%;
+    height: 260px;
+    overflow: hidden;
+    background: transparent;
+  }
+
+  .expanded .chart-uplot {
+    height: 100%;
+  }
+
   .chart-interaction-canvas {
     position: absolute;
     inset: 0;
@@ -1524,14 +1301,14 @@
     position: fixed;
     z-index: 1100;
     inset: auto;
-    width: min(420px, calc(100vw - 16px));
+    width: min(320px, calc(100vw - 16px));
     max-width: calc(100vw - 16px);
     max-height: calc(100dvh - 16px);
     display: block;
     overflow: hidden;
     padding: 0;
     margin: 0;
-    pointer-events: auto;
+    pointer-events: none;
     transform: none;
     visibility: hidden;
   }
@@ -1607,12 +1384,12 @@
 
   .comparison-tooltip th:nth-child(2),
   .comparison-tooltip td:nth-child(2) {
-    width: 96px;
+    width: 76px;
   }
 
   .comparison-tooltip th:nth-child(3),
   .comparison-tooltip td:nth-child(3) {
-    width: 80px;
+    width: 64px;
   }
 
   .tooltip-series {

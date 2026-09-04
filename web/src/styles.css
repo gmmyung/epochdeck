@@ -18,6 +18,7 @@
   --button-hover: #dfe3e6;
   --line: #aeb5bb;
   --line-strong: #6f7880;
+  --divider: #d5d9dc;
   --muted: #596168;
   --faint: #626a71;
   --label: #3e454b;
@@ -47,6 +48,7 @@
     --button-hover: #272c31;
     --line: #3a4046;
     --line-strong: #6b747c;
+    --divider: #2b3035;
     --muted: #a5abb1;
     --faint: #a5abb1;
     --label: #c1c6ca;
@@ -95,10 +97,6 @@ body,
   color: var(--text);
 }
 
-body.chart-modal-open {
-  overflow: hidden;
-}
-
 button,
 select,
 input {
@@ -135,15 +133,6 @@ input:focus-visible {
   }
 }
 
-header {
-  min-height: 54px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  border-bottom: 1px solid var(--line);
-}
-
 .content {
   min-width: 0;
   flex: 1;
@@ -158,7 +147,7 @@ header {
   line-height: 1;
 }
 
-.brand img {
+.brand .brand-logo {
   width: auto;
   max-width: min(220px, 42vw);
   height: 32px;
@@ -228,7 +217,7 @@ header {
   display: grid;
   grid-template-columns: var(--sidebar-width, 280px) 11px minmax(0, 1fr);
   gap: 0;
-  padding: 20px 0 48px;
+  padding: 0 0 48px;
 }
 
 .workspace.sidebar-collapsed {
@@ -242,7 +231,7 @@ article {
 
 aside {
   align-self: start;
-  padding: 4px clamp(14px, 1vw, 24px) 20px 0;
+  padding: 18px clamp(14px, 1vw, 24px) 20px 0;
 }
 
 .workspace.sidebar-collapsed aside {
@@ -264,7 +253,7 @@ aside {
   position: absolute;
   inset: 0 auto 0 5px;
   width: 1px;
-  background: var(--line);
+  background: var(--divider);
   content: "";
 }
 
@@ -395,6 +384,10 @@ aside label {
   background: color-mix(in srgb, var(--run-color) 9%, transparent);
 }
 
+.run-list-row:hover {
+  background: color-mix(in srgb, var(--run-color) 5%, var(--button-hover));
+}
+
 .run-list-row.primary {
   box-shadow: inset 3px 0 var(--run-color);
 }
@@ -413,7 +406,7 @@ aside label {
 
 .run-list-row .run-primary-button.active {
   box-shadow: none;
-  background: color-mix(in srgb, var(--run-color) 14%, transparent);
+  background: transparent;
   color: var(--text);
 }
 
@@ -724,6 +717,7 @@ aside .run-color-control {
 .run-view {
   min-width: 0;
   margin-left: clamp(14px, 1.5vw, 36px);
+  padding-top: 18px;
 }
 
 .workspace.sidebar-collapsed .run-view {
@@ -962,7 +956,7 @@ canvas {
   width: 100%;
   height: 260px;
   display: block;
-  background: var(--surface);
+  background: transparent;
 }
 
 .metrics-heading {
@@ -991,7 +985,7 @@ canvas {
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 480px), 1fr));
-  gap: 18px 14px;
+  gap: 22px 16px;
 }
 
 .rich-grid {
@@ -1288,7 +1282,7 @@ canvas {
 .metric-chart-card {
   min-height: 350px;
   padding: 0 0 10px;
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--divider);
   content-visibility: auto;
   contain: layout paint style;
   contain-intrinsic-size: auto 350px;
@@ -2022,7 +2016,7 @@ dd {
 
   .workspace {
     grid-template-columns: 1fr;
-    padding-top: 12px;
+    padding-top: 0;
   }
 
   .sidebar-resizer {
@@ -2030,13 +2024,14 @@ dd {
   }
 
   aside {
-    padding: 0 0 12px;
+    padding: 12px 0;
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }
 
   .run-view {
     margin-left: 0;
+    padding-top: 12px;
   }
 
   .run-list {

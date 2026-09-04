@@ -24,6 +24,7 @@
   export let highlightedRunId: string | null = null;
   export let selectedRunCount: number;
   export let catalog: MetricCatalogEntry[];
+  export let totalCount: number;
   export let catalogLoading: boolean;
   export let catalogError: string | null;
   export let search: string;
@@ -98,7 +99,10 @@
         oninput={(event) => onsearch(event.currentTarget.value)}
       />
     </label>
-    <span>{catalog.length.toLocaleString()} on this page</span>
+    <span>
+      {totalCount.toLocaleString()}
+      {search.trim() ? "matching " : ""}{totalCount === 1 ? "metric" : "metrics"}
+    </span>
   </div>
   <div class="comparison-controls">
     <div class="segmented-control" aria-label="Metric availability mode">
@@ -146,8 +150,13 @@
         >{cursorDepth === 0 && after ? "First" : "Previous"}</button
       >
       <span>
-        {catalog.length.toLocaleString()} loaded · up to {METRIC_CATALOG_PAGE_SIZE}
-        charts{backHistoryTruncated ? " · back history limited" : ""}
+        {(cursorDepth * METRIC_CATALOG_PAGE_SIZE + 1).toLocaleString()}–{Math.min(
+          cursorDepth * METRIC_CATALOG_PAGE_SIZE + catalog.length,
+          totalCount,
+        ).toLocaleString()} of {totalCount.toLocaleString()}
+        {totalCount === 1 ? "metric" : "metrics"}{backHistoryTruncated
+          ? " · back history limited"
+          : ""}
       </span>
       <button type="button" disabled={!nextAfter} onclick={() => oncursor("next")}>Next</button>
     </nav>

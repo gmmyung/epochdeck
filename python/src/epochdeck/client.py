@@ -697,7 +697,10 @@ class EpochDeckClient:
 
 def _normalize_server_url(server_url: str) -> str:
     normalized = server_url.rstrip("/")
-    if httpx.URL(normalized).userinfo:
+    parsed = httpx.URL(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.host:
+        raise ValueError("server_url must be an absolute HTTP or HTTPS URL")
+    if parsed.userinfo:
         raise ValueError(
             "server_url must not contain credentials; use EPOCHDECK_HTTP_USERNAME and "
             "EPOCHDECK_HTTP_PASSWORD"

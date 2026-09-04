@@ -96,16 +96,21 @@ pub(super) async fn query_project_metrics(
     validate_metric_catalog_text(request.after.as_deref(), "metric catalog cursor")?;
     let mut catalog_request = request.clone();
     catalog_request.limit = page_limit(request.limit);
-    let mut keys = state
+    let page = state
         .catalog
         .project_metric_catalog(&project, &catalog_request)
         .await?;
+    let mut keys = page.keys;
     let has_more = keys.len() > request.limit;
     keys.truncate(request.limit);
     let next_after = has_more
         .then(|| keys.last().map(|summary| summary.key.clone()))
         .flatten();
-    Ok(Json(ProjectMetricCatalogResponse { keys, next_after }))
+    Ok(Json(ProjectMetricCatalogResponse {
+        keys,
+        next_after,
+        total_count: page.total_count,
+    }))
 }
 
 pub(super) async fn list_runs(

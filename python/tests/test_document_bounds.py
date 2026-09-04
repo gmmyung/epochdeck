@@ -5,9 +5,9 @@ from collections.abc import Iterator, Mapping
 
 import pytest
 
-from epochdeck.run import create_run
+from epochdeck._run import create_run
 
-run_module = importlib.import_module("epochdeck.run")
+run_module = importlib.import_module("epochdeck._run")
 api_module = importlib.import_module("epochdeck.api")
 
 

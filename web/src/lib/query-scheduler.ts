@@ -1,4 +1,4 @@
-export type ScheduledQuery<T> = {
+type ScheduledQuery<T> = {
   identity: string;
   requestKey: string;
   schedulingPolicy?: "abort-active" | "coalesce-pending";
@@ -51,7 +51,7 @@ export class QueryScheduler {
   }
 
   cancelAll(): void {
-    for (const identity of [...this.pending.keys()]) this.discardPending(identity);
+    for (const identity of this.pending.keys()) this.discardPending(identity);
     for (const query of this.active.values()) query.controller.abort();
   }
 

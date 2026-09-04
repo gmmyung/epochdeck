@@ -244,12 +244,8 @@ def _document_paths(root: Path, explicit: str | None) -> list[Path]:
     if len(paths) > MAX_DOCUMENTS_PER_DEPENDENCY:
         raise NoticeError(f"{root} has too many candidate license documents")
     for path in paths:
-        try:
-            path.relative_to(resolved_root)
-        except ValueError as error:
-            raise NoticeError(
-                f"license document escapes package root: {path}"
-            ) from error
+        if not path.is_relative_to(resolved_root):
+            raise NoticeError(f"license document escapes package root: {path}")
     return sorted(paths, key=lambda path: path.name.encode("utf-8"))
 
 
@@ -261,9 +257,8 @@ def _packaged_documents(
     name: str,
     version: str,
 ) -> tuple[LicenseDocument, ...]:
-    documents = []
-    for path in _document_paths(root, explicit):
-        documents.append(
+    return tuple(
+        (
             LicenseDocument(
                 label=path.name,
                 source=f"packaged with {ecosystem} dependency {name} {version}",
@@ -273,7 +268,8 @@ def _packaged_documents(
                 ),
             )
         )
-    return tuple(documents)
+        for path in _document_paths(root, explicit)
+    )
 
 
 def _load_overrides() -> dict[tuple[str, str, str], Override]:
@@ -643,9 +639,14 @@ def _pnpm_report_dependencies(
                     package.get("version"), f"version for pnpm package {name}"
                 )
                 installed_versions.add(version)
-                license_expression = _field(
-                    package.get("license"),
-                    f"license expression for pnpm package {name}",
+                package_license = package.get("license")
+                license_expression = (
+                    entry_license
+                    if package_license is None
+                    else _field(
+                        package_license,
+                        f"license expression for pnpm package {name}",
+                    )
                 )
                 if name != entry_name or license_expression != entry_license:
                     raise NoticeError(
@@ -1062,10 +1063,12 @@ def _render(dependencies: Iterable[Dependency]) -> str:
                     "  License documents:",
                 )
             )
-            for document in sorted(
-                dependency.documents, key=lambda item: (item.label, item.digest)
-            ):
-                lines.append(f"    - {document.label} (SHA-256: {document.digest})")
+            lines.extend(
+                f"    - {document.label} (SHA-256: {document.digest})"
+                for document in sorted(
+                    dependency.documents, key=lambda item: (item.label, item.digest)
+                )
+            )
             lines.append("")
 
     lines.extend(("LICENSE DOCUMENTS", "=================", ""))

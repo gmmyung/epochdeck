@@ -43,6 +43,10 @@
   export let loadingRuns: boolean;
   export let runError: string | null;
   export let selectionNotice: string | null;
+  export let logoUrl: string | null = null;
+  export let statusText = "connecting";
+  export let statusFailed = false;
+  export let onlogofailure: () => void = () => {};
   export let onchooseproject: (project: string) => void;
   export let onloadprojects: () => void;
   export let onchoosereport: (report: ReportSummary) => void;
@@ -149,7 +153,21 @@
 </script>
 
 <aside class:collapsed>
-  <div class="sidebar-mode-toolbar">
+  <div class="sidebar-header">
+    {#if !collapsed}
+      <div class="brand">
+        <h1>
+          {#if logoUrl}
+            <img class="brand-logo" src={logoUrl} alt="EpochDeck" onerror={onlogofailure} />
+          {:else}
+            <span class="default-brand">
+              <img src="/epochdeck-mark.svg" alt="" aria-hidden="true" />
+              <span>EpochDeck</span>
+            </span>
+          {/if}
+        </h1>
+      </div>
+    {/if}
     <button
       type="button"
       aria-label={collapsed ? "Expand run sidebar" : "Collapse run sidebar"}
@@ -158,6 +176,12 @@
     >
       <Icon name={collapsed ? "chevron-right" : "chevron-left"} size={15} />
     </button>
+    {#if !collapsed}
+      <div class="status" class:failed={statusFailed} title={statusText}>
+        <span class="status-dot" aria-hidden="true"></span>
+        <span>{statusText}</span>
+      </div>
+    {/if}
   </div>
   {#if !collapsed}
     <label class="nav-search">
@@ -197,45 +221,49 @@
       </p>
     {/if}
 
-    <div class="nav-section-heading">
-      <p class="nav-label">Reports</p>
-      <label class="compact-search">
-        <Icon name="search" size={13} />
-        <input
-          type="search"
-          name="report-filter"
-          aria-label="Filter loaded reports"
-          maxlength="256"
-          bind:value={reportSearch}
-        />
-      </label>
-    </div>
-    {#if reportError}<p class="nav-error" role="alert">{reportError}</p>{/if}
-    <div class="run-list" aria-label="Reports" class:hidden={reports.length === 0}>
-      {#each visibleReports as report (report.id)}
+    {#if reports.length > 0 || reportError || reportCursor}
+      <div class="nav-section-heading">
+        <p class="nav-label">Reports</p>
+        <label class="compact-search">
+          <Icon name="search" size={13} />
+          <input
+            type="search"
+            name="report-filter"
+            aria-label="Filter loaded reports"
+            maxlength="256"
+            bind:value={reportSearch}
+          />
+        </label>
+      </div>
+      {#if reportError}<p class="nav-error" role="alert">{reportError}</p>{/if}
+      <div class="run-list" aria-label="Reports">
+        {#each visibleReports as report (report.id)}
+          <button
+            type="button"
+            class:active={selectedReportId === report.id}
+            aria-pressed={selectedReportId === report.id}
+            onclick={() => onchoosereport(report)}
+          >
+            <span>{report.name}</span>
+            <small>{new Date(report.updated_at).toLocaleDateString()}</small>
+          </button>
+        {/each}
+      </div>
+      {#if reportCursor}
         <button
+          class="nav-load-more"
           type="button"
-          class:active={selectedReportId === report.id}
-          aria-pressed={selectedReportId === report.id}
-          onclick={() => onchoosereport(report)}
+          disabled={loadingMoreReports}
+          onclick={onloadreports}
         >
-          <span>{report.name}</span>
-          <small>{new Date(report.updated_at).toLocaleDateString()}</small>
+          {loadingMoreReports ? "Loading…" : "Load more reports"}
         </button>
-      {/each}
-    </div>
-    {#if reportCursor}
-      <button
-        class="nav-load-more"
-        type="button"
-        disabled={loadingMoreReports}
-        onclick={onloadreports}>{loadingMoreReports ? "Loading…" : "Load more reports"}</button
-      >
-    {/if}
-    {#if reportWindowTruncated}
-      <p class="window-notice" role="status">
-        Bounded window · recent and oldest loaded reports kept
-      </p>
+      {/if}
+      {#if reportWindowTruncated}
+        <p class="window-notice" role="status">
+          Bounded window · recent and oldest loaded reports kept
+        </p>
+      {/if}
     {/if}
 
     <form
@@ -429,14 +457,18 @@
     min-width: 0;
   }
 
-  .sidebar-mode-toolbar {
-    min-height: 30px;
-    display: flex;
-    justify-content: flex-end;
-    margin-bottom: 7px;
+  .sidebar-header {
+    min-height: 51px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 29px;
+    gap: 7px 10px;
+    align-items: center;
+    margin-bottom: 16px;
+    padding-bottom: 13px;
+    border-bottom: 1px solid var(--divider);
   }
 
-  .sidebar-mode-toolbar button {
+  .sidebar-header button {
     width: 29px;
     height: 29px;
     display: grid;
@@ -447,15 +479,42 @@
     color: var(--muted);
   }
 
-  .sidebar-mode-toolbar button:hover,
-  .sidebar-mode-toolbar button:focus-visible {
+  .sidebar-header button:hover,
+  .sidebar-header button:focus-visible {
     border-color: var(--line);
     background: var(--button-hover);
     color: var(--text);
   }
 
-  aside.collapsed .sidebar-mode-toolbar {
+  .sidebar-header .status {
+    grid-column: 1 / -1;
+    min-width: 0;
+  }
+
+  .sidebar-header .status > span:last-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .default-brand {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+
+  .default-brand img {
+    width: 26px;
+    height: 26px;
+    flex: none;
+  }
+
+  aside.collapsed .sidebar-header {
+    min-height: 34px;
+    display: flex;
     justify-content: center;
+    margin-bottom: 10px;
+    padding-bottom: 10px;
   }
 
   .nav-search,
@@ -476,7 +535,7 @@
   .nav-section-heading {
     grid-template-columns: auto minmax(0, 1fr);
     align-items: center;
-    margin-top: 15px;
+    margin-top: 18px;
   }
 
   .nav-label {
@@ -508,7 +567,7 @@
   .run-search-form {
     gap: 5px;
     align-items: end;
-    margin-top: 15px;
+    margin-top: 18px;
   }
 
   .run-search-form .nav-search {

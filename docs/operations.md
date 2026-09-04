@@ -124,8 +124,9 @@ snapshot:
 - the most recent 64 slow request paths, statuses, and durations.
 
 Counters are in-memory and reset with the process. They diagnose contention and
-slow endpoints without creating another persistent telemetry database. HTTP
-logs remain available through journald.
+slow endpoints without creating another persistent telemetry database.
+`tower-http` emits one structured tracing event when each admitted request
+finishes; service deployments retain those events through journald.
 
 Except for embedded static dashboard assets, a request must acquire a
 non-queuing admission permit before body parsing. General API traffic has 64

@@ -29,8 +29,6 @@ describe("BoundedRequestScheduler", () => {
 
     expect(starts).toEqual([]);
     await vi.waitFor(() => expect(starts).toEqual([0, 1]));
-    expect(scheduler.activeCount).toBe(2);
-    expect(scheduler.pendingCount).toBe(2);
     await expect(results[2]).resolves.toBeUndefined();
 
     gates[0].resolve(0);

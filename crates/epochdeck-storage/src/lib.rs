@@ -254,7 +254,7 @@ impl BlobStore {
     }
 }
 
-pub fn validate_blob_digest(digest: &str) -> Result<(), StorageError> {
+fn validate_blob_digest(digest: &str) -> Result<(), StorageError> {
     if digest.len() != 64
         || !digest
             .bytes()
@@ -272,11 +272,9 @@ impl StorageLayout {
     pub fn from_environment() -> Self {
         let data_dir = environment_path("EPOCHDECK_DATA_DIR", "./data");
         let metrics_dir = std::env::var_os("EPOCHDECK_METRICS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| data_dir.join("metrics"));
+            .map_or_else(|| data_dir.join("metrics"), PathBuf::from);
         let blobs_dir = std::env::var_os("EPOCHDECK_BLOBS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| data_dir.join("blobs"));
+            .map_or_else(|| data_dir.join("blobs"), PathBuf::from);
         Self::new(data_dir, metrics_dir, blobs_dir)
     }
 
@@ -314,11 +312,6 @@ impl StorageLayout {
         self.data_dir.join("catalog.sqlite3")
     }
 
-    #[must_use]
-    pub fn lock_path(&self) -> PathBuf {
-        self.data_dir.join(STORAGE_LOCK_FILE_NAME)
-    }
-
     pub fn ownership_lock_paths(&self) -> Result<Vec<PathBuf>, StorageError> {
         let mut paths = [
             canonical_storage_root(&self.data_dir)?,
@@ -339,7 +332,7 @@ impl StorageLayout {
     }
 
     #[must_use]
-    pub fn metric_staging_dir(&self) -> PathBuf {
+    fn metric_staging_dir(&self) -> PathBuf {
         self.metrics_dir.join("staging")
     }
 
@@ -349,7 +342,7 @@ impl StorageLayout {
     }
 
     #[must_use]
-    pub fn blob_staging_dir(&self) -> PathBuf {
+    fn blob_staging_dir(&self) -> PathBuf {
         self.blobs_dir.join("staging")
     }
 
@@ -564,14 +557,6 @@ impl MinMaxHistorySampler {
                 .map(|_| SampleBucket::new(keys.len()))
                 .collect(),
         })
-    }
-
-    pub fn read_segments(
-        &mut self,
-        store: &MetricStore,
-        segments: &[SegmentSource],
-    ) -> Result<(), StorageError> {
-        self.read_segments_cancelable(store, segments, &AtomicBool::new(false))
     }
 
     pub fn read_segments_cancelable(
@@ -890,9 +875,7 @@ impl ChartCoordinate {
             Self::RelativeStep { origin } => step.checked_sub(origin),
             Self::ElapsedTime { origin_ms } => {
                 let elapsed = i128::from(timestamp_ms) - i128::from(origin_ms);
-                (elapsed >= 0)
-                    .then(|| u64::try_from(elapsed).ok())
-                    .flatten()
+                u64::try_from(elapsed).ok()
             }
         }
     }
@@ -1240,24 +1223,6 @@ impl MetricStore {
         })
     }
 
-    pub fn read_history(
-        &self,
-        run_id: RunId,
-        segments: &[SegmentSource],
-        keys: &[String],
-        after_sequence: Option<u64>,
-        limit: usize,
-    ) -> Result<HistoryResponse, StorageError> {
-        self.read_history_cancelable(
-            run_id,
-            segments,
-            keys,
-            after_sequence,
-            limit,
-            &AtomicBool::new(false),
-        )
-    }
-
     pub fn read_history_cancelable(
         &self,
         run_id: RunId,
@@ -1298,21 +1263,6 @@ impl MetricStore {
         }
         response.source_last_sequence = response.sequence.last().copied();
         Ok(response)
-    }
-
-    pub fn read_sampled_history(
-        &self,
-        run_id: RunId,
-        segments: &[SegmentSource],
-        keys: &[String],
-        first_sequence: u64,
-        last_sequence: u64,
-        max_points: usize,
-    ) -> Result<HistoryResponse, StorageError> {
-        let mut sampler =
-            MinMaxHistorySampler::new(run_id, keys, first_sequence, last_sequence, max_points)?;
-        sampler.read_segments(self, segments)?;
-        Ok(sampler.finish())
     }
 
     pub fn read_segment_tail(&self, relative_path: &str) -> Result<SegmentTail, StorageError> {
@@ -2036,7 +1986,9 @@ fn row_group_may_overlap_step_range(
     let (Some(minimum), Some(maximum)) = (statistics.min_opt(), statistics.max_opt()) else {
         return true;
     };
-    let (minimum, maximum) = (*minimum as u64, *maximum as u64);
+    let (Ok(minimum), Ok(maximum)) = (u64::try_from(*minimum), u64::try_from(*maximum)) else {
+        return true;
+    };
     if minimum > maximum {
         return true;
     }
@@ -2333,7 +2285,7 @@ mod tests {
         assert_eq!(segment.installation, SegmentInstallation::InstalledNew);
         let replay = store.write_batch(project_id, run_id, &"a".repeat(64), &request)?;
         assert_eq!(replay.installation, SegmentInstallation::AlreadyPresent);
-        let history = store.read_history(
+        let history = store.read_history_cancelable(
             run_id,
             &[SegmentSource {
                 relative_path: segment.relative_path,
@@ -2341,6 +2293,7 @@ mod tests {
             &["loss".to_owned()],
             None,
             10,
+            &AtomicBool::new(false),
         )?;
 
         assert_eq!(history.sequence, vec![1, 2]);
@@ -2389,8 +2342,9 @@ mod tests {
             });
         }
 
-        let history =
-            store.read_sampled_history(run_id, &segments, &["loss".to_owned()], 1, 12, 4)?;
+        let mut sampler = MinMaxHistorySampler::new(run_id, &["loss".to_owned()], 1, 12, 4)?;
+        sampler.read_segments_cancelable(&store, &segments, &AtomicBool::new(false))?;
+        let history = sampler.finish();
 
         assert_eq!(history.sequence, vec![4, 5, 7, 12]);
         assert_eq!(
@@ -2460,7 +2414,7 @@ mod tests {
             &sources,
             &AtomicBool::new(false),
         )?;
-        let history = store.read_history(
+        let history = store.read_history_cancelable(
             run_id,
             &[SegmentSource {
                 relative_path: compacted.relative_path.clone(),
@@ -2468,8 +2422,9 @@ mod tests {
             &["loss".to_owned(), "reward".to_owned()],
             None,
             10,
+            &AtomicBool::new(false),
         )?;
-        let page = store.read_history(
+        let page = store.read_history_cancelable(
             run_id,
             &[SegmentSource {
                 relative_path: compacted.relative_path.clone(),
@@ -2477,6 +2432,7 @@ mod tests {
             &["loss".to_owned()],
             Some(3),
             2,
+            &AtomicBool::new(false),
         )?;
 
         assert_eq!(compacted.first_sequence, 1);

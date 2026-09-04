@@ -33,11 +33,11 @@ impl MetricRuntime {
         }
     }
 
-    pub(crate) fn store(&self) -> &MetricStore {
+    pub(super) fn store(&self) -> &MetricStore {
         &self.store
     }
 
-    pub(crate) async fn read_snapshot(&self) -> OwnedRwLockReadGuard<()> {
+    pub(super) async fn read_snapshot(&self) -> OwnedRwLockReadGuard<()> {
         Arc::clone(&self.snapshots).read_owned().await
     }
 
@@ -68,14 +68,14 @@ impl Default for CompactionConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompactionOutcome {
+pub(super) enum CompactionOutcome {
     Idle,
     RetiredFilesRemoved { count: usize },
     SegmentsCompacted { inputs: usize, rows: usize },
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum CompactionError {
+pub(super) enum CompactionError {
     #[error(transparent)]
     Catalog(#[from] CatalogError),
     #[error(transparent)]
@@ -86,7 +86,7 @@ pub(crate) enum CompactionError {
     InvalidConfig(String),
 }
 
-pub(crate) async fn compact_once(
+pub(super) async fn compact_once(
     catalog: &Catalog,
     metrics: &MetricRuntime,
     config: CompactionConfig,

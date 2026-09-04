@@ -1,4 +1,13 @@
-# EpochDeck
+<p align="center">
+  <img src="web/public/epochdeck-mark.svg" width="96" height="96" alt="EpochDeck logo">
+</p>
+
+<h1 align="center">EpochDeck</h1>
+
+<p align="center">
+  <a href="https://github.com/gmmyung/epochdeck/actions/workflows/ci.yml"><img src="https://github.com/gmmyung/epochdeck/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
+  <a href="https://github.com/gmmyung/epochdeck/releases"><img src="https://img.shields.io/github/v/release/gmmyung/epochdeck?include_prereleases&amp;sort=semver&amp;label=release" alt="Latest release"></a>
+</p>
 
 EpochDeck is a standalone, self-hosted experiment tracker for long-running,
 high-dimensional workloads. Its Python SDK provides a W&B-compatible API, while
@@ -6,12 +15,13 @@ its Rust server owns ingestion, storage, querying, and the Svelte dashboard.
 Trackio feature parity is the immediate milestone; practical W&B compatibility
 is the longer-term contract.
 
-EpochDeck is pre-alpha. Scalar metrics, host telemetry, alerts, rich media,
-versioned artifacts, traces, finite sweeps, persisted reports, and streaming
-W&B import/export are usable end to end. Authentication, multi-user
-authorization, and the wider compatibility surface are still in development.
-For remote access, place the server behind an authenticated HTTPS reverse proxy
-and review [SECURITY.md](SECURITY.md).
+> [!WARNING]
+> EpochDeck is pre-alpha. Scalar metrics, host telemetry, alerts, rich media,
+> versioned artifacts, traces, finite sweeps, persisted reports, and streaming
+> W&B import/export are usable end to end. Authentication, multi-user
+> authorization, and the wider compatibility surface are still in development.
+> For remote access, place the server behind an authenticated HTTPS reverse
+> proxy and review [SECURITY.md](SECURITY.md).
 
 ## Design
 
@@ -129,8 +139,12 @@ For disconnected work, initialize with `mode="offline"`, then upload the
 durable spool later:
 
 ```bash
-epochdeck sync ~/.local/share/epochdeck/spool/<run-id>
+epochdeck sync <platform-data-directory>/epochdeck/spool/<run-id>
 ```
+
+The platform data directory is selected using the operating system convention
+(`~/.local/share` on Linux by default and `~/Library/Application Support` on
+macOS). Set `EPOCHDECK_SPOOL_DIR` to use an explicit spool location.
 
 ## Development
 

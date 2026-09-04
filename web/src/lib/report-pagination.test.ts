@@ -1,11 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ReportPanel } from "./api";
-import {
-  MAX_REPORT_CHARTS_PER_PAGE,
-  MAX_REPORT_PANELS_PER_PAGE,
-  paginateReportPanels,
-} from "./report-pagination";
+import { paginateReportPanels } from "./report-pagination";
 
 describe("report pagination", () => {
   it("caps markdown-only pages while preserving panel order", () => {
@@ -53,8 +49,8 @@ describe("report pagination", () => {
       ["tail"],
     ]);
     for (const page of pages) {
-      expect(page.panels.length).toBeLessThanOrEqual(MAX_REPORT_PANELS_PER_PAGE);
-      expect(page.chartCount).toBeLessThanOrEqual(MAX_REPORT_CHARTS_PER_PAGE);
+      expect(page.panels.length).toBeLessThanOrEqual(12);
+      expect(page.chartCount).toBeLessThanOrEqual(24);
     }
   });
 

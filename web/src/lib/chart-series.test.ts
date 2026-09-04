@@ -3,12 +3,11 @@ import { describe, expect, it } from "vitest";
 import type { ChartHistory } from "./api";
 import {
   closestSeriesPoints,
-  contiguousBucketRanges,
+  hasDrawableSeriesInRange,
   lineDash,
   metricChartViewportKey,
   prepareMetricSeries,
   runSetIdentity,
-  stableSeriesPattern,
   type MetricChartSeries,
 } from "./chart-series";
 
@@ -171,7 +170,16 @@ describe("multi-run chart series", () => {
   });
 
   it("assigns deterministic visual patterns and canvas dash arrays", () => {
-    expect(stableSeriesPattern("run-a")).toBe(stableSeriesPattern("run-a"));
+    const input: MetricChartSeries = {
+      runId: "run-a",
+      runName: "A",
+      color: "#123456",
+      available: true,
+      history: history("run-a", [1]),
+    };
+    expect(prepareMetricSeries(input, "loss", "none", 0.15).pattern).toBe(
+      prepareMetricSeries(input, "loss", "none", 0.15).pattern,
+    );
     expect(lineDash("solid")).toEqual([]);
     expect(lineDash("dash-dot")).toEqual([9, 4, 2, 4]);
   });
@@ -195,36 +203,36 @@ describe("multi-run chart series", () => {
     );
   });
 
-  it("preserves sparse bucket indexes and splits paths at bucket gaps", () => {
+  it("requires two distinct visible samples for a drawable line", () => {
     const prepared = prepareMetricSeries(
       {
-        runId: "sparse",
-        runName: "Sparse",
-        color: "#111111",
+        runId: "run-a",
+        runName: "A",
+        color: "#123456",
         available: true,
-        history: {
-          ...history("sparse", [1, 2, 3, 4]),
-          metrics: {
-            loss: {
-              ...history("sparse", [1, 2, 3, 4]).metrics.loss,
-              bucket: [0, 1, 7, 8],
-            },
-          },
-        },
+        history: history("run-a", [1, 2, 3], { x: [10, 20, 30] }),
       },
       "loss",
       "none",
-      0.15,
+      0,
     );
 
-    expect(prepared.buckets).toEqual([0, 1, 7, 8]);
-    expect(contiguousBucketRanges(prepared.buckets, [true, true, true, true])).toEqual([
-      { start: 0, end: 2 },
-      { start: 2, end: 4 },
-    ]);
-    expect(contiguousBucketRanges(prepared.buckets, [true, false, true, true])).toEqual([
-      { start: 0, end: 1 },
-      { start: 2, end: 4 },
-    ]);
+    expect(hasDrawableSeriesInRange([prepared], 9, 21, "linear")).toBe(true);
+    expect(hasDrawableSeriesInRange([prepared], 19, 21, "linear")).toBe(false);
+    expect(hasDrawableSeriesInRange([prepared], 31, 40, "linear")).toBe(false);
+
+    const gapped = prepareMetricSeries(
+      {
+        runId: "run-b",
+        runName: "B",
+        color: "#654321",
+        available: true,
+        history: history("run-b", [1, Number.NaN, 3], { x: [10, 20, 30] }),
+      },
+      "loss",
+      "none",
+      0,
+    );
+    expect(hasDrawableSeriesInRange([gapped], 9, 31, "linear")).toBe(false);
   });
 });

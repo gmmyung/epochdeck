@@ -107,33 +107,6 @@ export function prepareMetricSeries(
   };
 }
 
-export function contiguousBucketRanges(
-  buckets: number[],
-  valid: readonly boolean[],
-): Array<{ start: number; end: number }> {
-  const ranges: Array<{ start: number; end: number }> = [];
-  let start: number | null = null;
-  for (let index = 0; index < valid.length; index += 1) {
-    const bucket = buckets[index];
-    const usable = valid[index] && Number.isFinite(bucket);
-    if (!usable) {
-      if (start !== null) ranges.push({ start, end: index });
-      start = null;
-      continue;
-    }
-    if (start === null) {
-      start = index;
-      continue;
-    }
-    if (bucket !== buckets[index - 1] + 1) {
-      ranges.push({ start, end: index });
-      start = index;
-    }
-  }
-  if (start !== null) ranges.push({ start, end: valid.length });
-  return ranges;
-}
-
 export function closestSeriesPoints(
   series: PreparedMetricSeries[],
   target: number,
@@ -171,7 +144,7 @@ export function closestSeriesPoints(
   return points;
 }
 
-export function stableSeriesPattern(runId: string): SeriesPattern {
+function stableSeriesPattern(runId: string): SeriesPattern {
   let hash = 2166136261;
   for (let index = 0; index < runId.length; index += 1) {
     hash ^= runId.charCodeAt(index);
@@ -186,6 +159,30 @@ export function runSetIdentity(series: readonly Pick<MetricChartSeries, "runId">
 
 export function metricChartViewportKey(viewport: MetricChartViewport | null): string {
   return viewport === null ? "full" : JSON.stringify([viewport.minimum, viewport.maximum]);
+}
+
+export function hasDrawableSeriesInRange(
+  series: readonly PreparedMetricSeries[],
+  minimum: number,
+  maximum: number,
+  yScale: ScaleMode,
+): boolean {
+  return series.some((candidate) => {
+    let previousCoordinate: number | null = null;
+    for (let index = 0; index < candidate.x.length; index += 1) {
+      const coordinate = candidate.x[index];
+      if (coordinate < minimum) continue;
+      if (coordinate > maximum) break;
+      const value = candidate.smoothed[index];
+      if (value === null || !Number.isFinite(value) || (yScale === "log" && value <= 0)) {
+        previousCoordinate = null;
+        continue;
+      }
+      if (previousCoordinate !== null && coordinate !== previousCoordinate) return true;
+      previousCoordinate = coordinate;
+    }
+    return false;
+  });
 }
 
 export function lineDash(pattern: SeriesPattern): number[] {

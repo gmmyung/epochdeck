@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import os
-import sys
 import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from epochdeck._json_normalization import normalize_json_object
+from epochdeck._run import Mode, Resume, Run, create_run
 from epochdeck._sweep_context import current_sweep_context
 from epochdeck.artifact import Artifact
-from epochdeck.run import Mode, Resume, Run, create_run
 from epochdeck.trace import Trace, TraceKind
 
 _current_run: Run | None = None
@@ -67,8 +66,11 @@ def init(
             config=selected_config,
             mode=mode,
             resume=_normalize_resume(resume),
-            server_url=server_url
-            or os.environ.get("EPOCHDECK_SERVER_URL", "http://127.0.0.1:8787"),
+            server_url=(
+                server_url
+                if server_url is not None
+                else os.environ.get("EPOCHDECK_SERVER_URL", "http://127.0.0.1:8787")
+            ),
             spool_root=spool_root,
             sweep_trial_id=sweep_context.trial_id if sweep_context is not None else None,
         )
@@ -78,7 +80,6 @@ def init(
                 sweep_context.run_id_callback(new_run.id)
         new_run._set_finish_callback(_clear_current_run)
         _current_run = None if new_run.finished else new_run
-        _publish_current_run(_current_run)
         return new_run
 
 
@@ -142,11 +143,10 @@ def _clear_current_run(run: Run) -> None:
     with _current_run_lock:
         if _current_run is run:
             _current_run = None
-            _publish_current_run(None)
 
 
 def current_run() -> Run | None:
-    """Return the active run without creating compatibility state."""
+    """Return the active run, if one exists."""
     with _current_run_lock:
         return _current_run
 
@@ -156,12 +156,6 @@ def _require_current_run() -> Run:
     if run is None:
         raise RuntimeError("no active EpochDeck run; call epochdeck.init first")
     return run
-
-
-def _publish_current_run(run: Run | None) -> None:
-    package = sys.modules.get("epochdeck")
-    if package is not None:
-        package.__dict__["run"] = run
 
 
 def _normalize_resume(value: bool | str | None) -> Resume:

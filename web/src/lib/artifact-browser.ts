@@ -5,7 +5,7 @@ export type ArtifactBreadcrumb = {
   path: string;
 };
 
-export type ArtifactDirectoryItem = {
+type ArtifactDirectoryItem = {
   kind: "directory";
   name: string;
   path: string;
@@ -13,7 +13,7 @@ export type ArtifactDirectoryItem = {
   size: number;
 };
 
-export type ArtifactFileItem = {
+type ArtifactFileItem = {
   kind: "file";
   name: string;
   path: string;

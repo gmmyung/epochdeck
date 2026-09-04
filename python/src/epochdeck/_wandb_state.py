@@ -242,7 +242,7 @@ class Checkpoint:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
-            _fsync_directory(self.path.parent)
+            sync_directory(self.path.parent)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
@@ -256,7 +256,3 @@ def _checkpoint_line(value: dict[str, Any]) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError) as error:
         raise WandbImportError(f"checkpoint update is not JSON-compatible: {error}") from error
-
-
-def _fsync_directory(path: Path) -> None:
-    sync_directory(path)

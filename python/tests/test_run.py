@@ -10,10 +10,10 @@ import httpx
 import pytest
 
 from epochdeck import Artifact, Audio, Histogram, Image, Table
+from epochdeck import _run as run_module
 from epochdeck import _spool as spool_module
 from epochdeck._protocol import encode_json_request
-from epochdeck.rich import PreparedRichValue, RichValue
-from epochdeck.run import (
+from epochdeck._run import (
     _SUMMARY_CHECKPOINT_BYTE_INTERVAL,
     _SUMMARY_CHECKPOINT_RECORD_INTERVAL,
     DeliveryError,
@@ -21,8 +21,30 @@ from epochdeck.run import (
     create_run,
     sync_spool,
 )
+from epochdeck.rich import PreparedRichValue, RichValue
 
 _METRIC_REQUEST_BUDGET = 1_750_000
+
+
+def test_default_spool_root_uses_platform_data_directory(monkeypatch, tmp_path) -> None:
+    platform_data = tmp_path / "platform-data"
+    monkeypatch.delenv("EPOCHDECK_SPOOL_DIR", raising=False)
+    monkeypatch.setattr(
+        run_module,
+        "user_data_path",
+        lambda appname, *, appauthor: platform_data,
+    )
+
+    assert run_module._select_spool_root(None) == platform_data / "spool"
+
+
+def test_explicit_spool_root_takes_precedence_over_environment(monkeypatch, tmp_path) -> None:
+    configured = tmp_path / "configured"
+    explicit = tmp_path / "explicit"
+    monkeypatch.setenv("EPOCHDECK_SPOOL_DIR", str(configured))
+
+    assert run_module._select_spool_root(explicit) == explicit
+    assert run_module._select_spool_root(None) == configured
 
 
 def _summary_fields(

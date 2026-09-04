@@ -24,7 +24,7 @@ export function groupRichValues(values: RichValueSummary[]): MediaGroup[] {
   return groups;
 }
 
-export function mediaGroupId(kind: RichValueSummary["kind"], key: string): string {
+function mediaGroupId(kind: RichValueSummary["kind"], key: string): string {
   return `${kind}\0${key}`;
 }
 

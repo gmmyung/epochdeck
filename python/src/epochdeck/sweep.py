@@ -20,10 +20,10 @@ from epochdeck._json_normalization import (
 )
 from epochdeck._limits import MAX_SAFE_INTEGER
 from epochdeck._platform_fs import open_regular_file_descriptor, sync_directory, verify_directory
+from epochdeck._run import SweepEarlyStop
 from epochdeck._sweep_context import SweepRunContext, current_sweep_context
 from epochdeck.api import current_run
 from epochdeck.client import EpochDeckApiError, EpochDeckClient
-from epochdeck.run import SweepEarlyStop
 
 _MAX_AGENT_STATE_BYTES = 512 * 1024
 _MAX_SWEEP_PARAMETERS = 64
@@ -73,117 +73,23 @@ def agent(
             agent_state.clear()
             completed += 1
         while count is None or completed < count:
-            recovered = agent_state.read()
-            trial: dict[str, Any] | None = None
-            sweep_record: dict[str, Any] | None = None
-            if recovered is not None and recovered.get("phase") == "running":
-                try:
-                    renewed = client.heartbeat_sweep_trial(
-                        str(recovered["trial_id"]),
-                        selected_agent,
-                    )
-                except EpochDeckApiError as error:
-                    if error.status_code not in {404, 409}:
-                        raise
-                    agent_state.clear()
-                else:
-                    trial = renewed
-                    sweep_record = {"metric": {"name": str(recovered["metric_name"])}}
-            if trial is None:
-                claim = client.claim_sweep_trial(sweep_id, selected_agent)
-                claimed = claim.get("trial")
-                if claimed is None:
-                    return
-                if not isinstance(claimed, dict):
-                    raise TypeError("sweep claim response has an invalid trial")
-                record = claim.get("sweep")
-                if not isinstance(record, dict):
-                    raise TypeError("sweep claim response has an invalid sweep")
-                trial = claimed
-                sweep_record = record
-            assert sweep_record is not None
-            trial_id = str(trial["id"])
-            trial_config = deepcopy(trial["config"])
-            metric_name = str(sweep_record["metric"]["name"])
-            bound_run_id = trial.get("run_id")
-            if bound_run_id is not None:
-                bound_run_id = str(bound_run_id)
-            agent_state.write(
-                {
-                    "phase": "running",
-                    "trial_id": trial_id,
-                    "run_id": bound_run_id,
-                    "config": trial_config,
-                    "metric_name": metric_name,
-                }
+            assignment = _claim_or_recover_trial(
+                client,
+                sweep_id,
+                selected_agent,
+                agent_state,
             )
-
-            def persist_run_id(
-                run_id: str,
-                *,
-                _trial_id: str = trial_id,
-                _trial_config: dict[str, Any] = trial_config,
-                _metric_name: str = metric_name,
-            ) -> None:
-                agent_state.write(
-                    {
-                        "phase": "running",
-                        "trial_id": _trial_id,
-                        "run_id": run_id,
-                        "config": _trial_config,
-                        "metric_name": _metric_name,
-                    }
-                )
-
-            context = SweepRunContext(
-                trial_id=trial_id,
-                config=trial_config,
-                metric_name=metric_name,
-                run_id=bound_run_id,
-                run_id_callback=persist_run_id,
-            )
-            token = current_sweep_context.set(context)
-            trial_state = "completed"
-            failure: Exception | None = None
+            if assignment is None:
+                return
+            trial, sweep_record = assignment
+            context = _prepare_trial_context(trial, sweep_record, agent_state)
             heartbeat = _Heartbeat(
                 server_url=selected_server,
-                trial_id=trial_id,
+                trial_id=context.trial_id,
                 agent_id=selected_agent,
             )
-            heartbeat.start()
-            try:
-                function()
-            except SweepEarlyStop:
-                trial_state = "stopped"
-            except Exception as error:
-                trial_state = "failed"
-                failure = error
-            finally:
-                active = current_run()
-                try:
-                    if active is not None and active.should_stop and trial_state == "completed":
-                        trial_state = "stopped"
-                    if active is not None and not active.finished:
-                        active.finish(summary={"sweep_state": trial_state})
-                except Exception as finish_error:
-                    trial_state = "failed"
-                    if failure is None:
-                        failure = finish_error
-                finally:
-                    heartbeat.stop()
-                    heartbeat.join(10)
-                    current_sweep_context.reset(token)
-            if heartbeat.is_alive():
-                raise RuntimeError("timed out stopping the sweep heartbeat")
-            if heartbeat.lease_lost:
-                raise RuntimeError(f"sweep trial lease was lost: {heartbeat.last_error}")
-            if context.run_id is None:
-                trial_state = "failed"
-                metric = None
-            else:
-                run = client.get_run(context.run_id)
-                raw_metric = run.get("summary", {}).get(context.metric_name)
-                metric = float(raw_metric) if isinstance(raw_metric, (int, float)) else None
+            trial_state, failure = _execute_trial(function, context, heartbeat)
+            trial_state, metric = _trial_result(client, context, trial_state)
             terminal = {
                 "phase": "terminal",
                 "trial_id": context.trial_id,
@@ -198,6 +104,127 @@ def agent(
             completed += 1
             if failure is not None and raise_on_error:
                 raise failure
+
+
+def _claim_or_recover_trial(
+    client: EpochDeckClient,
+    sweep_id: str,
+    agent_id: str,
+    agent_state: _AgentState,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    recovered = agent_state.read()
+    if recovered is not None and recovered.get("phase") == "running":
+        try:
+            renewed = client.heartbeat_sweep_trial(str(recovered["trial_id"]), agent_id)
+        except EpochDeckApiError as error:
+            if error.status_code not in {404, 409}:
+                raise
+            agent_state.clear()
+        else:
+            return renewed, {"metric": {"name": str(recovered["metric_name"])}}
+
+    claim = client.claim_sweep_trial(sweep_id, agent_id)
+    trial = claim.get("trial")
+    if trial is None:
+        return None
+    if not isinstance(trial, dict):
+        raise TypeError("sweep claim response has an invalid trial")
+    sweep_record = claim.get("sweep")
+    if not isinstance(sweep_record, dict):
+        raise TypeError("sweep claim response has an invalid sweep")
+    return trial, sweep_record
+
+
+def _prepare_trial_context(
+    trial: Mapping[str, Any],
+    sweep_record: Mapping[str, Any],
+    agent_state: _AgentState,
+) -> SweepRunContext:
+    trial_id = str(trial["id"])
+    trial_config = deepcopy(trial["config"])
+    metric_name = str(sweep_record["metric"]["name"])
+    bound_run_id = trial.get("run_id")
+    if bound_run_id is not None:
+        bound_run_id = str(bound_run_id)
+
+    def persist_run_id(run_id: str) -> None:
+        agent_state.write(
+            {
+                "phase": "running",
+                "trial_id": trial_id,
+                "run_id": run_id,
+                "config": trial_config,
+                "metric_name": metric_name,
+            }
+        )
+
+    agent_state.write(
+        {
+            "phase": "running",
+            "trial_id": trial_id,
+            "run_id": bound_run_id,
+            "config": trial_config,
+            "metric_name": metric_name,
+        }
+    )
+    return SweepRunContext(
+        trial_id=trial_id,
+        config=trial_config,
+        metric_name=metric_name,
+        run_id=bound_run_id,
+        run_id_callback=persist_run_id,
+    )
+
+
+def _execute_trial(
+    function: Callable[[], Any],
+    context: SweepRunContext,
+    heartbeat: _Heartbeat,
+) -> tuple[str, Exception | None]:
+    token = current_sweep_context.set(context)
+    trial_state = "completed"
+    failure: Exception | None = None
+    heartbeat.start()
+    try:
+        function()
+    except SweepEarlyStop:
+        trial_state = "stopped"
+    except Exception as error:
+        trial_state = "failed"
+        failure = error
+    finally:
+        active = current_run()
+        try:
+            if active is not None and active.should_stop and trial_state == "completed":
+                trial_state = "stopped"
+            if active is not None and not active.finished:
+                active.finish(summary={"sweep_state": trial_state})
+        except Exception as finish_error:
+            trial_state = "failed"
+            if failure is None:
+                failure = finish_error
+        finally:
+            heartbeat.stop()
+            heartbeat.join(10)
+            current_sweep_context.reset(token)
+    if heartbeat.is_alive():
+        raise RuntimeError("timed out stopping the sweep heartbeat")
+    if heartbeat.lease_lost:
+        raise RuntimeError(f"sweep trial lease was lost: {heartbeat.last_error}")
+    return trial_state, failure
+
+
+def _trial_result(
+    client: EpochDeckClient,
+    context: SweepRunContext,
+    trial_state: str,
+) -> tuple[str, float | None]:
+    if context.run_id is None:
+        return "failed", None
+    run = client.get_run(context.run_id)
+    raw_metric = run.get("summary", {}).get(context.metric_name)
+    metric = float(raw_metric) if isinstance(raw_metric, (int, float)) else None
+    return trial_state, metric
 
 
 class _Heartbeat(threading.Thread):
@@ -288,7 +315,7 @@ class _AgentState:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
-            _fsync_directory(self.path.parent)
+            sync_directory(self.path.parent)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
@@ -296,7 +323,7 @@ class _AgentState:
     def clear(self) -> None:
         self.path.unlink(missing_ok=True)
         if self.path.parent.exists():
-            _fsync_directory(self.path.parent)
+            sync_directory(self.path.parent)
 
 
 def _agent_state_path(
@@ -339,10 +366,6 @@ def _complete_pending_trial(client: EpochDeckClient, pending: Mapping[str, Any])
     )
 
 
-def _fsync_directory(path: Path) -> None:
-    sync_directory(path)
-
-
 def _normalize_sweep(configuration: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(configuration, Mapping):
         raise TypeError("sweep configuration must be a mapping")
@@ -357,7 +380,22 @@ def _normalize_sweep(configuration: Mapping[str, Any]) -> dict[str, Any]:
     sweep_name = configuration.get("name")
     if sweep_name is not None:
         _validate_sweep_text(sweep_name, "sweep name", 256)
-    metric = configuration.get("metric")
+    metric = _normalize_sweep_metric(configuration.get("metric"))
+    parameters = _normalize_sweep_parameters(configuration.get("parameters"))
+    early_terminate = _normalize_early_termination(configuration.get("early_terminate"))
+    max_runs = _normalize_run_cap(configuration.get("run_cap"), method, parameters)
+    return {
+        "id": None,
+        "name": sweep_name,
+        "method": method,
+        "metric": metric,
+        "parameters": parameters,
+        "max_runs": max_runs,
+        "early_terminate": early_terminate,
+    }
+
+
+def _normalize_sweep_metric(metric: Any) -> dict[str, str]:
     if not isinstance(metric, Mapping) or not isinstance(metric.get("name"), str):
         raise ValueError("sweep metric requires a string name")
     _reject_unknown_fields(metric, {"name", "goal"}, "sweep metric")
@@ -365,7 +403,10 @@ def _normalize_sweep(configuration: Mapping[str, Any]) -> dict[str, Any]:
     goal = metric.get("goal")
     if goal not in {"minimize", "maximize"}:
         raise ValueError("sweep metric goal must be 'minimize' or 'maximize'")
-    raw_parameters = configuration.get("parameters")
+    return {"name": metric["name"], "goal": goal}
+
+
+def _normalize_sweep_parameters(raw_parameters: Any) -> dict[str, dict[str, list[Any]]]:
     if not isinstance(raw_parameters, Mapping) or not raw_parameters:
         raise ValueError("sweep parameters must be a non-empty mapping")
     parameters: dict[str, dict[str, list[Any]]] = {}
@@ -413,14 +454,15 @@ def _normalize_sweep(configuration: Mapping[str, Any]) -> dict[str, Any]:
         parameters[name] = {"values": normalized_values}
         parameters_size = candidate_size
         parameters_nodes = candidate_nodes
-    parameters = normalize_json_object(
+    return normalize_json_object(
         parameters,
         "sweep parameters",
         _MAX_SWEEP_PARAMETERS_BYTES,
         maximum_nodes=DEFAULT_MAX_JSON_NODES,
     )
-    early = configuration.get("early_terminate")
-    normalized_early = None
+
+
+def _normalize_early_termination(early: Any) -> dict[str, int] | None:
     if early is not None:
         if not isinstance(early, Mapping) or early.get("type") != "median":
             raise ValueError("early_terminate currently supports only type='median'")
@@ -443,11 +485,18 @@ def _normalize_sweep(configuration: Mapping[str, Any]) -> dict[str, Any]:
             or not 1 <= min_trials <= 100
         ):
             raise ValueError("early_terminate min_trials must be between 1 and 100")
-        normalized_early = {
+        return {
             "min_step": min_step,
             "min_trials": min_trials,
         }
-    max_runs = configuration.get("run_cap")
+    return None
+
+
+def _normalize_run_cap(
+    max_runs: Any,
+    method: str,
+    parameters: Mapping[str, Mapping[str, list[Any]]],
+) -> int:
     if max_runs is None:
         if method == "grid":
             max_runs = 1
@@ -461,15 +510,7 @@ def _normalize_sweep(configuration: Mapping[str, Any]) -> dict[str, Any]:
         or not 1 <= max_runs <= _MAX_SWEEP_RUNS
     ):
         raise ValueError(f"sweep run_cap must be between 1 and {_MAX_SWEEP_RUNS}")
-    return {
-        "id": None,
-        "name": sweep_name,
-        "method": method,
-        "metric": {"name": metric["name"], "goal": goal},
-        "parameters": parameters,
-        "max_runs": max_runs,
-        "early_terminate": normalized_early,
-    }
+    return max_runs
 
 
 def _reject_unknown_fields(
@@ -503,4 +544,6 @@ def _validate_sweep_text(value: Any, name: str, maximum: int) -> None:
 
 
 def _server_url(value: str | None) -> str:
-    return value or os.environ.get("EPOCHDECK_SERVER_URL", "http://127.0.0.1:8787")
+    if value is not None:
+        return value
+    return os.environ.get("EPOCHDECK_SERVER_URL", "http://127.0.0.1:8787")

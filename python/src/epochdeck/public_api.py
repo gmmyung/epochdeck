@@ -25,7 +25,9 @@ class Api:
         timeout: float = 30.0,
     ) -> None:
         self.client = EpochDeckClient(
-            server_url or os.environ.get("EPOCHDECK_SERVER_URL", "http://127.0.0.1:8787"),
+            server_url
+            if server_url is not None
+            else os.environ.get("EPOCHDECK_SERVER_URL", "http://127.0.0.1:8787"),
             timeout=timeout,
         )
 

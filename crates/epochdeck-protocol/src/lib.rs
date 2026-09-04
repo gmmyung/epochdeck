@@ -661,7 +661,7 @@ pub struct RunQueryRequest {
     pub limit: usize,
 }
 
-fn default_query_limit() -> usize {
+const fn default_query_limit() -> usize {
     100
 }
 
@@ -701,6 +701,7 @@ pub struct ProjectMetricKeySummary {
 pub struct ProjectMetricCatalogResponse {
     pub keys: Vec<ProjectMetricKeySummary>,
     pub next_after: Option<String>,
+    pub total_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

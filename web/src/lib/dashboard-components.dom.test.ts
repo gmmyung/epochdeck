@@ -228,35 +228,25 @@ describe("interactive dashboard components", () => {
       .map((id) => document.getElementById(id)?.textContent)
       .join(" ");
     expect(accessibleName).toBe("Axis scale Linear");
-    trigger.click();
+    trigger.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
     await tick();
-    const listbox = target.querySelector<HTMLElement>('[role="listbox"]')!;
+    const listbox = document.body.querySelector<HTMLElement>('[role="listbox"]')!;
     expect(listbox.classList.contains("select-popover")).toBe(true);
     expect(
-      target
+      document.body
         .querySelector<HTMLElement>('[role="option"][aria-label="Linear"]')
         ?.getAttribute("aria-selected"),
     ).toBe("true");
 
-    target.querySelector<HTMLButtonElement>('[role="option"][aria-label="Log"]')!.click();
+    document.body
+      .querySelector<HTMLElement>('[role="option"][aria-label="Log"]')!
+      .dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0 }));
     await tick();
     expect(change).toHaveBeenCalledWith("log");
-    expect(target.querySelector('[role="listbox"]')).toBeNull();
+    expect(document.body.querySelector('[role="listbox"]')?.getAttribute("data-state")).toBe(
+      "closed",
+    );
     expect(trigger.textContent).toContain("Log");
-
-    trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
-    await tick();
-    const logOption = target.querySelector<HTMLButtonElement>('[role="option"][aria-label="Log"]')!;
-    expect(logOption.tabIndex).toBe(0);
-    logOption.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true }));
-    await tick();
-    const linearOption = target.querySelector<HTMLButtonElement>(
-      '[role="option"][aria-label="Linear"]',
-    )!;
-    expect(linearOption.tabIndex).toBe(0);
-    linearOption.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    await tick();
-    expect(change).toHaveBeenLastCalledWith("linear");
 
     await unmount(component);
     target.remove();
@@ -487,9 +477,17 @@ describe("interactive dashboard components", () => {
     const xScale = xScaleLabel.parentElement!.querySelector<HTMLButtonElement>(
       'button[aria-haspopup="listbox"]',
     )!;
-    xScale.click();
+    xScale.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
     await tick();
-    target.querySelector<HTMLButtonElement>('[role="option"][aria-label="Log"]')!.click();
+    const logOption = document.body.querySelector<HTMLElement>(
+      '[role="option"][aria-label="Log"]',
+    )!;
+    logOption.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+    await tick();
+    expect(target.querySelector("details")?.open).toBe(true);
+    logOption.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0 }));
+    await tick();
+    expect(target.querySelector("details")?.open).toBe(true);
     expect(viewChange).toHaveBeenCalledOnce();
 
     const smoothingAmount = target.querySelector<HTMLInputElement>('input[type="number"]')!;

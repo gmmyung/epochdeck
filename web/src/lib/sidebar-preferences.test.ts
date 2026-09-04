@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import { runStyle } from "./comparison-state";
 import {
   DEFAULT_SIDEBAR_WIDTH,
-  MAX_SIDEBAR_WIDTH,
   MIN_SIDEBAR_WIDTH,
   clampSidebarWidth,
   forgetRunStylePreference,
@@ -81,7 +80,7 @@ describe("sidebar preferences", () => {
     const storage = new MemoryStorage();
     expect(readSidebarWidth(1440, storage)).toBe(DEFAULT_SIDEBAR_WIDTH);
     expect(clampSidebarWidth(10, 1440)).toBe(MIN_SIDEBAR_WIDTH);
-    expect(clampSidebarWidth(2_000, 4_000)).toBe(MAX_SIDEBAR_WIDTH);
+    expect(clampSidebarWidth(2_000, 4_000)).toBe(640);
     expect(clampSidebarWidth(600, 800)).toBe(320);
 
     expect(rememberSidebarWidth(412, 1440, storage)).toBe(412);

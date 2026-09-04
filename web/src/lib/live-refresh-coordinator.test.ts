@@ -20,12 +20,10 @@ describe("LiveRefreshCoordinator", () => {
     coordinator.invalidate("comparison", () => calls.push("latest"));
 
     expect(calls).toEqual(["first"]);
-    expect(coordinator.pendingCount).toBe(1);
     await vi.advanceTimersByTimeAsync(5_999);
     expect(calls).toEqual(["first"]);
     await vi.advanceTimersByTimeAsync(1);
     expect(calls).toEqual(["first", "latest"]);
-    expect(coordinator.pendingCount).toBe(0);
   });
 
   it("lets a final refresh bypass the cooldown without leaving stale work queued", () => {
@@ -40,7 +38,6 @@ describe("LiveRefreshCoordinator", () => {
     coordinator.invalidate("report", () => calls.push("finished"), true);
 
     expect(calls).toEqual(["running", "finished"]);
-    expect(coordinator.pendingCount).toBe(0);
   });
 
   it("forgets pending work and cooldown state when navigation changes", async () => {
@@ -57,7 +54,6 @@ describe("LiveRefreshCoordinator", () => {
     await vi.runAllTimersAsync();
 
     expect(calls).toEqual(["first", "new-view"]);
-    expect(coordinator.pendingCount).toBe(0);
   });
 
   it("bounds remembered and pending refresh identities", () => {

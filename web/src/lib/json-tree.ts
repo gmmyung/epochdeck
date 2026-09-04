@@ -1,7 +1,7 @@
 export const JSON_TREE_PAGE_SIZE = 100;
 export const JSON_TREE_SEARCH_MAX_LENGTH = 256;
 
-export type JsonTreeSearchChild = {
+type JsonTreeSearchChild = {
   name: string;
   value: unknown;
   match: JsonTreeSearchMatch;

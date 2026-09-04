@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path, PurePosixPath
 from threading import Lock
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from epochdeck._limits import (
     MAX_ARTIFACT_ALIAS_BYTES,
@@ -83,9 +83,15 @@ _MEDIA_KINDS = {
     "image-file": "image",
     "video-file": "video",
 }
-_TERMINAL_RUN_STATES = frozenset({"finished", "failed", "crashed", "killed"})
+_TERMINAL_RUN_STATES = frozenset({"finished", "failed", "crashed", "killed", "preempted"})
 
 _T = TypeVar("_T")
+
+
+class _IdentityDigest(Protocol):
+    def update(self, value: bytes) -> None: ...
+
+    def digest(self) -> bytes: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +107,24 @@ class ImportResult:
 class _SourceRevision:
     state: str
     updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoryProgress:
+    rows_committed: int
+    media_rows_committed: int
+    next_sequence: int
+    unsupported_values: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRunImport:
+    source: Any
+    source_id: str
+    phase: str
+    run_id: str
+    source_revision: _SourceRevision
+    source_metadata: dict[str, str]
 
 
 def _retry_wandb_read(
@@ -132,7 +156,7 @@ def _retrying_wandb_reads(
     resume_key: Callable[[_T], str] | None = None,
 ) -> Iterator[_T]:
     emitted = 0
-    emitted_keys: list[str] = []
+    emitted_identity = hashlib.sha256()
     failures = 0
     iterator: Iterator[_T] | None = None
     while True:
@@ -141,14 +165,20 @@ def _retrying_wandb_reads(
         try:
             if iterator is None:
                 iterator = iter(factory())
-                for index in range(emitted):
+                replayed_identity = hashlib.sha256()
+                for _ in range(emitted):
                     cancellation.check()
                     resumed_item = next(iterator)
-                    if resume_key is not None and resume_key(resumed_item) != emitted_keys[index]:
-                        raise WandbImportError(
-                            f"{description} changed identity or order while resuming after "
-                            "a transient failure"
-                        )
+                    if resume_key is not None:
+                        _update_identity(replayed_identity, resume_key(resumed_item))
+                if (
+                    resume_key is not None
+                    and replayed_identity.digest() != emitted_identity.digest()
+                ):
+                    raise WandbImportError(
+                        f"{description} changed identity or order while resuming after "
+                        "a transient failure"
+                    )
             positioning = False
             item = next(iterator)
         except StopIteration:
@@ -171,8 +201,14 @@ def _retrying_wandb_reads(
         failures = 0
         emitted += 1
         if resume_key is not None:
-            emitted_keys.append(resume_key(item))
+            _update_identity(emitted_identity, resume_key(item))
         yield item
+
+
+def _update_identity(digest: _IdentityDigest, value: str) -> None:
+    encoded = value.encode("utf-8")
+    digest.update(len(encoded).to_bytes(8, "big"))
+    digest.update(encoded)
 
 
 def _is_transient_wandb_read_error(error: Exception) -> bool:
@@ -390,7 +426,7 @@ def import_wandb_runs(
         source_loader = _SourceRunLoader(source_api, cancellation)
         selected = completed = skipped = failed = 0
         failures: list[str] = []
-        pending: list[tuple[str, Future[str]]] = []
+        pending: deque[tuple[str, Future[str]]] = deque()
         discovered_source_ids: set[str] = set()
 
         def collect(source_id: str, future: Future[str]) -> None:
@@ -448,7 +484,7 @@ def import_wandb_runs(
                 pending.append((source_id, future))
                 selected += 1
                 if len(pending) >= workers:
-                    collect(*pending.pop(0))
+                    collect(*pending.popleft())
             for item in pending:
                 collect(*item)
         except BaseException as error:
@@ -480,51 +516,116 @@ def _import_one_run(
     include_files: bool,
     cancellation: ImportCancellation,
 ) -> str:
-    cancellation.check()
-    source_id = _required_text(source, "id")
-    source = source_loader.refresh(
+    prepared = _prepare_run_import(
+        source,
+        source_loader,
+        client,
+        checkpoint,
+        entity=entity,
+        project=project,
+        target_project=target_project,
+        include_files=include_files,
+        cancellation=cancellation,
+    )
+    if prepared is None:
+        return "skipped"
+    source = prepared.source
+    source_id = prepared.source_id
+    phase = prepared.phase
+    run_id = prepared.run_id
+    source_revision = prepared.source_revision
+    source_metadata = prepared.source_metadata
+
+    progress = _import_history(
+        source,
+        client,
+        checkpoint,
+        source_id=source_id,
+        run_id=run_id,
+        source_metadata=source_metadata,
+        phase=phase,
+        include_files=include_files,
+        cancellation=cancellation,
+    )
+
+    if phase == _PHASE_HISTORY:
+        phase = _PHASE_RUN_FILES if include_files else _PHASE_FINALIZE
+        checkpoint.update(
+            source_id,
+            phase=phase,
+            rows_committed=progress.rows_committed,
+            media_rows_committed=progress.media_rows_committed,
+            next_sequence=progress.next_sequence,
+            unsupported_values=progress.unsupported_values,
+        )
+
+    if include_files and phase == _PHASE_RUN_FILES:
+        _import_run_files(
+            source,
+            client,
+            checkpoint,
+            source_id,
+            run_id,
+            source_metadata,
+            cancellation,
+        )
+        phase = _PHASE_LOGGED_ARTIFACTS
+        checkpoint.update(source_id, phase=phase)
+    if include_files and phase == _PHASE_LOGGED_ARTIFACTS:
+        _import_logged_artifacts(
+            source,
+            client,
+            checkpoint,
+            source_id,
+            run_id,
+            source_metadata,
+            cancellation,
+        )
+        phase = _PHASE_FINALIZE
+        checkpoint.update(source_id, phase=phase)
+
+    if phase != _PHASE_FINALIZE:
+        raise WandbImportError(f"cannot finalize W&B import from checkpoint phase {phase!r}")
+
+    _finalize_import(
+        source_loader,
+        client,
+        checkpoint,
         entity=entity,
         project=project,
         source_id=source_id,
+        run_id=run_id,
+        source_revision=source_revision,
+        source_metadata=source_metadata,
+        progress=progress,
+        cancellation=cancellation,
     )
+    return "completed"
+
+
+def _prepare_run_import(
+    source: Any,
+    source_loader: _SourceRunLoader,
+    client: EpochDeckClient,
+    checkpoint: Checkpoint,
+    *,
+    entity: str,
+    project: str,
+    target_project: str,
+    include_files: bool,
+    cancellation: ImportCancellation,
+) -> _PreparedRunImport | None:
     cancellation.check()
-    state = checkpoint.state(source_id)
-    if state:
-        phase = _checkpoint_phase(state)
-        checkpoint_include_files = _checkpoint_include_files(state)
-        if checkpoint_include_files != include_files:
-            raise WandbImportError(
-                "checkpoint include_files contract does not match this W&B import"
-            )
-    else:
-        phase = _PHASE_HISTORY
-        checkpoint.update(source_id, phase=phase, include_files=include_files)
-        state = checkpoint.state(source_id)
+    source_id = _required_text(source, "id")
+    state, phase = _resume_import_state(checkpoint, source_id, include_files)
+    source = source_loader.refresh(entity=entity, project=project, source_id=source_id)
+    cancellation.check()
     source_revision = _retry_wandb_read(
         lambda: _source_revision(source),
         cancellation,
         f"W&B source revision read for {source_id!r}",
     )
-    if source_revision.state not in _TERMINAL_RUN_STATES:
-        raise WandbImportError(
-            f"W&B run {source_id!r} is not terminal (state={source_revision.state!r})"
-        )
-    stored_updated_at = state.get("source_updated_at")
-    stored_source_state = state.get("source_state")
-    if stored_updated_at is not None or stored_source_state is not None:
-        if not isinstance(stored_updated_at, str) or not isinstance(stored_source_state, str):
-            raise WandbImportError("checkpoint has an incomplete W&B source revision")
-        if (stored_source_state, stored_updated_at) != (
-            source_revision.state,
-            source_revision.updated_at,
-        ):
-            raise _source_changed_error(source_id, "after import began")
-    checkpoint_complete = state.get("status") == "complete"
-    if checkpoint_complete:
-        if stored_updated_at is None:
-            raise WandbImportError("completed checkpoint has no W&B source revision")
-        if phase != _PHASE_COMPLETE:
-            raise WandbImportError("completed checkpoint is not in the complete import phase")
+    checkpoint_complete = _validate_source_revision(state, phase, source_id, source_revision)
 
     run_id = str(
         uuid.uuid5(
@@ -538,12 +639,12 @@ def _import_one_run(
     if checkpoint_complete and stored_run_id is None:
         raise WandbImportError("completed checkpoint has no deterministic EpochDeck run ID")
     source_url = _retry_wandb_read(
-        lambda: str(getattr(source, "url", "")),
+        lambda: _optional_text(source, "url"),
         cancellation,
         f"W&B source URL read for {source_id!r}",
     )
     source_name = _retry_wandb_read(
-        lambda: str(getattr(source, "name", "")),
+        lambda: _optional_text(source, "name"),
         cancellation,
         f"W&B source name read for {source_id!r}",
     )
@@ -569,25 +670,15 @@ def _import_one_run(
         raise WandbImportError("W&B config uses reserved key '_epochdeck_wandb_source'")
     config["_epochdeck_wandb_source"] = source_metadata
     config = _json_document(config, "W&B config", _MAX_RUN_DOCUMENT_BYTES)
-    try:
-        cancellation.check()
-        record = client.get_run(run_id)
-        cancellation.check()
-    except EpochDeckApiError as error:
-        if error.status_code != 404:
-            raise
-        if checkpoint_complete:
-            raise WandbImportError("completed checkpoint target run does not exist") from error
-        cancellation.check()
-        created = client.create_run(
-            project=target_project,
-            run_id=run_id,
-            name=source_name or source_id,
-            config=config,
-            resume="never",
-        )
-        cancellation.check()
-        record = _object(created, "run")
+    record = _get_or_create_target_run(
+        client,
+        target_project=target_project,
+        run_id=run_id,
+        run_name=source_name or source_id,
+        config=config,
+        checkpoint_complete=checkpoint_complete,
+        cancellation=cancellation,
+    )
     existing_source = _object(record, "config").get("_epochdeck_wandb_source")
     if record.get("project") != target_project:
         raise WandbImportError(f"deterministic EpochDeck run ID collision: {run_id}")
@@ -598,11 +689,23 @@ def _import_one_run(
     if checkpoint_complete:
         if record.get("state") != "finished":
             raise WandbImportError("completed checkpoint target run is not finished")
-        return "skipped"
+        return None
     if record.get("state") == "finished":
         if phase != _PHASE_FINALIZE:
             raise WandbImportError(
                 f"finished target run cannot recover from checkpoint phase {phase!r}"
+            )
+        summary = record.get("summary")
+        expected_source = {
+            **source_metadata,
+            "unsupported_history_values": _state_int(state, "unsupported_values", 0),
+        }
+        if (
+            not isinstance(summary, Mapping)
+            or summary.get("_epochdeck_wandb_source") != expected_source
+        ):
+            raise WandbImportError(
+                "finished target run does not contain the expected imported W&B summary"
             )
         checkpoint.update(
             source_id,
@@ -612,7 +715,7 @@ def _import_one_run(
             source_updated_at=source_revision.updated_at,
             source_state=source_revision.state,
         )
-        return "skipped"
+        return None
 
     checkpoint.update(
         source_id,
@@ -622,6 +725,104 @@ def _import_one_run(
         source_updated_at=source_revision.updated_at,
         source_state=source_revision.state,
     )
+    return _PreparedRunImport(
+        source=source,
+        source_id=source_id,
+        phase=phase,
+        run_id=run_id,
+        source_revision=source_revision,
+        source_metadata=source_metadata,
+    )
+
+
+def _resume_import_state(
+    checkpoint: Checkpoint,
+    source_id: str,
+    include_files: bool,
+) -> tuple[dict[str, Any], str]:
+    state = checkpoint.state(source_id)
+    if not state:
+        checkpoint.update(source_id, phase=_PHASE_HISTORY, include_files=include_files)
+        return checkpoint.state(source_id), _PHASE_HISTORY
+    phase = _checkpoint_phase(state)
+    if _checkpoint_include_files(state) != include_files:
+        raise WandbImportError("checkpoint include_files contract does not match this W&B import")
+    return state, phase
+
+
+def _validate_source_revision(
+    state: Mapping[str, Any],
+    phase: str,
+    source_id: str,
+    source_revision: _SourceRevision,
+) -> bool:
+    if source_revision.state not in _TERMINAL_RUN_STATES:
+        raise WandbImportError(
+            f"W&B run {source_id!r} is not terminal (state={source_revision.state!r})"
+        )
+    stored_updated_at = state.get("source_updated_at")
+    stored_source_state = state.get("source_state")
+    if stored_updated_at is not None or stored_source_state is not None:
+        if not isinstance(stored_updated_at, str) or not isinstance(stored_source_state, str):
+            raise WandbImportError("checkpoint has an incomplete W&B source revision")
+        if (stored_source_state, stored_updated_at) != (
+            source_revision.state,
+            source_revision.updated_at,
+        ):
+            raise _source_changed_error(source_id, "after import began")
+    checkpoint_complete = state.get("status") == "complete"
+    if checkpoint_complete:
+        if stored_updated_at is None:
+            raise WandbImportError("completed checkpoint has no W&B source revision")
+        if phase != _PHASE_COMPLETE:
+            raise WandbImportError("completed checkpoint is not in the complete import phase")
+    return checkpoint_complete
+
+
+def _get_or_create_target_run(
+    client: EpochDeckClient,
+    *,
+    target_project: str,
+    run_id: str,
+    run_name: str,
+    config: dict[str, Any],
+    checkpoint_complete: bool,
+    cancellation: ImportCancellation,
+) -> dict[str, Any]:
+    try:
+        cancellation.check()
+        record = client.get_run(run_id)
+        cancellation.check()
+        return record
+    except EpochDeckApiError as error:
+        if error.status_code != 404:
+            raise
+        if checkpoint_complete:
+            raise WandbImportError("completed checkpoint target run does not exist") from error
+    cancellation.check()
+    created = client.create_run(
+        project=target_project,
+        run_id=run_id,
+        name=run_name,
+        config=config,
+        resume="never",
+    )
+    cancellation.check()
+    return _object(created, "run")
+
+
+def _import_history(
+    source: Any,
+    client: EpochDeckClient,
+    checkpoint: Checkpoint,
+    *,
+    source_id: str,
+    run_id: str,
+    source_metadata: dict[str, str],
+    phase: str,
+    include_files: bool,
+    cancellation: ImportCancellation,
+) -> _HistoryProgress:
     state = checkpoint.state(source_id)
     rows_committed = _state_int(state, "rows_committed", 0)
     next_sequence = _state_int(state, "next_sequence", 1)
@@ -666,6 +867,7 @@ def _import_one_run(
                     lambda: source.scan_history(page_size=history_page_size),
                     cancellation,
                     f"W&B history scan for {source_id!r}",
+                    resume_key=_history_row_identity,
                 )
         else:
             history = ()
@@ -802,45 +1004,28 @@ def _import_one_run(
                     )
         raise
 
-    if phase == _PHASE_HISTORY:
-        phase = _PHASE_RUN_FILES if include_files else _PHASE_FINALIZE
-        checkpoint.update(
-            source_id,
-            phase=phase,
-            rows_committed=rows_committed,
-            media_rows_committed=media_rows_committed,
-            next_sequence=next_sequence,
-            unsupported_values=unsupported_values,
-        )
+    return _HistoryProgress(
+        rows_committed=rows_committed,
+        media_rows_committed=media_rows_committed,
+        next_sequence=next_sequence,
+        unsupported_values=unsupported_values,
+    )
 
-    if include_files and phase == _PHASE_RUN_FILES:
-        _import_run_files(
-            source,
-            client,
-            checkpoint,
-            source_id,
-            run_id,
-            source_metadata,
-            cancellation,
-        )
-        phase = _PHASE_LOGGED_ARTIFACTS
-        checkpoint.update(source_id, phase=phase)
-    if include_files and phase == _PHASE_LOGGED_ARTIFACTS:
-        _import_logged_artifacts(
-            source,
-            client,
-            checkpoint,
-            source_id,
-            run_id,
-            source_metadata,
-            cancellation,
-        )
-        phase = _PHASE_FINALIZE
-        checkpoint.update(source_id, phase=phase)
 
-    if phase != _PHASE_FINALIZE:
-        raise WandbImportError(f"cannot finalize W&B import from checkpoint phase {phase!r}")
-
+def _finalize_import(
+    source_loader: _SourceRunLoader,
+    client: EpochDeckClient,
+    checkpoint: Checkpoint,
+    *,
+    entity: str,
+    project: str,
+    source_id: str,
+    run_id: str,
+    source_revision: _SourceRevision,
+    source_metadata: dict[str, str],
+    progress: _HistoryProgress,
+    cancellation: ImportCancellation,
+) -> None:
     cancellation.check()
     refreshed_source = source_loader.refresh(
         entity=entity,
@@ -870,7 +1055,7 @@ def _import_one_run(
         raise WandbImportError("W&B summary uses reserved key '_epochdeck_wandb_source'")
     summary["_epochdeck_wandb_source"] = {
         **source_metadata,
-        "unsupported_history_values": unsupported_values,
+        "unsupported_history_values": progress.unsupported_values,
     }
     summary = _json_document(summary, "W&B summary", _MAX_RUN_DOCUMENT_BYTES)
     cancellation.check()
@@ -880,15 +1065,14 @@ def _import_one_run(
         source_id,
         status="complete",
         phase=_PHASE_COMPLETE,
-        rows_committed=rows_committed,
-        media_rows_committed=media_rows_committed,
-        next_sequence=next_sequence,
-        unsupported_values=unsupported_values,
+        rows_committed=progress.rows_committed,
+        media_rows_committed=progress.media_rows_committed,
+        next_sequence=progress.next_sequence,
+        unsupported_values=progress.unsupported_values,
         source_updated_at=source_revision.updated_at,
         source_state=source_revision.state,
         error=None,
     )
-    return "completed"
 
 
 def _commit_metric_batch(
@@ -1046,6 +1230,7 @@ def _import_run_files(
         source.files,
         cancellation,
         f"W&B run file listing for {source_id!r}",
+        resume_key=lambda source_file: _required_text(source_file, "name"),
     )
     for index, source_file in enumerate(source_files):
         cancellation.check()
@@ -1077,6 +1262,8 @@ def _import_run_files(
             cancellation=cancellation,
         )
         files_committed = seen
+    if seen < files_committed:
+        raise WandbImportError("W&B run file listing became shorter after import began")
     checkpoint.update(source_id, files_committed=files_committed, files_complete=True)
 
 
@@ -1157,7 +1344,7 @@ def _import_logged_artifacts(
         )
     committed = _state_int(state, "logged_artifacts_committed", 0)
     seen = 0
-    pending: list[tuple[int, Future[None]]] = []
+    pending: deque[tuple[int, Future[None]]] = deque()
 
     def collect(index: int, future: Future[None]) -> None:
         nonlocal committed
@@ -1175,6 +1362,7 @@ def _import_logged_artifacts(
             lambda: list_artifacts(per_page=100),
             cancellation,
             f"W&B logged artifact listing for {source_id!r}",
+            resume_key=_source_artifact_identity,
         )
         for index, artifact in enumerate(artifacts):
             cancellation.check()
@@ -1195,7 +1383,7 @@ def _import_logged_artifacts(
                 )
             )
             if len(pending) >= _ARTIFACT_WORKERS:
-                collect(*pending.pop(0))
+                collect(*pending.popleft())
         for item in pending:
             collect(*item)
     except BaseException as error:
@@ -1206,6 +1394,8 @@ def _import_logged_artifacts(
         raise
     finally:
         executor.shutdown(wait=not cancellation.cancelled, cancel_futures=True)
+    if seen < committed:
+        raise WandbImportError("W&B logged artifact listing became shorter after import began")
     checkpoint.update(
         source_id,
         logged_artifacts_committed=max(committed, seen),
@@ -1221,10 +1411,8 @@ def _import_logged_artifact(
     cancellation: ImportCancellation,
 ) -> None:
     cancellation.check()
-    qualified_name = str(getattr(source_artifact, "qualified_name", ""))
-    source_id = str(getattr(source_artifact, "id", "")) or qualified_name
-    if not source_id:
-        raise WandbImportError("W&B artifact has no stable identity")
+    qualified_name = _optional_text(source_artifact, "qualified_name")
+    source_id = _source_artifact_identity(source_artifact)
     source_name = _required_text(source_artifact, "name")
     source_version, target_version = _artifact_version(source_artifact, source_name)
     target_name = source_name.removesuffix(f":{source_version}")
@@ -1265,6 +1453,7 @@ def _import_logged_artifact(
         lambda: source_artifact.files(per_page=100),
         cancellation,
         f"W&B artifact file listing for {source_name!r}",
+        resume_key=lambda source_file: _required_text(source_file, "name"),
     )
     for source_file in source_artifact_files:
         cancellation.check()
@@ -1308,6 +1497,15 @@ def _import_logged_artifact(
         cancellation.check()
         client.create_artifact(run_id, request)
         cancellation.check()
+
+
+def _source_artifact_identity(source_artifact: Any) -> str:
+    source_id = _optional_text(source_artifact, "id") or _optional_text(
+        source_artifact, "qualified_name"
+    )
+    if not source_id:
+        raise WandbImportError("W&B artifact has no stable identity")
+    return source_id
 
 
 def _history_page_size(source: Any) -> int:
@@ -1423,7 +1621,11 @@ def _history_values(
                 )
             metrics[prefix] = float(value)
         elif isinstance(value, (int, float)):
-            number = float(value)
+            try:
+                number = float(value)
+            except OverflowError:
+                skipped += 1
+                continue
             if not math.isfinite(number):
                 skipped += 1
             else:
@@ -1480,7 +1682,10 @@ def _bounded_media_reference(value: Mapping[Any, Any], path: str) -> dict[str, A
         if isinstance(item, str):
             reference[name] = item
         elif isinstance(item, (int, float)) and not isinstance(item, bool):
-            number = float(item)
+            try:
+                number = float(item)
+            except OverflowError:
+                continue
             if math.isfinite(number):
                 reference[name] = item
     if _json_size(reference) > _MAX_SOURCE_MEDIA_REFERENCE_BYTES:
@@ -1561,7 +1766,12 @@ def _import_media_reference(
 
 def _history_step(row: Mapping[str, Any], row_index: int) -> int:
     value = row.get("_step", row_index)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) != value:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or (isinstance(value, float) and not math.isfinite(value))
+        or int(value) != value
+    ):
         raise WandbImportError(f"W&B history row {row_index} has an invalid _step")
     step = int(value)
     if step < 0 or step > MAX_SAFE_INTEGER:
@@ -1575,14 +1785,31 @@ def _history_timestamp_ms(row: Mapping[str, Any], row_index: int) -> int:
     value = row.get("_timestamp")
     if value is None:
         return row_index
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or (isinstance(value, float) and not math.isfinite(value))
+    ):
         raise WandbImportError(f"W&B history row {row_index} has an invalid _timestamp")
-    timestamp_ms = round(float(value) * 1_000)
+    try:
+        timestamp_ms = round(float(value) * 1_000)
+    except OverflowError as error:
+        raise WandbImportError(f"W&B history row {row_index} has an invalid _timestamp") from error
     if timestamp_ms < 0 or timestamp_ms > MAX_SAFE_INTEGER:
         raise WandbImportError(
             f"W&B history row {row_index} has an _timestamp outside 0..{MAX_SAFE_INTEGER}"
         )
     return timestamp_ms
+
+
+def _history_row_identity(row: Any) -> str:
+    if not isinstance(row, Mapping):
+        raise WandbImportError("W&B history yielded a non-object row")
+    positions = [row.get(name) for name in ("_step", "_timestamp")]
+    try:
+        return json.dumps(positions, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError) as error:
+        raise WandbImportError("W&B history row has invalid position metadata") from error
 
 
 def _downloaded_path(downloaded: Any, root: Path, artifact_path: str) -> Path:
@@ -1750,6 +1977,15 @@ def _required_text(value: Any, field: str) -> str:
     result = getattr(value, field, None)
     if not isinstance(result, str) or not result:
         raise WandbImportError(f"W&B object has no non-empty {field}")
+    return result
+
+
+def _optional_text(value: Any, field: str) -> str:
+    result = getattr(value, field, None)
+    if result is None:
+        return ""
+    if not isinstance(result, str):
+        raise WandbImportError(f"W&B object has invalid {field}")
     return result
 
 

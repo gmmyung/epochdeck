@@ -8,11 +8,9 @@ import {
   getDashboardConfig,
   getAlertPage,
   getArtifact,
-  getArtifactLineagePage,
   getChartHistory,
   getComparisonChartHistory,
   getHealth,
-  getHistory,
   getProjectMetricCatalogPage,
   getProject,
   getProjectPage,
@@ -25,7 +23,6 @@ import {
   getRunArtifactPage,
   getRunPage,
   getRunSummariesByIds,
-  getSampledHistory,
   getTrace,
   getTracePage,
 } from "./api";
@@ -70,49 +67,17 @@ describe("getHealth", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/dashboard/config", { signal: undefined });
   });
 
-  it("encodes project names and requests only selected history columns", async () => {
+  it("encodes project names", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ runs: [], next_before: null }), { status: 200 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            run_id: "run-id",
-            sequence: [],
-            step: [],
-            timestamp_ms: [],
-            metrics: { loss: [] },
-            next_after: null,
-          }),
-          { status: 200 },
-        ),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            run_id: "run-id",
-            sequence: [],
-            step: [],
-            timestamp_ms: [],
-            metrics: { loss: [] },
-            next_after: null,
-            sampled: true,
-            source_points: 200_000,
-          }),
-          { status: 200 },
-        ),
       );
     vi.stubGlobal("fetch", fetchMock);
 
     await getRunPage("robot learning");
-    await getHistory("run-id", ["loss"], 500);
-    await getSampledHistory("run-id", ["loss"], 1_200);
 
     expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/projects/robot%20learning/runs?limit=100");
-    expect(fetchMock.mock.calls[1][0]).toBe("/api/v1/runs/run-id/history?limit=500&key=loss");
-    expect(fetchMock.mock.calls[2][0]).toBe("/api/v1/runs/run-id/history?max_points=1200&key=loss");
   });
 
   it("loads cursor pages for projects, searched runs, and report summaries", async () => {
@@ -175,35 +140,17 @@ describe("getHealth", () => {
     ]);
   });
 
-  it("loads one run and encodes a bounded delta cursor", async () => {
+  it("loads one run", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ id: "run-id", metric_revision: 4 }), { status: 200 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            run_id: "run-id",
-            sequence: [],
-            step: [],
-            timestamp_ms: [],
-            metrics: { loss: [] },
-            next_after: null,
-            source_last_sequence: 42,
-          }),
-          { status: 200 },
-        ),
       );
     vi.stubGlobal("fetch", fetchMock);
 
     await getRun("run-id");
-    await getHistory("run-id", ["loss"], 257, undefined, 42);
 
     expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/runs/run-id");
-    expect(fetchMock.mock.calls[1][0]).toBe(
-      "/api/v1/runs/run-id/history?limit=257&key=loss&after=42",
-    );
   });
 
   it("polls an exact bounded run set with lightweight summaries", async () => {
@@ -231,6 +178,7 @@ describe("getHealth", () => {
         JSON.stringify({
           keys: [{ key: "comma,key", run_ids: ["run/a"] }],
           next_after: "loss",
+          total_count: 37,
         }),
         { status: 200 },
       ),
@@ -249,6 +197,7 @@ describe("getHealth", () => {
     ).resolves.toEqual({
       items: [{ key: "comma,key", run_ids: ["run/a"] }],
       nextAfter: "loss",
+      totalCount: 37,
     });
     expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/projects/robot%20learning/metrics/query");
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
@@ -467,17 +416,6 @@ describe("getHealth", () => {
       )
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ id: "artifact/id", entries: [] }), { status: 200 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            artifact_id: "artifact/id",
-            relation: "output",
-            runs: [],
-            next_before: "run/id",
-          }),
-          { status: 200 },
-        ),
       );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -488,14 +426,9 @@ describe("getHealth", () => {
       nextCursor: { before: "artifact/id", relation: "input" },
     });
     await expect(getArtifact("artifact/id")).resolves.toMatchObject({ id: "artifact/id" });
-    await expect(getArtifactLineagePage("artifact/id", "output", "run/id")).resolves.toEqual({
-      items: [],
-      nextBefore: "run/id",
-    });
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       "/api/v1/runs/run%2Fid/artifacts?limit=100&before=previous%2Fid&before_relation=output",
       "/api/v1/artifacts/artifact%2Fid",
-      "/api/v1/artifacts/artifact%2Fid/lineage?limit=100&before=run%2Fid&relation=output",
     ]);
     expect(artifactFileUrl("artifact/id", "checkpoints/best model.bin")).toBe(
       "/api/v1/artifacts/artifact%2Fid/files/checkpoints/best%20model.bin",

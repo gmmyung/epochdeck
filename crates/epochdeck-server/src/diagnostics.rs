@@ -3,7 +3,7 @@ use std::path::Path;
 
 use epochdeck_protocol::{StorageRootDiagnostics, StorageRootKind};
 
-pub(crate) fn collect_storage_root_diagnostics(
+pub(super) fn collect_storage_root_diagnostics(
     catalog_path: &Path,
     metrics_path: &Path,
     blobs_path: &Path,

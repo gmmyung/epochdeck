@@ -54,6 +54,7 @@ describe("metric run counts", () => {
         runs,
         selectedRunCount: runs.length,
         catalog: [{ key: "train/loss", run_ids: ["run-a", "run-b"] }],
+        totalCount: 1,
         catalogLoading: false,
         catalogError: null,
         search: "",
@@ -84,6 +85,12 @@ describe("metric run counts", () => {
     expect(heading.querySelector("small")?.textContent?.trim()).toBe("2 runs");
     expect(heading.textContent).not.toContain("2/4 runs");
     expect(heading.textContent).not.toContain("4 runs");
+    expect(target.querySelector(".metrics-toolbar")?.textContent?.replace(/\s+/g, " ")).toContain(
+      "1 metric",
+    );
+    expect(target.querySelector(".metric-pagination")?.textContent?.replace(/\s+/g, " ")).toContain(
+      "1–1 of 1 metric",
+    );
 
     await unmount(component);
     target.remove();

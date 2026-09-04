@@ -45,21 +45,21 @@
   let summary: HTMLElement;
 
   onMount(() => {
+    const isOwnedSelectTarget = (target: EventTarget | null) =>
+      target instanceof Element &&
+      target.closest("[data-select-content]") !== null &&
+      settings.querySelector('[data-select-trigger][data-state="open"]') !== null;
     const keydown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || !open) return;
-      if (
-        event.target instanceof Element &&
-        settings.contains(event.target) &&
-        event.target.closest('[role="listbox"]')
-      ) {
-        return;
-      }
+      if (isOwnedSelectTarget(event.target)) return;
       event.preventDefault();
       event.stopImmediatePropagation();
       close(true);
     };
     const pointerdown = (event: PointerEvent) => {
-      if (open && !settings.contains(event.target as Node)) close(false);
+      if (open && !settings.contains(event.target as Node) && !isOwnedSelectTarget(event.target)) {
+        close(false);
+      }
     };
     document.addEventListener("keydown", keydown, true);
     document.addEventListener("pointerdown", pointerdown);

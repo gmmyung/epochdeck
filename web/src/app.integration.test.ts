@@ -99,7 +99,7 @@ describe("dashboard orchestration", () => {
         });
       }
       if (path === "/api/v1/projects/hidden-project/metrics/query") {
-        return json({ keys: [], next_after: null });
+        return json({ keys: [], next_after: null, total_count: 0 });
       }
       return json({ code: "unexpected_request", message: path }, 500);
     });
@@ -301,7 +301,7 @@ describe("dashboard orchestration", () => {
         });
       }
       if (path === "/api/v1/projects/hidden-project/metrics/query") {
-        return json({ keys: [], next_after: null });
+        return json({ keys: [], next_after: null, total_count: 0 });
       }
       return json({ code: "unexpected_request", message: path }, 500);
     });
@@ -406,7 +406,7 @@ describe("dashboard orchestration", () => {
         });
       }
       if (path === "/api/v1/projects/hidden-project/metrics/query") {
-        return json({ keys: [], next_after: null });
+        return json({ keys: [], next_after: null, total_count: 0 });
       }
       return json({ code: "unexpected_request", message: path }, 500);
     });
@@ -479,6 +479,7 @@ describe("dashboard orchestration", () => {
         return json({
           keys: [{ key: "train/loss", run_ids: [HIDDEN_RUN, LISTED_RUN_A] }],
           next_after: null,
+          total_count: 1,
         });
       }
       if (path === "/api/v1/projects/hidden-project/chart-history/query") {
@@ -537,7 +538,10 @@ describe("dashboard orchestration", () => {
         ],
       }),
     );
-    await vi.waitFor(() => expect(target.querySelectorAll("canvas")).toHaveLength(2));
+    await vi.waitFor(() =>
+      expect(target.querySelectorAll(".chart-interaction-canvas")).toHaveLength(1),
+    );
+    expect(target.querySelector(".chart-uplot")).not.toBeNull();
     expect(target.textContent).not.toContain("Loading bounded histories");
 
     const historyCallsBefore = fetchMock.mock.calls.filter(
@@ -653,6 +657,7 @@ describe("dashboard orchestration", () => {
         return json({
           keys: [{ key: "train/loss", run_ids: [HIDDEN_RUN] }],
           next_after: null,
+          total_count: 1,
         });
       }
       if (path === "/api/v1/projects/hidden-project/chart-history/query") {
@@ -702,7 +707,11 @@ describe("dashboard orchestration", () => {
     expect(chartSignals.every((signal) => !signal.aborted)).toBe(true);
     expect(metricCatalogSignals[1]?.aborted).toBe(false);
     liveCatalogRefresh.resolve(
-      json({ keys: [{ key: "train/loss", run_ids: [HIDDEN_RUN] }], next_after: null }),
+      json({
+        keys: [{ key: "train/loss", run_ids: [HIDDEN_RUN] }],
+        next_after: null,
+        total_count: 1,
+      }),
     );
 
     await unmount(component);
@@ -760,6 +769,7 @@ describe("dashboard orchestration", () => {
         return json({
           keys: [{ key: "train/loss", run_ids: [HIDDEN_RUN] }],
           next_after: null,
+          total_count: 1,
         });
       }
       if (path.startsWith(`/api/v1/runs/${HIDDEN_RUN}/chart-history?`)) {

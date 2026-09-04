@@ -32,6 +32,12 @@ pub const MAX_SEGMENTS_PER_QUERY: usize = 256;
 const MIN_COMPACTION_INPUT_SEGMENTS: usize = 4;
 const MAX_COMPACTION_SIZE_RATIO: usize = 2;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMetricCatalogPage {
+    pub keys: Vec<ProjectMetricKeySummary>,
+    pub total_count: usize,
+}
+
 const CATALOG_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -1386,7 +1392,7 @@ impl Catalog {
         &self,
         project: &str,
         request: &ProjectMetricCatalogRequest,
-    ) -> Result<Vec<ProjectMetricKeySummary>, CatalogError> {
+    ) -> Result<ProjectMetricCatalogPage, CatalogError> {
         discovery::project_metric_catalog(&self.pool, project, request).await
     }
 
@@ -4105,14 +4111,16 @@ mod tests {
             .await?;
         assert_eq!(
             union
+                .keys
                 .iter()
                 .map(|summary| summary.key.as_str())
                 .collect::<Vec<_>>(),
             vec!["loss", "reward", "throughput"]
         );
+        assert_eq!(union.total_count, 3);
         let mut expected_loss_runs = run_ids[..2].to_vec();
         expected_loss_runs.sort_by_key(|run_id| run_id.to_string());
-        assert_eq!(union[0].run_ids, expected_loss_runs);
+        assert_eq!(union.keys[0].run_ids, expected_loss_runs);
 
         let intersection = catalog
             .project_metric_catalog(
@@ -4126,8 +4134,9 @@ mod tests {
                 },
             )
             .await?;
-        assert_eq!(intersection.len(), 1);
-        assert_eq!(intersection[0].key, "loss");
+        assert_eq!(intersection.keys.len(), 1);
+        assert_eq!(intersection.keys[0].key, "loss");
+        assert_eq!(intersection.total_count, 1);
 
         let search = catalog
             .project_metric_catalog(
@@ -4141,8 +4150,9 @@ mod tests {
                 },
             )
             .await?;
-        assert_eq!(search.len(), 1);
-        assert_eq!(search[0].key, "reward");
+        assert_eq!(search.keys.len(), 1);
+        assert_eq!(search.keys[0].key, "reward");
+        assert_eq!(search.total_count, 1);
 
         let after_loss = catalog
             .project_metric_catalog(
@@ -4156,7 +4166,8 @@ mod tests {
                 },
             )
             .await?;
-        assert_eq!(after_loss[0].key, "reward");
+        assert_eq!(after_loss.keys[0].key, "reward");
+        assert_eq!(after_loss.total_count, 3);
         assert!(matches!(
             catalog
                 .project_metric_catalog(
@@ -4185,7 +4196,8 @@ mod tests {
                 },
             )
             .await?;
-        assert!(empty_intersection.is_empty());
+        assert!(empty_intersection.keys.is_empty());
+        assert_eq!(empty_intersection.total_count, 0);
         assert!(matches!(
             catalog
                 .project_metric_catalog(
@@ -4328,12 +4340,13 @@ mod tests {
                     },
                 )
                 .await?;
-            if page.is_empty() {
+            if page.keys.is_empty() {
                 break;
             }
-            after = page.last().map(|summary| summary.key.clone());
-            let exhausted = page.len() < 200;
-            cataloged_keys.extend(page.into_iter().map(|summary| summary.key));
+            assert_eq!(page.total_count, total_keys);
+            after = page.keys.last().map(|summary| summary.key.clone());
+            let exhausted = page.keys.len() < 200;
+            cataloged_keys.extend(page.keys.into_iter().map(|summary| summary.key));
             if exhausted {
                 break;
             }

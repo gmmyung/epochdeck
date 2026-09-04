@@ -5,7 +5,7 @@ use std::time::Instant;
 use epochdeck_protocol::{IngestBatchRequest, MetricPoint, ProjectId, RunId};
 use epochdeck_storage::{
     ChartAxisExtentScanner, ChartCoordinate, ChartHistorySampler, ChartSamplingSpec,
-    ChartStepExtentScanner, CompactionSource, MetricStore, SegmentSource,
+    ChartStepExtentScanner, CompactionSource, MetricStore, MinMaxHistorySampler, SegmentSource,
 };
 use tempfile::tempdir;
 
@@ -92,14 +92,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compaction_elapsed = compaction_started.elapsed();
 
     let query_started = Instant::now();
-    let history = store.read_sampled_history(
-        run_id,
-        &segments,
-        &["metric_0".to_owned()],
-        1,
-        rows as u64,
-        5_000,
-    )?;
+    let history_keys = ["metric_0".to_owned()];
+    let mut history_sampler =
+        MinMaxHistorySampler::new(run_id, &history_keys, 1, rows as u64, 5_000)?;
+    history_sampler.read_segments_cancelable(&store, &segments, &AtomicBool::new(false))?;
+    let history = history_sampler.finish();
     let query_elapsed = query_started.elapsed();
 
     let chart_keys = ["metric_0".to_owned()];

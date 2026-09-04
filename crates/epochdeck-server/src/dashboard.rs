@@ -105,7 +105,7 @@ struct DashboardLogo {
 pub(super) async fn dashboard_config(
     State(state): State<AppState>,
 ) -> Json<DashboardConfigResponse> {
-    Json(state.dashboard.response.clone())
+    Json(state.dashboard.response)
 }
 
 pub(super) async fn dashboard_logo(State(state): State<AppState>) -> Response {

@@ -31,6 +31,7 @@
   import {
     chartViewportKey as viewportKey,
     normalizeChartViewport as normalizedViewport,
+    preserveNavigableHistory,
   } from "./lib/chart-request";
   import { BoundedRequestScheduler } from "./lib/bounded-request-scheduler";
   import { chartPreferenceIdentity } from "./lib/chart-preferences";
@@ -173,6 +174,7 @@
     target: HTMLElement;
   } | null = null;
   let metricCatalog: MetricCatalogEntry[] = [];
+  let metricCatalogTotalCount = 0;
   let metricCatalogNextAfter: string | null = null;
   let metricAfter: string | null = null;
   let metricCursorStack: Array<string | null> = [];
@@ -187,16 +189,6 @@
   let metricSearch = "";
   let traceSearch = "";
   let runResources = emptyRunResourceState();
-  let {
-    alerts,
-    richValues,
-    artifacts,
-    traces,
-    loadedTabs: loadedRunTabs,
-    loadingTabs: loadingRunTabs,
-    errors: runTabErrors,
-    loadingMoreTab,
-  } = runResources;
   const runResourceController = new RunResourceController((state) => {
     runResources = state;
   });
@@ -209,7 +201,6 @@
   let visibleMetrics = new Set<string>();
   let scheduledMetricStateKeys: Record<string, string> = {};
   let scheduledMetricBatchKeys: Record<string, string> = {};
-  let instantiatedMetricSignature = "";
   let fullRangeFlushScheduled = false;
   let fullRangeFlushFrame: number | null = null;
   let fullRangeFlushPolicy: ChartSchedulingPolicy = "abort-active";
@@ -233,34 +224,21 @@
   let metricCatalogController: AbortController | null = null;
   let metricSearchTimer: number | null = null;
 
-  $: ({
-    alerts,
-    richValues,
-    artifacts,
-    traces,
-    loadedTabs: loadedRunTabs,
-    loadingTabs: loadingRunTabs,
-    errors: runTabErrors,
-    loadingMoreTab,
-  } = runResources);
-
+  $: runsById = new Map(runs.map((run) => [run.id, run]));
   $: comparisonRuns = selectedRunIds.flatMap((runId) => {
-    const run = runs.find((candidate) => candidate.id === runId);
+    const run = runsById.get(runId);
     return run ? [run] : [];
   });
+  $: normalizedProjectSearch = projectSearch.trim().toLocaleLowerCase();
   $: filteredProjects = projects.filter(
     (project) =>
       project.name === selectedProject ||
-      project.name.toLocaleLowerCase().includes(projectSearch.trim().toLocaleLowerCase()),
+      project.name.toLocaleLowerCase().includes(normalizedProjectSearch),
   );
+  $: normalizedReportSearch = reportSearch.trim().toLocaleLowerCase();
   $: filteredReports = reports.filter((report) =>
-    report.name.toLocaleLowerCase().includes(reportSearch.trim().toLocaleLowerCase()),
+    report.name.toLocaleLowerCase().includes(normalizedReportSearch),
   );
-  $: pagedMetricSignature = JSON.stringify(metricCatalog.map((entry) => entry.key));
-  $: if (pagedMetricSignature !== instantiatedMetricSignature) {
-    instantiatedMetricSignature = pagedMetricSignature;
-    evictMetricsOutsidePage(new Set(metricCatalog.map((entry) => entry.key)));
-  }
 
   onMount(() => {
     const controller = new AbortController();
@@ -873,7 +851,8 @@
     metricCatalogController?.abort();
     if (selectedRunIds.length === 0) {
       metricCatalogController = null;
-      metricCatalog = [];
+      replaceMetricCatalog([]);
+      metricCatalogTotalCount = 0;
       metricCatalogNextAfter = null;
       metricAfter = null;
       metricCursorStack = [];
@@ -904,7 +883,8 @@
         controller.signal,
       );
       if (controller.signal.aborted || metricCatalogController !== controller) return null;
-      metricCatalog = page.items;
+      replaceMetricCatalog(page.items);
+      metricCatalogTotalCount = page.totalCount;
       metricCatalogNextAfter = page.nextAfter;
       metricAfter = requestedAfter;
       metricCursorStack = [...cursorStack];
@@ -935,7 +915,8 @@
     metricAfter = null;
     metricCursorStack = [];
     metricBackHistoryTruncated = false;
-    metricCatalog = [];
+    replaceMetricCatalog([]);
+    metricCatalogTotalCount = 0;
     metricCatalogNextAfter = null;
     metricCatalogError = null;
     metricCatalogLoading = selectedRunIds.length > 0;
@@ -1057,7 +1038,8 @@
     runDetailsById = {};
     selectedReport = null;
     metricCatalogController?.abort();
-    metricCatalog = [];
+    replaceMetricCatalog([]);
+    metricCatalogTotalCount = 0;
     metricCatalogNextAfter = null;
     metricAfter = null;
     metricCursorStack = [];
@@ -1247,7 +1229,14 @@
         if (selectedReport?.id !== report.id) return;
         if (scheduledReportRequestKeys[request.identity] !== publishedKey) return;
         if (reportRequestKey(request) !== publishedKey) return;
-        reportHistories = { ...reportHistories, [request.identity]: history };
+        reportHistories = {
+          ...reportHistories,
+          [request.identity]: preserveNavigableHistory(
+            reportHistories[request.identity],
+            history,
+            viewport,
+          ),
+        };
         reportHistoryRequestKeys = {
           ...reportHistoryRequestKeys,
           [request.identity]: publishedKey,
@@ -1481,7 +1470,11 @@
           if (!visibleMetrics.has(metric)) continue;
           if (scheduledMetricBatchKeys[metric] !== publishedKey) continue;
           if (viewportKey(metricViewports[metric] ?? null) === viewportKey(viewport)) {
-            nextHistories[metric] = comparisonResponseForMetric(response, metric);
+            nextHistories[metric] = preserveNavigableHistory(
+              nextHistories[metric],
+              comparisonResponseForMetric(response, metric),
+              viewport,
+            );
             nextHistoryKeys[metric] = stateKeys[metric];
           }
           finishMetricRequest(metric, publishedKey);
@@ -1562,7 +1555,7 @@
       plan.candidates.map((candidate) => ({
         metric: candidate.metric,
         revisions: candidate.runIds.map(
-          (runId) => [runId, runs.find((run) => run.id === runId)?.metric_revision ?? -1] as const,
+          (runId) => [runId, runsById.get(runId)?.metric_revision ?? -1] as const,
         ),
       })),
     );
@@ -1624,6 +1617,11 @@
       if (!metrics.has(metric)) evictMetricHistory(metric, true);
     }
     visibleMetrics = new Set([...visibleMetrics].filter((metric) => metrics.has(metric)));
+  }
+
+  function replaceMetricCatalog(entries: MetricCatalogEntry[]): void {
+    metricCatalog = entries;
+    evictMetricsOutsidePage(new Set(entries.map((entry) => entry.key)));
   }
 
   function queueVisibleMetrics(schedulingPolicy: ChartSchedulingPolicy = "abort-active"): void {
@@ -1705,7 +1703,7 @@
     return "step";
   }
 
-  function changeAlignment(_: string, alignment: RunAlignment): void {
+  function changeAlignment(alignment: RunAlignment): void {
     if (xAlignment === alignment) return;
     liveChartRefresh.forget("comparison");
     xAlignment = alignment;
@@ -1729,7 +1727,8 @@
     metricAfter = null;
     metricCursorStack = [];
     metricBackHistoryTruncated = false;
-    metricCatalog = [];
+    replaceMetricCatalog([]);
+    metricCatalogTotalCount = 0;
     metricCatalogNextAfter = null;
     await loadMetricCatalog(null, []);
     queueVisibleMetrics();
@@ -1819,13 +1818,6 @@
     }
   }
 
-  function currentComparisonRuns(): RunListItem[] {
-    return selectedRunIds.flatMap((runId) => {
-      const run = runs.find((candidate) => candidate.id === runId);
-      return run ? [run] : [];
-    });
-  }
-
   function currentPollingRuns(): RunListItem[] {
     const ids = selectedReport ? reportPanelRunIds(selectedReport) : selectedRunIds;
     const selected = new Set(ids.slice(0, 32));
@@ -1907,24 +1899,27 @@
   function runTabCount(tab: RunTab): number {
     if (tab === "summary") return Object.keys(selectedRun?.summary ?? {}).length;
     if (tab === "configuration") return Object.keys(selectedRun?.config ?? {}).length;
-    if (tab === "metrics") return metricCatalog.length;
     if (tab === "media") {
       return runResources.richKeys.reduce((total, key) => total + key.count, 0);
     }
-    if (tab === "traces") return traces.length;
-    return artifacts.length;
+    if (tab === "traces") return runResources.traces.length;
+    return runResources.artifacts.length;
   }
 
   function runTabCountLabel(tab: RunTab): string {
-    if (loadingRunTabs.has(tab) || (tab === "metrics" && metricCatalogLoading)) return "…";
-    if (["media", "traces", "artifacts"].includes(tab) && !loadedRunTabs.has(tab)) return "—";
+    if (runResources.loadingTabs.has(tab) || (tab === "metrics" && metricCatalogLoading)) {
+      return "…";
+    }
+    if (["media", "traces", "artifacts"].includes(tab) && !runResources.loadedTabs.has(tab)) {
+      return "—";
+    }
+    if (tab === "metrics") return metricCatalogTotalCount.toLocaleString();
     const hasMore =
       (tab === "media" && Boolean(runResources.richKeyCursor || runResources.truncatedRichKeys)) ||
       (tab === "traces" &&
         Boolean(runResources.traceCursor || runResources.truncatedTabs.has("traces"))) ||
       (tab === "artifacts" &&
-        Boolean(runResources.artifactCursor || runResources.truncatedTabs.has("artifacts"))) ||
-      (tab === "metrics" && Boolean(metricAfter || metricCatalogNextAfter));
+        Boolean(runResources.artifactCursor || runResources.truncatedTabs.has("artifacts")));
     return `${runTabCount(tab).toLocaleString()}${hasMore ? "+" : ""}`;
   }
 </script>
@@ -1944,30 +1939,6 @@
   class="app-shell"
   style={`--configured-accent: ${dashboardConfig.accent_color}; --series-accent: ${dashboardConfig.accent_color}`}
 >
-  <header>
-    <div class="brand">
-      <h1>
-        {#if dashboardConfig.logo_url && !dashboardLogoFailed}
-          <img
-            src={dashboardConfig.logo_url}
-            alt="EpochDeck"
-            onerror={() => (dashboardLogoFailed = true)}
-          />
-        {:else}
-          EpochDeck
-        {/if}
-      </h1>
-    </div>
-    <div class="status" class:failed={Boolean(error || refreshError || healthError)}>
-      <span class="status-dot" aria-hidden="true"></span>
-      {health
-        ? `${health.status} · v${health.version}`
-        : healthError
-          ? "status unavailable"
-          : "connecting"}
-    </div>
-  </header>
-
   <main class="content">
     {#if error}
       <div class="error" role="alert">
@@ -2032,6 +2003,16 @@
           loadingRuns={loadingRunNavigation}
           runError={runNavigationError}
           {selectionNotice}
+          logoUrl={dashboardConfig.logo_url && !dashboardLogoFailed
+            ? dashboardConfig.logo_url
+            : null}
+          statusText={health
+            ? `${health.status} · v${health.version}`
+            : healthError
+              ? "status unavailable"
+              : "connecting"}
+          statusFailed={Boolean(error || refreshError || healthError)}
+          onlogofailure={() => (dashboardLogoFailed = true)}
           onchooseproject={(project) => void chooseProject(project)}
           onloadprojects={() => void loadMoreProjects()}
           onchoosereport={(report) => void chooseReport(report)}
@@ -2094,11 +2075,11 @@
             <RunDocumentPanels
               run={selectedRun}
               activeTab={activeRunTab}
-              {alerts}
+              alerts={runResources.alerts}
               alertCursor={runResources.alertCursor}
               alertsTruncated={runResources.truncatedTabs.has("summary")}
-              alertError={runTabErrors.summary}
-              {loadingMoreTab}
+              alertError={runResources.errors.summary}
+              loadingMoreTab={runResources.loadingMoreTab}
               onretryalerts={() => retryRunTab("summary")}
               onloadalerts={() => void loadMore("summary")}
             />
@@ -2111,6 +2092,7 @@
               highlightedRunId={hoveredRunId}
               selectedRunCount={selectedRunIds.length}
               catalog={metricCatalog}
+              totalCount={metricCatalogTotalCount}
               catalogLoading={metricCatalogLoading}
               catalogError={metricCatalogError}
               search={metricSearch}
@@ -2126,7 +2108,7 @@
               errors={metricErrors}
               onsearch={changeMetricSearch}
               onmodechange={(mode) => void changeMetricMode(mode)}
-              onalignmentchange={(alignment) => changeAlignment("", alignment)}
+              onalignmentchange={changeAlignment}
               onretrycatalog={retryMetricCatalog}
               oncursor={(direction) => void changeMetricCursor(direction)}
               onretrymetric={retryMetric}
@@ -2137,9 +2119,9 @@
             <RunMediaPanel
               active={activeRunTab === "media"}
               state={runResources}
-              error={runTabErrors.media}
-              loading={loadingRunTabs.has("media")}
-              {loadingMoreTab}
+              error={runResources.errors.media}
+              loading={runResources.loadingTabs.has("media")}
+              loadingMoreTab={runResources.loadingMoreTab}
               onretry={() => retryRunTab("media")}
               onselectkey={selectRichKey}
               onloadkeys={loadMoreRichKeys}
@@ -2151,9 +2133,9 @@
               active={activeRunTab === "traces"}
               state={runResources}
               bind:search={traceSearch}
-              error={runTabErrors.traces}
-              loading={loadingRunTabs.has("traces")}
-              {loadingMoreTab}
+              error={runResources.errors.traces}
+              loading={runResources.loadingTabs.has("traces")}
+              loadingMoreTab={runResources.loadingMoreTab}
               onsearch={searchTraces}
               onretry={() => retryRunTab("traces")}
               onselectdetail={loadTraceDetail}
@@ -2163,9 +2145,9 @@
             <RunArtifactPanel
               active={activeRunTab === "artifacts"}
               state={runResources}
-              error={runTabErrors.artifacts}
-              loading={loadingRunTabs.has("artifacts")}
-              {loadingMoreTab}
+              error={runResources.errors.artifacts}
+              loading={runResources.loadingTabs.has("artifacts")}
+              loadingMoreTab={runResources.loadingMoreTab}
               onretry={() => retryRunTab("artifacts")}
               onselectdetail={loadArtifactDetail}
               onloadmore={() => void loadMore("artifacts")}

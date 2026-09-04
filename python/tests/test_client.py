@@ -67,6 +67,12 @@ def test_server_url_rejects_embedded_credentials() -> None:
         EpochDeckClient("https://proxy-user:proxy-password@epochdeck.test")
 
 
+@pytest.mark.parametrize("server_url", ["", "epochdeck.test", "ftp://epochdeck.test"])
+def test_server_url_requires_an_absolute_http_url(server_url: str) -> None:
+    with pytest.raises(ValueError, match="absolute HTTP or HTTPS URL"):
+        EpochDeckClient(server_url)
+
+
 def test_project_detail_validates_identity_and_opaque_mutation_token() -> None:
     responses = iter(
         [

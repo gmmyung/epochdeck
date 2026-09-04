@@ -137,7 +137,7 @@ function coordinateDistance(
 function runningAverage(values: Array<number | null>, amount: number): Array<number | null> {
   const window = Math.max(1, Math.min(MAX_SMOOTHING_WINDOW, Math.round(amount)));
   const output: Array<number | null> = [];
-  const ring = new Array<number>(window);
+  const ring = Array.from({ length: window }, () => 0);
   let count = 0;
   let writeIndex = 0;
   let total = 0;

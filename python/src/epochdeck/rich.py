@@ -365,16 +365,12 @@ def _install_temporary(blob_root: Path, temporary_path: Path, digest: str) -> No
         pass
     finally:
         temporary_path.unlink(missing_ok=True)
-    _fsync_directory(blob_root)
+    sync_directory(blob_root)
 
 
 def _ensure_private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     verify_directory(path, private_mode=0o700)
-
-
-def _fsync_directory(path: Path) -> None:
-    sync_directory(path)
 
 
 def _json_bytes(value: Any) -> bytes:

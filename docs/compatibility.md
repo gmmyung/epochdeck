@@ -82,11 +82,14 @@ accept inert compatibility flags.
 The current partial scalar contract supports finite numeric and boolean values,
 nested dictionaries flattened with `/`, explicit or automatic steps, durable
 local spooling, resumable batch delivery, Parquet persistence, and bounded
-column-projected history. The Python SDK normalizes booleans to `0.0`/`1.0`,
-requires unique string paths after flattening, and caps one traversal at 64
-mapping levels and 65,536 values before journaling. Dashboard charts scan only requested columns and use
-bounded exact min/max/last buckets that preserve source spikes without deleting
-raw samples; settled viewports are re-aggregated for zoom detail. Project
+column-projected history. The Python SDK places its default spool under the
+platform application-data directory and honors `EPOCHDECK_SPOOL_DIR` as an
+explicit override. It normalizes booleans to `0.0`/`1.0`, requires unique string
+paths after flattening, and caps one traversal at 64
+mapping levels and 65,536 values before journaling. Dashboard charts use uPlot,
+scan only requested columns, and use bounded exact min/max/last buckets that
+preserve source spikes without deleting raw samples; settled viewports are
+re-aggregated for zoom detail. Project
 comparisons overlay sparse series from up to 32 selected runs on a shared
 absolute-step, relative-step, or elapsed-time lattice. They retain fixed
 per-run sequence watermarks and never interpolate missing metrics.

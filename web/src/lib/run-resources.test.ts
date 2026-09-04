@@ -55,7 +55,7 @@ describe("RunResourceController", () => {
 
     await controller.ensureLoaded("summary", context);
     await controller.loadMore("summary", context);
-    await controller.refresh("summary", context);
+    await controller.applyResourceRevision("summary", context);
 
     expect(states.at(-1)?.alerts.map((value) => value.id)).toEqual(["newest", "current", "older"]);
     expect(states.at(-1)?.alertCursor).toBeNull();
@@ -90,7 +90,7 @@ describe("RunResourceController", () => {
     await controller.ensureLoaded("media", context);
     await controller.loadMoreRichKeys(context);
     await controller.loadMore("media", context);
-    await controller.refresh("media", context);
+    await controller.applyResourceRevision("media", context);
 
     const current = states.at(-1)!;
     expect(current.richValues.map((value) => value.id)).toEqual(["newest", "first", "older"]);

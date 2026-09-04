@@ -1,6 +1,8 @@
+import { containsControlCharacter, utf8ByteLength } from "./text-validation";
+
 export const MAX_SELECTED_RUNS = 12;
-export const MAX_COMPARISON_CELLS = 20_000;
-export const MAX_COMPARISON_SERIES = 32;
+const MAX_COMPARISON_CELLS = 20_000;
+const MAX_COMPARISON_SERIES = 32;
 export const METRIC_CATALOG_PAGE_SIZE = 24;
 
 export type MetricSetMode = "union" | "intersection";
@@ -11,18 +13,17 @@ export type RunStyle = {
   pattern: "solid" | "dash" | "dot" | "dash-dot";
 };
 
-export type ComparisonBatchCandidate = {
+type ComparisonBatchCandidate = {
   metric: string;
   runIds: string[];
 };
 
-export type ComparisonBatchPlan = {
+type ComparisonBatchPlan = {
   candidates: ComparisonBatchCandidate[];
-  seriesCount: number;
   maxBuckets: number;
 };
 
-export type ComparisonCacheMetric = {
+type ComparisonCacheMetric = {
   metric: string;
   revisions: ReadonlyArray<readonly [runId: string, revision: number]>;
 };
@@ -83,7 +84,7 @@ export function normalizeRunSelection(
   return { runIds, primaryRunId };
 }
 
-export function comparisonBucketBudget(seriesCount: number, requestedBuckets: number): number {
+function comparisonBucketBudget(seriesCount: number, requestedBuckets: number): number {
   if (!Number.isInteger(seriesCount) || seriesCount < 1) {
     throw new Error("comparison series count must be a positive integer");
   }
@@ -104,7 +105,6 @@ export function planComparisonBatches(
     if (current.length === 0) return;
     batches.push({
       candidates: current,
-      seriesCount,
       maxBuckets: comparisonBucketBudget(seriesCount, requestedBuckets),
     });
     current = [];
@@ -226,7 +226,9 @@ function cleanValue(value: string | null): string | null {
 
 function cleanBoundedValue(value: string | null, maxBytes: number): string | null {
   const cleaned = cleanValue(value);
-  if (!cleaned || utf8Bytes(cleaned) > maxBytes || hasControlCharacter(cleaned)) return null;
+  if (!cleaned || utf8ByteLength(cleaned) > maxBytes || containsControlCharacter(cleaned)) {
+    return null;
+  }
   return cleaned;
 }
 
@@ -246,17 +248,14 @@ function boundedRunIds(values: readonly string[]): string[] {
 }
 
 function cleanBoundedSearch(value: string | null): string {
-  if (value === null || utf8Bytes(value) > MAX_SEARCH_BYTES || hasControlCharacter(value))
+  if (
+    value === null ||
+    utf8ByteLength(value) > MAX_SEARCH_BYTES ||
+    containsControlCharacter(value)
+  ) {
     return "";
+  }
   return value;
-}
-
-function utf8Bytes(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
-}
-
-function hasControlCharacter(value: string): boolean {
-  return /[\u0000-\u001f\u007f-\u009f]/.test(value);
 }
 
 function stableHash(value: string): number {

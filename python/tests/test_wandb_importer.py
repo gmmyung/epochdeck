@@ -291,6 +291,7 @@ class FakeClient:
         self.finished = True
         assert self.run is not None
         self.run["state"] = "finished"
+        self.run["summary"] = summary
         assert (
             summary["_epochdeck_wandb_source"]["unsupported_history_values"]
             == self.expected_unsupported
@@ -595,6 +596,48 @@ def test_history_scan_resumes_in_process_after_transient_comm_error(
     ]
 
 
+def test_history_scan_rejects_reordered_rows_after_transient_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(importer_module, "_WANDB_RETRY_INITIAL_SECONDS", 0.0)
+
+    class ReorderedHistoryRun(FakeRun):
+        def __init__(self) -> None:
+            self.scan_attempts = 0
+
+        def scan_history(self, *, page_size: int):
+            assert page_size == 3_907
+            self.scan_attempts += 1
+            if self.scan_attempts == 1:
+                yield {"_step": 0, "loss": 3.0}
+                yield {"_step": 1, "loss": 2.0}
+                raise CommError("the service process is busy")
+            yield {"_step": 1, "loss": 2.0}
+            yield {"_step": 0, "loss": 3.0}
+            yield {"_step": 2, "loss": 1.0}
+
+    source = ReorderedHistoryRun()
+    client = FakeClient()
+    client.fail_first_batch = False
+
+    result = import_wandb_runs(
+        OneRunSourceApi(source),
+        client,
+        entity="team",
+        project="demo",
+        target_project="imported",
+        checkpoint_path=tmp_path / "checkpoint.jsonl",
+        workers=1,
+        include_files=False,
+    )
+
+    assert result.failed == 1
+    assert "changed identity or order" in result.failures[0]
+    assert client.batches == []
+    assert client.finished is False
+
+
 def test_history_scan_must_match_authoritative_row_count(tmp_path) -> None:
     class ShortHistoryRun(FakeRun):
         historyLineCount = 4
@@ -732,6 +775,49 @@ def test_wandb_import_replays_a_lost_batch_and_resumes_from_checkpoint(tmp_path)
     third = import_wandb_runs(FakeSourceApi(), client, **arguments)
     assert third.skipped == 1
     assert len(client.batches) == 2
+
+
+def test_refresh_failure_leaves_a_resumable_checkpoint(tmp_path) -> None:
+    class FailRefreshOnceApi(OneRunSourceApi):
+        def __init__(self, run: object) -> None:
+            super().__init__(run)
+            self.failed = False
+
+        def run(self, path: str):
+            if not self.failed:
+                self.failed = True
+                raise ValueError("malformed refresh response")
+            return super().run(path)
+
+    source_api = FailRefreshOnceApi(FakeRun())
+    client = FakeClient()
+    client.fail_first_batch = False
+    client.expected_unsupported = 2
+    checkpoint_path = tmp_path / "checkpoint.jsonl"
+    arguments = {
+        "entity": "team",
+        "project": "demo",
+        "target_project": "imported",
+        "checkpoint_path": checkpoint_path,
+        "workers": 1,
+        "include_files": False,
+    }
+
+    first = import_wandb_runs(source_api, client, **arguments)
+
+    assert first.failed == 1
+    checkpoint = Checkpoint(
+        checkpoint_path,
+        entity="team",
+        project="demo",
+        target_project="imported",
+    )
+    assert checkpoint.state(FakeRun.id)["phase"] == "history"
+    assert checkpoint.state(FakeRun.id)["include_files"] is False
+
+    second = import_wandb_runs(source_api, client, **arguments)
+
+    assert second.completed == 1
 
 
 @pytest.mark.parametrize(
@@ -911,6 +997,37 @@ def test_lost_finish_response_recovers_only_from_finalize_phase(tmp_path) -> Non
         target_project="imported",
     )
     assert checkpoint.state(FakeRun.id)["phase"] == "complete"
+
+
+def test_finalize_recovery_rejects_a_finished_run_with_the_wrong_summary(tmp_path) -> None:
+    class LostFinishResponseClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_first_batch = False
+            self.expected_unsupported = 2
+
+        def finish_run(self, run_id: str, summary: dict):
+            super().finish_run(run_id, summary)
+            raise ConnectionError("finish response was lost")
+
+    client = LostFinishResponseClient()
+    checkpoint_path = tmp_path / "checkpoint.jsonl"
+    arguments = {
+        "entity": "team",
+        "project": "demo",
+        "target_project": "imported",
+        "checkpoint_path": checkpoint_path,
+        "workers": 1,
+        "include_files": False,
+    }
+    assert import_wandb_runs(FakeSourceApi(), client, **arguments).failed == 1
+    assert client.run is not None
+    client.run["summary"] = {}
+
+    resumed = import_wandb_runs(FakeSourceApi(), client, **arguments)
+
+    assert resumed.failed == 1
+    assert "does not contain the expected imported W&B summary" in resumed.failures[0]
 
 
 def test_checkpoint_rejects_include_files_contract_change(tmp_path) -> None:
@@ -1611,6 +1728,30 @@ def test_nonterminal_wandb_run_is_not_marked_finished(tmp_path) -> None:
     assert client.run is None
 
 
+def test_preempted_wandb_run_is_importable(tmp_path) -> None:
+    source = FakeRun()
+    source.state = "preempted"
+    client = FakeClient()
+    client.fail_first_batch = False
+    client.expected_unsupported = 2
+
+    result = import_wandb_runs(
+        CountingSourceApi([source]),
+        client,
+        entity="team",
+        project="demo",
+        target_project="imported",
+        checkpoint_path=tmp_path / "checkpoint.jsonl",
+        workers=1,
+        include_files=False,
+    )
+
+    assert result.completed == 1
+    assert client.finished is True
+    assert client.run is not None
+    assert client.run["config"]["_epochdeck_wandb_source"]["state"] == "preempted"
+
+
 def test_source_revision_uses_real_wandb_heartbeat_shape() -> None:
     source = SimpleNamespace(
         state="FINISHED",
@@ -2004,3 +2145,95 @@ def test_artifact_import_preflights_file_count_before_any_upload() -> None:
             ImportCancellation(),
         )
     assert yielded == importer_module.MAX_ARTIFACT_ENTRIES + 1
+
+
+def test_run_file_resume_rejects_a_shorter_source_listing(tmp_path) -> None:
+    checkpoint = Checkpoint(
+        tmp_path / "checkpoint.jsonl",
+        entity="team",
+        project="demo",
+        target_project="imported",
+    )
+    checkpoint.update(
+        FakeRun.id,
+        phase="run_files",
+        include_files=True,
+        files_committed=2,
+    )
+
+    with pytest.raises(importer_module.WandbImportError, match="file listing became shorter"):
+        importer_module._import_run_files(
+            FakeRun(),
+            FakeClient(),
+            checkpoint,
+            FakeRun.id,
+            "run-1",
+            {"entity": "team", "project": "demo", "run_id": FakeRun.id, "url": ""},
+            ImportCancellation(),
+        )
+
+    assert checkpoint.state(FakeRun.id).get("files_complete") is not True
+
+
+def test_logged_artifact_resume_rejects_a_shorter_source_listing(tmp_path) -> None:
+    checkpoint = Checkpoint(
+        tmp_path / "checkpoint.jsonl",
+        entity="team",
+        project="demo",
+        target_project="imported",
+    )
+    checkpoint.update(
+        FakeRun.id,
+        phase="logged_artifacts",
+        include_files=True,
+        logged_artifacts_committed=2,
+    )
+
+    with pytest.raises(importer_module.WandbImportError, match="artifact listing became shorter"):
+        importer_module._import_logged_artifacts(
+            FakeRun(),
+            FakeClient(),
+            checkpoint,
+            FakeRun.id,
+            "run-1",
+            {"entity": "team", "project": "demo", "run_id": FakeRun.id, "url": ""},
+            ImportCancellation(),
+        )
+
+    assert checkpoint.state(FakeRun.id).get("logged_artifacts_complete") is not True
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_history_positions_reject_nonfinite_numbers(value: float) -> None:
+    with pytest.raises(importer_module.WandbImportError, match="invalid _step"):
+        importer_module._history_step({"_step": value}, 0)
+    with pytest.raises(importer_module.WandbImportError, match="invalid _timestamp"):
+        importer_module._history_timestamp_ms({"_timestamp": value}, 0)
+
+    with pytest.raises(importer_module.WandbImportError, match="position metadata"):
+        importer_module._history_row_identity({"_step": value})
+
+
+def test_history_values_treat_overflowing_numbers_as_unsupported() -> None:
+    huge = 10**10_000
+
+    metrics, media, skipped = importer_module._history_values({"huge": huge})
+    reference = importer_module._bounded_media_reference(
+        {"path": "media/video.mp4", "width": huge},
+        "media/video.mp4",
+    )
+
+    assert metrics == {}
+    assert media == []
+    assert skipped == 1
+    assert "width" not in reference
+
+
+def test_history_timestamp_rejects_an_overflowing_integer() -> None:
+    with pytest.raises(importer_module.WandbImportError, match="invalid _timestamp"):
+        importer_module._history_timestamp_ms({"_timestamp": 10**10_000}, 0)
+
+
+def test_artifact_identity_does_not_stringify_missing_values() -> None:
+    with pytest.raises(importer_module.WandbImportError, match="no stable identity"):
+        importer_module._source_artifact_identity(SimpleNamespace(id=None, qualified_name=None))

@@ -83,8 +83,10 @@ Project metric discovery accepts 1 to 32 unique `run_ids`, required `mode`
 (`union` or `intersection`), and optional `search`, `after`, and `limit` fields.
 Every selected run must belong to the path project. Results are lexicographic
 pages of `{key, run_ids}` summaries; `run_ids` identifies exactly which selected
-runs contain the key. Pass `next_after` back unchanged. This endpoint returns
-catalog metadata only—metric values still come from the chart-history APIs.
+runs contain the key. `total_count` is the exact number of keys matching the
+selected runs, availability mode, and search text, independent of the current
+page. Pass `next_after` back unchanged. This endpoint returns catalog metadata
+only—metric values still come from the chart-history APIs.
 
 Chart history is a separate aggregate contract; raw cursor pagination on
 `/history` is unchanged. Repeat the percent-encoded `key` parameter to request
@@ -143,12 +145,12 @@ Multi-run charts send one project-scoped JSON request:
 ```json
 {
   "series": [
-    {"run_id": "019c...", "key": "loss"},
-    {"run_id": "019d...", "key": "loss"}
+    { "run_id": "019c...", "key": "loss" },
+    { "run_id": "019d...", "key": "loss" }
   ],
   "alignment": "relative_step",
   "max_buckets": 1000,
-  "viewport": {"minimum": 0, "maximum": 10000}
+  "viewport": { "minimum": 0, "maximum": 10000 }
 }
 ```
 
@@ -171,21 +173,23 @@ per-run `source_last_sequence` watermarks, and sparse series:
   "x_max": 10000,
   "bucket_count": 1000,
   "runs": [
-    {"run_id": "019c...", "source_last_sequence": 12000},
-    {"run_id": "019d...", "source_last_sequence": 9000}
+    { "run_id": "019c...", "source_last_sequence": 12000 },
+    { "run_id": "019d...", "source_last_sequence": 9000 }
   ],
-  "series": [{
-    "run_id": "019c...",
-    "key": "loss",
-    "source_points": 9998,
-    "bucket": [0, 1],
-    "last_x": [9, 19],
-    "last_step": [109, 119],
-    "last_timestamp_ms": [1710000000009, 1710000000019],
-    "minimum": [0.82, 0.71],
-    "maximum": [1.14, 0.93],
-    "last": [0.88, 0.74]
-  }]
+  "series": [
+    {
+      "run_id": "019c...",
+      "key": "loss",
+      "source_points": 9998,
+      "bucket": [0, 1],
+      "last_x": [9, 19],
+      "last_step": [109, 119],
+      "last_timestamp_ms": [1710000000009, 1710000000019],
+      "minimum": [0.82, 0.71],
+      "maximum": [1.14, 0.93],
+      "last": [0.88, 0.74]
+    }
+  ]
 }
 ```
 

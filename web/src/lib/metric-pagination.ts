@@ -1,4 +1,4 @@
-export const MAX_METRIC_BACK_HISTORY = 64;
+const MAX_METRIC_BACK_HISTORY = 64;
 
 export function pushMetricCursor(
   history: readonly (string | null)[],

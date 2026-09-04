@@ -200,8 +200,9 @@ epochdeck doctor --server-url https://epochdeck.example.com
 journalctl -u epochdeck --since today
 ```
 
-`EPOCHDECK_SLOW_REQUEST_MS` controls the 1–60,000 ms slow-request threshold. Slow
-requests are logged and the most recent 64 appear in `epochdeck doctor`.
+Completed requests are logged through the server's structured tracing layer.
+`EPOCHDECK_SLOW_REQUEST_MS` controls the 1–60,000 ms threshold used by diagnostics;
+the most recent 64 requests over that threshold appear in `epochdeck doctor`.
 
 ## Dashboard branding
 

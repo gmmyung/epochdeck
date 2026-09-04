@@ -11,6 +11,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
+from platformdirs import user_data_path
+
 from epochdeck._ids import uuid7
 from epochdeck._json_normalization import normalize_json_object
 from epochdeck._limits import MAX_SAFE_INTEGER
@@ -199,68 +201,9 @@ class _DeliveryWorker(threading.Thread):
                     time.sleep(self._flush_interval)
             try:
                 delivery = self._next_delivery()
-                if delivery == "alert":
-                    alert, next_offset = self._spool.read_alert()
-                    if alert is None:
-                        continue
-                    self._client.create_alert(self._run_id, alert)
-                    self._spool.acknowledge_alert(next_offset)
-                elif delivery == "rich":
-                    value, next_offset = self._spool.read_rich_value()
-                    if value is None:
-                        continue
-                    blob = value.get("blob")
-                    if blob is not None:
-                        self._client.upload_blob(
-                            self._spool.blob_path(str(blob["digest"])),
-                            blob,
-                        )
-                    self._client.create_rich_value(self._run_id, value)
-                    self._spool.acknowledge_rich_value(next_offset)
-                elif delivery == "artifact":
-                    artifact, next_offset = self._spool.read_artifact()
-                    if artifact is None:
-                        continue
-                    operation = artifact.pop("operation", None)
-                    if operation == "create":
-                        for entry in artifact["entries"]:
-                            blob = entry["blob"]
-                            self._client.upload_blob(
-                                self._spool.blob_path(str(blob["digest"])),
-                                blob,
-                            )
-                        self._client.create_artifact(self._run_id, artifact)
-                    elif operation == "use":
-                        self._client.use_artifact(self._run_id, str(artifact["artifact_id"]))
-                    else:
-                        raise DeliveryError("artifact journal has an unknown operation")
-                    self._spool.acknowledge_artifact(next_offset)
-                elif delivery == "trace":
-                    trace, next_offset = self._spool.read_trace()
-                    if trace is None:
-                        continue
-                    blob = trace.get("payload")
-                    if blob is not None:
-                        self._client.upload_blob(
-                            self._spool.blob_path(str(blob["digest"])),
-                            blob,
-                        )
-                    self._client.create_trace_span(self._run_id, trace)
-                    self._spool.acknowledge_trace(next_offset)
-                elif delivery == "metrics":
-                    points, next_offset = self._spool.read_batch(
-                        self._batch_size,
-                        request_byte_budget=_MAX_METRIC_REQUEST_BYTES,
-                    )
-                    if not points:
-                        continue
-                    request = {"batch_sequence": points[0]["sequence"], "points": points}
-                    response = self._client.ingest_batch(self._run_id, request)
-                    if response.get("stop_requested") is True:
-                        self._stop_requested()
-                    self._spool.acknowledge(next_offset)
-                else:
+                if delivery is None:
                     continue
+                delivery()
             except Exception as error:  # The durable journal remains authoritative.
                 self.last_error = error
                 self._wake.wait(retry_delay)
@@ -272,20 +215,81 @@ class _DeliveryWorker(threading.Thread):
                 self.last_error = None
                 retry_delay = 0.25
 
-    def _next_delivery(self) -> str | None:
-        pending = (
-            self._spool.pending_metrics,
-            self._spool.pending_rich_values,
-            self._spool.pending_artifacts,
-            self._spool.pending_traces,
-            self._spool.pending_alerts,
+    def _deliver_alert(self) -> None:
+        alert, next_offset = self._spool.read_alert()
+        if alert is None:
+            return
+        self._client.create_alert(self._run_id, alert)
+        self._spool.acknowledge_alert(next_offset)
+
+    def _deliver_rich_value(self) -> None:
+        value, next_offset = self._spool.read_rich_value()
+        if value is None:
+            return
+        blob = value.get("blob")
+        if blob is not None:
+            self._upload_blob(blob)
+        self._client.create_rich_value(self._run_id, value)
+        self._spool.acknowledge_rich_value(next_offset)
+
+    def _deliver_artifact(self) -> None:
+        artifact, next_offset = self._spool.read_artifact()
+        if artifact is None:
+            return
+        operation = artifact.pop("operation", None)
+        if operation == "create":
+            for entry in artifact["entries"]:
+                self._upload_blob(entry["blob"])
+            self._client.create_artifact(self._run_id, artifact)
+        elif operation == "use":
+            self._client.use_artifact(self._run_id, str(artifact["artifact_id"]))
+        else:
+            raise DeliveryError("artifact journal has an unknown operation")
+        self._spool.acknowledge_artifact(next_offset)
+
+    def _deliver_trace(self) -> None:
+        trace, next_offset = self._spool.read_trace()
+        if trace is None:
+            return
+        blob = trace.get("payload")
+        if blob is not None:
+            self._upload_blob(blob)
+        self._client.create_trace_span(self._run_id, trace)
+        self._spool.acknowledge_trace(next_offset)
+
+    def _deliver_metrics(self) -> None:
+        points, next_offset = self._spool.read_batch(
+            self._batch_size,
+            request_byte_budget=_MAX_METRIC_REQUEST_BYTES,
         )
-        names = ("metrics", "rich", "artifact", "trace", "alert")
-        for offset in range(len(pending)):
-            index = (self._delivery_cursor + offset) % len(pending)
-            if pending[index]():
-                self._delivery_cursor = (index + 1) % len(pending)
-                return names[index]
+        if not points:
+            return
+        request = {"batch_sequence": points[0]["sequence"], "points": points}
+        response = self._client.ingest_batch(self._run_id, request)
+        if response.get("stop_requested") is True:
+            self._stop_requested()
+        self._spool.acknowledge(next_offset)
+
+    def _upload_blob(self, blob: dict[str, Any]) -> None:
+        self._client.upload_blob(
+            self._spool.blob_path(str(blob["digest"])),
+            blob,
+        )
+
+    def _next_delivery(self) -> Callable[[], None] | None:
+        deliveries = (
+            (self._spool.pending_metrics, self._deliver_metrics),
+            (self._spool.pending_rich_values, self._deliver_rich_value),
+            (self._spool.pending_artifacts, self._deliver_artifact),
+            (self._spool.pending_traces, self._deliver_trace),
+            (self._spool.pending_alerts, self._deliver_alert),
+        )
+        for offset in range(len(deliveries)):
+            index = (self._delivery_cursor + offset) % len(deliveries)
+            pending, deliver = deliveries[index]
+            if pending():
+                self._delivery_cursor = (index + 1) % len(deliveries)
+                return deliver
         return None
 
 
@@ -568,7 +572,7 @@ class Run:
     def __enter__(self) -> Run:
         return self
 
-    def __exit__(self, exception_type: object, exception: object, traceback: object) -> None:
+    def __exit__(self, exception_type: object, exception: object, _traceback: object) -> None:
         if exception is None:
             self.finish()
             return
@@ -1042,17 +1046,13 @@ def create_run(
     if mode == "disabled" and resume != "never":
         raise ValueError("disabled mode does not support resume policies")
     selected_id = _canonical_run_id(run_id) if run_id is not None else uuid7()
-    selected_spool_root = Path(
-        spool_root
-        or os.environ.get("EPOCHDECK_SPOOL_DIR")
-        or Path.home() / ".local" / "share" / "epochdeck" / "spool"
-    )
+    selected_spool_root = _select_spool_root(spool_root)
     selected_monitor_interval = _system_monitor_interval(system_monitor_interval)
     return Run(
         project=project,
         run_id=selected_id,
         name=name,
-        config=config or {},
+        config=config if config is not None else {},
         mode=mode,
         resume=resume,
         server_url=server_url,
@@ -1064,6 +1064,15 @@ def create_run(
         transport=transport,
         sweep_trial_id=sweep_trial_id,
     )
+
+
+def _select_spool_root(spool_root: str | Path | None) -> Path:
+    if spool_root is not None:
+        return Path(spool_root)
+    configured_root = os.environ.get("EPOCHDECK_SPOOL_DIR")
+    if configured_root:
+        return Path(configured_root)
+    return user_data_path("epochdeck", appauthor=False) / "spool"
 
 
 def sync_spool(

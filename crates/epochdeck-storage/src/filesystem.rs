@@ -8,12 +8,12 @@ use crate::StorageError;
 static PUBLICATION_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FileInstallation {
+pub(super) enum FileInstallation {
     InstalledNew,
     AlreadyPresent,
 }
 
-pub(crate) fn ensure_publication_capability(
+pub(super) fn ensure_publication_capability(
     root: &Path,
     staging_dir: &Path,
     verified: &AtomicBool,
@@ -26,7 +26,7 @@ pub(crate) fn ensure_publication_capability(
     Ok(())
 }
 
-pub(crate) fn probe_publication_capability(
+pub(super) fn probe_publication_capability(
     root: &Path,
     staging_dir: &Path,
 ) -> Result<(), StorageError> {
@@ -75,7 +75,7 @@ pub(crate) fn probe_publication_capability(
     sync_directory_after_removal(staging_dir)
 }
 
-pub(crate) fn install_no_replace(
+pub(super) fn install_no_replace(
     staging_path: &Path,
     final_path: &Path,
 ) -> Result<FileInstallation, StorageError> {
@@ -92,7 +92,7 @@ pub(crate) fn install_no_replace(
     }
 }
 
-pub(crate) fn sync_file(path: &Path) -> Result<(), StorageError> {
+pub(super) fn sync_file(path: &Path) -> Result<(), StorageError> {
     open_file_for_sync(path)
         .and_then(|file| file.sync_all())
         .map_err(|source| StorageError::Io {
@@ -101,7 +101,7 @@ pub(crate) fn sync_file(path: &Path) -> Result<(), StorageError> {
         })
 }
 
-pub(crate) fn sync_publication(file_path: &Path, parent: &Path) -> Result<(), StorageError> {
+pub(super) fn sync_publication(file_path: &Path, parent: &Path) -> Result<(), StorageError> {
     sync_file(file_path)?;
     sync_publication_parent(parent)
 }

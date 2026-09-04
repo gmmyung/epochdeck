@@ -5,8 +5,7 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result, bail};
 use epochdeck_catalog::Catalog;
 use epochdeck_server::{
-    CompactionConfig, DashboardConfig, MetricRuntime, app_with_runtime_and_blobs,
-    run_compaction_worker,
+    CompactionConfig, DashboardConfig, MetricRuntime, app, run_compaction_worker,
 };
 use epochdeck_storage::{BlobStore, MetricStore, StorageLayout};
 use fs2::FileExt;
@@ -69,16 +68,13 @@ async fn main() -> Result<()> {
     let signal_sender = shutdown_sender.clone();
 
     info!(%address, "EpochDeck server listening");
-    let serve_result = axum::serve(
-        listener,
-        app_with_runtime_and_blobs(catalog, metrics, blobs, dashboard),
-    )
-    .with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        let _ = signal_sender.send(true);
-    })
-    .await
-    .context("EpochDeck server failed");
+    let serve_result = axum::serve(listener, app(catalog, metrics, blobs, dashboard))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = signal_sender.send(true);
+        })
+        .await
+        .context("EpochDeck server failed");
     let _ = shutdown_sender.send(true);
     compaction_task
         .await

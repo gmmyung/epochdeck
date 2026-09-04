@@ -8,11 +8,11 @@ from typing import Annotated
 import typer
 
 from epochdeck import __version__
+from epochdeck._run import sync_spool
 from epochdeck.backup import StorageRoots, backup_storage, restore_storage
 from epochdeck.client import EpochDeckClient
 from epochdeck.exporter import export_project
 from epochdeck.public_api import Api
-from epochdeck.run import sync_spool
 from epochdeck.wandb_importer import import_wandb_runs
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)

@@ -1,4 +1,4 @@
-export const HISTOGRAM_CANVAS_BIN_LIMIT = 2_000;
+const HISTOGRAM_CANVAS_BIN_LIMIT = 2_000;
 
 /** Re-bin oversized histograms so canvas work stays constant while preserving total mass. */
 export function boundedHistogramCounts(

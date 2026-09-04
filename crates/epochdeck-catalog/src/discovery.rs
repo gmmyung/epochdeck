@@ -6,13 +6,13 @@ use epochdeck_protocol::{
 };
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, query};
 
-use crate::CatalogError;
+use crate::{CatalogError, ProjectMetricCatalogPage};
 
-pub(crate) async fn project_metric_catalog(
+pub(super) async fn project_metric_catalog(
     pool: &SqlitePool,
     project: &str,
     request: &ProjectMetricCatalogRequest,
-) -> Result<Vec<ProjectMetricKeySummary>, CatalogError> {
+) -> Result<ProjectMetricCatalogPage, CatalogError> {
     let project_exists: bool = query("SELECT EXISTS(SELECT 1 FROM projects WHERE name = ?)")
         .bind(project)
         .fetch_one(pool)
@@ -78,6 +78,29 @@ pub(crate) async fn project_metric_catalog(
         }
     }
 
+    let mut count_query = QueryBuilder::<Sqlite>::new(
+        "SELECT COUNT(*) AS total_count FROM (SELECT m.key FROM run_metric_keys m WHERE m.run_id IN (",
+    );
+    {
+        let mut separated = count_query.separated(", ");
+        for run_id in &run_ids {
+            separated.push_bind(run_id);
+        }
+    }
+    count_query.push(")");
+    push_search(&mut count_query, request.search.as_deref());
+    count_query.push(" GROUP BY m.key");
+    push_mode_having(&mut count_query, request.mode, run_ids.len())?;
+    count_query.push(") AS matching_keys");
+    let total_count = count_query
+        .build()
+        .fetch_one(pool)
+        .await?
+        .get::<i64, _>("total_count");
+    let total_count = usize::try_from(total_count).map_err(|_| {
+        CatalogError::InvalidData("metric catalog total count is out of range".to_owned())
+    })?;
+
     let mut key_query =
         QueryBuilder::<Sqlite>::new("SELECT m.key FROM run_metric_keys m WHERE m.run_id IN (");
     {
@@ -104,7 +127,10 @@ pub(crate) async fn project_metric_catalog(
         .map(|row| row.get::<String, _>("key"))
         .collect::<Vec<_>>();
     if keys.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ProjectMetricCatalogPage {
+            keys: Vec::new(),
+            total_count,
+        });
     }
 
     let mut availability_query =
@@ -130,13 +156,16 @@ pub(crate) async fn project_metric_catalog(
             .map_err(|error| CatalogError::InvalidData(format!("invalid run ID: {error}")))?;
         availability.entry(row.get("key")).or_default().push(run_id);
     }
-    Ok(keys
-        .into_iter()
-        .map(|key| ProjectMetricKeySummary {
-            run_ids: availability.remove(&key).unwrap_or_default(),
-            key,
-        })
-        .collect())
+    Ok(ProjectMetricCatalogPage {
+        keys: keys
+            .into_iter()
+            .map(|key| ProjectMetricKeySummary {
+                run_ids: availability.remove(&key).unwrap_or_default(),
+                key,
+            })
+            .collect(),
+        total_count,
+    })
 }
 
 fn push_search<'args>(query: &mut QueryBuilder<'args, Sqlite>, search: Option<&'args str>) {

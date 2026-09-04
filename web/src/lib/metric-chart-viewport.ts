@@ -105,7 +105,7 @@ export function transformScale(value: number, scale: ScaleMode): number {
   return scale === "log" ? Math.log10(value) : value;
 }
 
-export function restoreScale(value: number, scale: ScaleMode): number {
+function restoreScale(value: number, scale: ScaleMode): number {
   return scale === "log" ? 10 ** value : value;
 }
 
@@ -189,6 +189,53 @@ export function viewportFromSelection(
       verticalScale,
     ),
   };
+}
+
+export function zoomHorizontalViewport(
+  frame: Frame,
+  anchorX: number,
+  scale: ScaleMode,
+  factor: number,
+): Viewport {
+  const anchor = transformScale(fromScreenX(anchorX, frame, scale), scale);
+  const minimum = transformScale(frame.x.minimum, scale);
+  const maximum = transformScale(frame.x.maximum, scale);
+  const boundedFactor = Math.max(0.05, Math.min(20, factor));
+  return {
+    x: boundedDomain(
+      anchor + (minimum - anchor) * boundedFactor,
+      anchor + (maximum - anchor) * boundedFactor,
+      scale,
+    ),
+    y: frame.y,
+  };
+}
+
+export function clampDomainToBounds(domain: Domain, bounds: Domain): Domain {
+  const minimum = Math.max(domain.minimum, bounds.minimum);
+  const maximum = Math.min(domain.maximum, bounds.maximum);
+  return minimum < maximum ? { minimum, maximum } : { ...bounds };
+}
+
+export function clampPannedDomainToBounds(
+  domain: Domain,
+  bounds: Domain,
+  scale: ScaleMode,
+): Domain {
+  const boundsMinimum = transformScale(bounds.minimum, scale);
+  const boundsMaximum = transformScale(bounds.maximum, scale);
+  let minimum = transformScale(domain.minimum, scale);
+  let maximum = transformScale(domain.maximum, scale);
+  const span = maximum - minimum;
+  if (span >= boundsMaximum - boundsMinimum) return { ...bounds };
+  if (minimum < boundsMinimum) {
+    minimum = boundsMinimum;
+    maximum = boundsMinimum + span;
+  } else if (maximum > boundsMaximum) {
+    maximum = boundsMaximum;
+    minimum = boundsMaximum - span;
+  }
+  return boundedDomain(minimum, maximum, scale);
 }
 
 export function insidePlot(point: Point, frame: Frame): boolean {

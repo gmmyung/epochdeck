@@ -1,4 +1,4 @@
-export type BoundedRequest<T> = {
+type BoundedRequest<T> = {
   identity: string;
   parentSignal: AbortSignal;
   request: (signal: AbortSignal) => Promise<T>;
@@ -70,14 +70,6 @@ export class BoundedRequestScheduler {
     for (const task of this.pending.values()) this.finishPending(task);
     this.pending.clear();
     for (const request of this.active.values()) request.controller.abort();
-  }
-
-  get activeCount(): number {
-    return this.active.size;
-  }
-
-  get pendingCount(): number {
-    return this.pending.size;
   }
 
   private abort(task: PendingRequest): void {

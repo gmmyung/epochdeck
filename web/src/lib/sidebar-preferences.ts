@@ -4,8 +4,8 @@ export type RunStylePreferences = Record<string, RunStyle>;
 
 export const DEFAULT_SIDEBAR_WIDTH = 280;
 export const MIN_SIDEBAR_WIDTH = 220;
-export const MAX_SIDEBAR_WIDTH = 640;
-export const MIN_WORKSPACE_CONTENT_WIDTH = 480;
+const MAX_SIDEBAR_WIDTH = 640;
+const MIN_WORKSPACE_CONTENT_WIDTH = 480;
 
 const MAX_RUN_STYLE_PREFERENCES = 256;
 const MAX_RUN_STYLE_STORAGE_BYTES = 64 * 1024;

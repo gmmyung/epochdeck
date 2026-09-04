@@ -1,3 +1,5 @@
+import { containsControlCharacter, utf8ByteLength } from "./text-validation";
+
 export type Health = {
   service: string;
   version: string;
@@ -38,19 +40,7 @@ export type Run = {
 
 export type RunListItem = Omit<Run, "config" | "summary" | "explicit_summary" | "metric_summary">;
 
-export type History = {
-  run_id: string;
-  sequence: number[];
-  step: number[];
-  timestamp_ms: number[];
-  metrics: Record<string, Array<number | null>>;
-  next_after: number | null;
-  sampled: boolean;
-  source_points: number | null;
-  source_last_sequence: number | null;
-};
-
-export type ChartMetricHistory = {
+type ChartMetricHistory = {
   source_points: number;
   bucket: number[];
   last_x: number[];
@@ -76,30 +66,31 @@ export type ChartHistoryViewport = {
   stepMax: number;
 };
 
-export type ChartHistoryOptions = {
+type ChartHistoryOptions = {
   maxBuckets?: number;
   viewport?: ChartHistoryViewport;
   signal?: AbortSignal;
 };
 
-export type ComparisonAlignment = "step" | "relative_step" | "elapsed_time";
+type ComparisonAlignment = "step" | "relative_step" | "elapsed_time";
 
 export type MetricCatalogEntry = {
   key: string;
   run_ids: string[];
 };
 
-export type MetricCatalogPage = {
+type MetricCatalogPage = {
   items: MetricCatalogEntry[];
   nextAfter: string | null;
+  totalCount: number;
 };
 
-export type ComparisonChartSeriesRequest = {
+type ComparisonChartSeriesRequest = {
   run_id: string;
   key: string;
 };
 
-export type ComparisonChartSeries = ChartMetricHistory & {
+type ComparisonChartSeries = ChartMetricHistory & {
   run_id: string;
   key: string;
   last_x: number[];
@@ -115,7 +106,7 @@ export type ComparisonChartHistory = {
   series: ComparisonChartSeries[];
 };
 
-export type ComparisonChartHistoryOptions = {
+type ComparisonChartHistoryOptions = {
   alignment: ComparisonAlignment;
   maxBuckets?: number;
   viewport?: { minimum: number; maximum: number };
@@ -133,7 +124,7 @@ export type Alert = {
   created_at: string;
 };
 
-export type BlobRef = {
+type BlobRef = {
   digest: string;
   size: number;
   mime_type: string;
@@ -180,7 +171,7 @@ export type Artifact = {
   created_at: string;
 };
 
-export type ArtifactSummary = Pick<
+type ArtifactSummary = Pick<
   Artifact,
   "id" | "project_id" | "project" | "name" | "type" | "version" | "created_by_run" | "created_at"
 > & {
@@ -362,6 +353,7 @@ export async function getProjectMetricCatalogPage(
   const result = await requestJson<{
     keys: MetricCatalogEntry[];
     next_after: string | null;
+    total_count: number;
   }>(`/api/v1/projects/${encodeURIComponent(project)}/metrics/query`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -374,7 +366,11 @@ export async function getProjectMetricCatalogPage(
     }),
     signal,
   });
-  return { items: result.keys, nextAfter: result.next_after };
+  return {
+    items: result.keys,
+    nextAfter: result.next_after,
+    totalCount: result.total_count,
+  };
 }
 
 export async function getAlertPage(
@@ -459,26 +455,6 @@ export function getArtifact(artifactId: string, signal?: AbortSignal): Promise<A
   return getJson<Artifact>(`/api/v1/artifacts/${encodeURIComponent(artifactId)}`, signal);
 }
 
-export async function getArtifactLineagePage(
-  artifactId: string,
-  relation: RunArtifact["relation"],
-  before?: string,
-  signal?: AbortSignal,
-): Promise<CursorPage<RunListItem>> {
-  const query = cursorQuery(before);
-  query.set("relation", relation);
-  const result = await getJson<{
-    artifact_id: string;
-    relation: RunArtifact["relation"];
-    runs: RunListItem[];
-    next_before: string | null;
-  }>(`/api/v1/artifacts/${encodeURIComponent(artifactId)}/lineage?${query}`, signal);
-  if (result.artifact_id !== artifactId || result.relation !== relation) {
-    throw new Error("EpochDeck returned lineage for a different artifact relation");
-  }
-  return { items: result.runs, nextBefore: result.next_before };
-}
-
 export function artifactFileUrl(artifactId: string, path: string): string {
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
   return `/api/v1/artifacts/${encodeURIComponent(artifactId)}/files/${encodedPath}`;
@@ -507,30 +483,6 @@ export async function getTracePage(
 
 export function getTrace(spanId: string, signal?: AbortSignal): Promise<TraceSpan> {
   return getJson<TraceSpan>(`/api/v1/traces/${encodeURIComponent(spanId)}`, signal);
-}
-
-export function getHistory(
-  runId: string,
-  keys: string[],
-  limit = 5_000,
-  signal?: AbortSignal,
-  after?: number,
-): Promise<History> {
-  const query = new URLSearchParams({ limit: String(limit) });
-  for (const key of keys) query.append("key", key);
-  if (after !== undefined) query.set("after", String(after));
-  return getJson<History>(`/api/v1/runs/${encodeURIComponent(runId)}/history?${query}`, signal);
-}
-
-export function getSampledHistory(
-  runId: string,
-  keys: string[],
-  maxPoints = 2_000,
-  signal?: AbortSignal,
-): Promise<History> {
-  const query = new URLSearchParams({ max_points: String(maxPoints) });
-  for (const key of keys) query.append("key", key);
-  return getJson<History>(`/api/v1/runs/${encodeURIComponent(runId)}/history?${query}`, signal);
 }
 
 export function getChartHistory(
@@ -608,10 +560,7 @@ function cursorQuery(before?: string): URLSearchParams {
 function validatedSearch(value: string, name: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
-  if (
-    new TextEncoder().encode(trimmed).byteLength > 256 ||
-    /[\u0000-\u001f\u007f-\u009f]/.test(trimmed)
-  ) {
+  if (utf8ByteLength(trimmed) > 256 || containsControlCharacter(trimmed)) {
     throw new RangeError(`${name} cannot exceed 256 non-control bytes`);
   }
   return trimmed;

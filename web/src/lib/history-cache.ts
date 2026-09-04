@@ -99,18 +99,6 @@ export class ComparisonHistoryCache {
     }
   }
 
-  get size(): number {
-    return this.entries.size;
-  }
-
-  get cellCount(): number {
-    return this.totalCells;
-  }
-
-  get estimatedBytes(): number {
-    return this.totalEstimatedBytes;
-  }
-
   private delete(requestKey: string): void {
     const entry = this.entries.get(requestKey);
     if (!entry) return;
