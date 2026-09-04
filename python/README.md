@@ -100,17 +100,6 @@ downstream.use_artifact(artifact)
 Artifacts are immutable and versioned. Files are content-addressed and reused
 across artifacts.
 
-## Record traces
-
-```python
-with run.trace("answer", kind="llm", inputs={"prompt": "hello"}) as span:
-    span.add_message("assistant", "hello back")
-    span.set_outputs({"tokens": 2})
-```
-
-Trace kinds are `span`, `llm`, `tool`, `chain`, and `agent`. Complete payloads
-use blob storage; bounded previews remain searchable.
-
 ## Query runs
 
 ```python

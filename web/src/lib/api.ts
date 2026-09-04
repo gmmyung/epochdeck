@@ -172,7 +172,7 @@ export type Artifact = {
   created_at: string;
 };
 
-type ArtifactSummary = Pick<
+export type ArtifactSummary = Pick<
   Artifact,
   "id" | "project_id" | "project" | "name" | "type" | "version" | "created_by_run" | "created_at"
 > & {
@@ -209,25 +209,6 @@ export class EpochDeckApiError extends Error {
     this.name = "EpochDeckApiError";
   }
 }
-
-export type TraceSpan = {
-  id: string;
-  run_id: string;
-  trace_id: string;
-  parent_span_id: string | null;
-  name: string;
-  kind: "span" | "llm" | "tool" | "chain" | "agent";
-  status: "unset" | "ok" | "error";
-  start_time_ms: number;
-  end_time_ms: number;
-  step: number | null;
-  attributes: Record<string, unknown>;
-  preview: Record<string, unknown>;
-  payload: BlobRef | null;
-  created_at: string;
-};
-
-export type TraceSpanSummary = Omit<TraceSpan, "attributes" | "preview">;
 
 export type ReportPanel = {
   id: string;
@@ -463,27 +444,6 @@ export function artifactFileUrl(artifactId: string, path: string): string {
 
 export function artifactArchiveUrl(artifactId: string): string {
   return `/api/v1/artifacts/${encodeURIComponent(artifactId)}/download`;
-}
-
-export async function getTracePage(
-  runId: string,
-  query = "",
-  before?: string,
-  signal?: AbortSignal,
-): Promise<CursorPage<TraceSpanSummary>> {
-  const params = new URLSearchParams({ limit: "100" });
-  const boundedSearch = validatedSearch(query, "trace search");
-  if (boundedSearch) params.set("q", boundedSearch);
-  if (before) params.set("before", before);
-  const result = await getJson<{ spans: TraceSpanSummary[]; next_before: string | null }>(
-    `/api/v1/runs/${encodeURIComponent(runId)}/traces?${params}`,
-    signal,
-  );
-  return { items: result.spans, nextBefore: result.next_before };
-}
-
-export function getTrace(spanId: string, signal?: AbortSignal): Promise<TraceSpan> {
-  return getJson<TraceSpan>(`/api/v1/traces/${encodeURIComponent(spanId)}`, signal);
 }
 
 export function getChartHistory(

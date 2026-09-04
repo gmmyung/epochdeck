@@ -45,7 +45,6 @@ def export_project(client: EpochDeckClient, project: str, destination: Path) -> 
         "metric_pages": 0,
         "alerts": 0,
         "rich_values": 0,
-        "traces": 0,
         "artifacts": 0,
         "artifact_links": 0,
         "reports": 0,
@@ -171,17 +170,6 @@ def _export_run(
             blob = value.get("blob")
             if blob is not None and _export_blob(
                 client, _expect_object(blob, "rich blob"), blob_root
-            ):
-                counts["blobs"] += 1
-
-    with (run_root / "traces.jsonl").open("w", encoding="utf-8") as stream:
-        for summary in _trace_span_summaries(client, run_id):
-            span = _detail_record(client.get_trace_span, summary, "trace span")
-            _write_json_line(stream, span)
-            counts["traces"] += 1
-            payload = span.get("payload")
-            if payload is not None and _export_blob(
-                client, _expect_object(payload, "trace payload"), blob_root
             ):
                 counts["blobs"] += 1
 
@@ -330,16 +318,6 @@ def _alert_records(
     return _cursor_records(
         lambda before: client.alerts(run_id, before=before, limit=_PAGE_SIZE),
         "alerts",
-    )
-
-
-def _trace_span_summaries(
-    client: EpochDeckClient,
-    run_id: str,
-) -> Iterator[dict[str, Any]]:
-    return _cursor_records(
-        lambda before: client.trace_spans(run_id, before=before, limit=_PAGE_SIZE),
-        "spans",
     )
 
 

@@ -162,7 +162,7 @@ Navigation and resource caches have separate limits. The UI reports truncated
 windows instead of presenting them as complete collections.
 See [ADR 0013](adr/0013-multi-run-chart-comparison.md).
 
-### Media, artifacts, and traces
+### Media and artifacts
 
 Media and artifact bytes live in a content-addressed store rooted separately
 from metrics. The catalog contains small manifests, aliases, versions, and
@@ -171,11 +171,8 @@ installed. At most eight new blob uploads stream concurrently. Artifact
 manifest verification and ZIP delivery share a four-permit blocking-I/O pool,
 so a parallel importer cannot create an unbounded filesystem work queue.
 
-Video supports HTTP range delivery. Structured trace names, timing, status,
-attributes, relationships, and bounded message previews are indexed in SQLite.
-Complete trace inputs, outputs, and messages use the same content-addressed blob
-store as media and artifacts. None of these paths participate in scalar metric
-queries.
+Video supports HTTP range delivery. Media and artifact paths do not participate
+in scalar metric queries.
 
 ### Python SDK
 
@@ -242,22 +239,23 @@ It requests values only for visible charts and selected metrics. Off-screen
 charts use browser content visibility and intersection observers; bounded
 columnar JSON responses render with uPlot.
 
-Run data is separated into summary, configuration, metrics, media, traces, and
-artifact tabs. Config and summary documents render as locally searchable,
-expandable trees. Media snapshots are grouped into step timelines.
+Run data is separated into summary, configuration, metrics, media, and artifact
+tabs. Config and summary documents render as locally searchable, expandable
+trees. Media snapshots are grouped into step timelines.
 
 Charts support search, pan, zoom, region selection, axis settings, smoothing,
 hover inspection, and exact min/max bands. The server re-aggregates settled
 viewports. Exact Parquet statistics prune disjoint row groups; uncertain
 statistics fall back to reading.
 
-Artifact manifests render as a tabbed file browser; whole ZIP responses are
+Artifact manifests linked to checked runs render as a deduplicated, tabbed file
+browser that preserves each input/output relationship. Whole ZIP responses are
 produced with fixed buffers on a bounded download worker, and the worker permit
 is retained through terminal stream-error delivery.
 
 Live charts refresh bounded aggregates when per-run revisions change.
 `document_revision` invalidates config and summary data. `rich_data_revision`
-invalidates media, alerts, artifacts, and traces. Idempotent retries do not
+invalidates media, alerts, and artifacts. Idempotent retries do not
 increment either counter.
 
 The dashboard polls selected running IDs with one lightweight query and hydrates

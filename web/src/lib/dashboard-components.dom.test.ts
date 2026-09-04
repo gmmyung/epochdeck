@@ -254,11 +254,19 @@ describe("interactive dashboard components", () => {
 
   it("links sidebar hover and run style controls without changing selection", async () => {
     const run = runListItem();
+    const secondRun = {
+      ...run,
+      id: "00000000-0000-7000-8000-000000000002",
+      name: "policy candidate",
+    };
     const hover = vi.fn();
     const styleChange = vi.fn();
     const resetStyle = vi.fn();
     const toggle = vi.fn();
     const choose = vi.fn();
+    const selectOnly = vi.fn();
+    const hideAll = vi.fn();
+    const showAll = vi.fn();
     const target = document.createElement("div");
     document.body.append(target);
     const component = mount(NavigationSidebar, {
@@ -279,7 +287,7 @@ describe("interactive dashboard components", () => {
         reportWindowTruncated: false,
         loadingMoreReports: false,
         reportError: null,
-        runs: [run],
+        runs: [run, secondRun],
         selectedRunIds: [run.id],
         primaryRunId: run.id,
         runSearch: "",
@@ -296,6 +304,9 @@ describe("interactive dashboard components", () => {
         onloadruns: vi.fn(),
         ontogglerun: toggle,
         onchooserun: choose,
+        onselectonly: selectOnly,
+        onhideall: hideAll,
+        onshowall: showAll,
         onhoverrun: hover,
         onrunstylechange: styleChange,
         onresetrunstyle: resetStyle,
@@ -307,6 +318,22 @@ describe("interactive dashboard components", () => {
     row.dispatchEvent(new MouseEvent("mouseenter"));
     row.dispatchEvent(new MouseEvent("mouseleave"));
     expect(hover.mock.calls).toEqual([[run.id], [null]]);
+
+    const buttonWithText = (label: string) =>
+      [...target.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
+        button.textContent?.includes(label),
+      )!;
+    const hideAllButton = buttonWithText("Hide all");
+    const showAllButton = buttonWithText("Show all");
+    expect(hideAllButton.querySelector("svg")).not.toBeNull();
+    expect(showAllButton.querySelector("svg")).not.toBeNull();
+    hideAllButton.click();
+    showAllButton.click();
+    expect(hideAll).toHaveBeenCalledOnce();
+    expect(showAll).toHaveBeenCalledOnce();
+    expect(
+      target.querySelector('[aria-label="Runs"]')?.classList.contains("run-navigation-list"),
+    ).toBe(true);
 
     expect(target.querySelector(`[aria-label="Line color for ${run.name}"]`)).toBeNull();
     const styleMenu = target.querySelector<HTMLButtonElement>(
@@ -336,6 +363,14 @@ describe("interactive dashboard components", () => {
     await tick();
     expect(styleMenu.getAttribute("aria-expanded")).toBe("false");
     expect(target.querySelector(`[aria-label="Line color for ${run.name}"]`)).toBeNull();
+
+    const secondStyleMenu = target.querySelector<HTMLButtonElement>(
+      `[aria-label="Configure chart style for ${secondRun.name} (${secondRun.id.slice(0, 8)})"]`,
+    )!;
+    secondStyleMenu.click();
+    await tick();
+    buttonWithText("Show only").click();
+    expect(selectOnly).toHaveBeenCalledWith(secondRun);
 
     await unmount(component);
     target.remove();

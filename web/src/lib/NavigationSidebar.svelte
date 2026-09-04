@@ -55,6 +55,9 @@
   export let onloadruns: () => void;
   export let ontogglerun: (run: RunListItem, selected: boolean) => void;
   export let onchooserun: (run: RunListItem) => void;
+  export let onselectonly: (run: RunListItem) => void = () => {};
+  export let onhideall: () => void = () => {};
+  export let onshowall: () => void = () => {};
   export let onhoverrun: (runId: string | null) => void = () => {};
   export let onrunstylechange: (runId: string, style: RunStyle) => void = () => {};
   export let onresetrunstyle: (runId: string) => void = () => {};
@@ -236,7 +239,7 @@
         </label>
       </div>
       {#if reportError}<p class="nav-error" role="alert">{reportError}</p>{/if}
-      <div class="run-list" aria-label="Reports">
+      <div class="run-list report-list" aria-label="Reports">
         {#each visibleReports as report (report.id)}
           <button
             type="button"
@@ -273,7 +276,20 @@
         onsearchruns();
       }}
     >
-      <span class="nav-label">Runs</span>
+      <div class="run-section-heading">
+        <span class="nav-label">Runs</span>
+        <span class="run-selection-actions">
+          <button type="button" disabled={selectedRunIds.length === 0} onclick={onhideall}
+            ><Icon name="hide" size={12} /><span>Hide all</span></button
+          >
+          <button
+            type="button"
+            disabled={runs.length === 0 ||
+              runs.slice(0, MAX_SELECTED_RUNS).every((run) => selectedRunIds.includes(run.id))}
+            onclick={onshowall}><Icon name="show" size={12} /><span>Show all</span></button
+          >
+        </span>
+      </div>
       <div class="run-search-control">
         <label class="search-control">
           <Icon name="search" size={14} />
@@ -292,7 +308,7 @@
     </form>
     {#if runError}<p class="nav-error" role="alert">{runError}</p>{/if}
   {/if}
-  <div class="run-list" aria-label="Runs" class:hidden={runs.length === 0}>
+  <div class="run-list run-navigation-list" aria-label="Runs" class:hidden={runs.length === 0}>
     {#each runs as run (run.id)}
       {@const selected = selectedRunIds.includes(run.id)}
       {@const style = resolveRunStyle(run.id, runStylePreferences)}
@@ -373,9 +389,18 @@
                   style={styleMenuPopoverStyle}
                 >
                   <div class="run-style-popover-heading">
-                    <strong id={`run-style-heading-${run.id}`}>Run appearance</strong>
+                    <strong id={`run-style-heading-${run.id}`}>Run options</strong>
                     <small title={run.name}>{run.name}</small>
                   </div>
+                  <button
+                    class="run-selection-only"
+                    type="button"
+                    disabled={selectedRunIds.length === 1 && selected}
+                    onclick={() => {
+                      onselectonly(run);
+                      closeStyleMenu(false);
+                    }}><Icon name="select" size={12} /><span>Show only</span></button
+                  >
                   <label class="run-color-control">
                     <span>Color</span>
                     <span class="run-color-picker">
@@ -454,7 +479,13 @@
 
 <style>
   aside {
+    position: sticky;
+    top: 0;
+    height: 100dvh;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
 
   .sidebar-header {
@@ -570,9 +601,73 @@
   }
 
   .run-search-form {
+    flex: none;
     display: grid;
     gap: 6px;
     margin-top: 18px;
+  }
+
+  .run-section-heading,
+  .run-selection-actions {
+    display: flex;
+    align-items: center;
+  }
+
+  .run-section-heading {
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .run-selection-actions {
+    gap: 2px;
+  }
+
+  .run-selection-actions button {
+    min-height: 24px;
+    display: inline-flex;
+    gap: 4px;
+    align-items: center;
+    padding: 2px 5px;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font-size: 9px;
+  }
+
+  .run-selection-actions button:hover:not(:disabled) {
+    background: var(--button-hover);
+    color: var(--text);
+  }
+
+  .run-selection-only {
+    width: 100%;
+    min-height: 30px;
+    margin-bottom: 10px;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--text);
+    font-size: 10px;
+  }
+
+  .run-selection-only {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .run-navigation-list {
+    min-height: 0;
+    flex: 1 1 auto;
+    align-content: start;
+    grid-auto-rows: max-content;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+  }
+
+  .run-selection-only:hover:not(:disabled) {
+    background: var(--button-hover);
   }
 
   .run-search-control {
@@ -620,5 +715,19 @@
     color: var(--muted);
     font-size: 10px;
     line-height: 1.35;
+  }
+
+  @media (max-width: 760px) {
+    aside {
+      position: static;
+      height: auto;
+      overflow: visible;
+    }
+
+    .run-navigation-list {
+      overflow-x: auto;
+      overflow-y: visible;
+      scrollbar-gutter: auto;
+    }
   }
 </style>

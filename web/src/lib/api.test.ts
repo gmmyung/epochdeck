@@ -23,8 +23,6 @@ import {
   getRunArtifactPage,
   getRunPage,
   getRunSummariesByIds,
-  getTrace,
-  getTracePage,
 } from "./api";
 
 afterEach(() => {
@@ -238,7 +236,6 @@ describe("getHealth", () => {
     await expect(
       getProjectMetricCatalogPage("demo", ["run-a"], "union", "loss\nsecret"),
     ).rejects.toThrow(/256 non-control bytes/);
-    await expect(getTracePage("run-a", "한".repeat(100))).rejects.toThrow(/256 non-control bytes/);
     await expect(getRunPage("demo", "loss\u0085hidden")).rejects.toThrow(/256 non-control bytes/);
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -436,29 +433,5 @@ describe("getHealth", () => {
       "/api/v1/artifacts/artifact%2Fid/files/checkpoints/best%20model.bin",
     );
     expect(artifactArchiveUrl("artifact/id")).toBe("/api/v1/artifacts/artifact%2Fid/download");
-  });
-
-  it("loads trace summaries with an encoded query and selected detail", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ spans: [], next_before: "span/id" }), { status: 200 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ id: "span/id", attributes: {}, preview: {} }), {
-          status: 200,
-        }),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-
-    await expect(getTracePage("run/id", " assistant reward ", "span/id")).resolves.toEqual({
-      items: [],
-      nextBefore: "span/id",
-    });
-    await expect(getTrace("span/id")).resolves.toMatchObject({ id: "span/id" });
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "/api/v1/runs/run%2Fid/traces?limit=100&q=assistant+reward&before=span%2Fid",
-      "/api/v1/traces/span%2Fid",
-    ]);
   });
 });

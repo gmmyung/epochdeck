@@ -361,7 +361,6 @@ def test_lightweight_collection_and_full_detail_routes() -> None:
             before="run-2",
             limit=5,
         )
-        client.get_trace_span("span/id")
         client.run_artifacts(
             "run/id",
             before="artifact-2",
@@ -395,9 +394,8 @@ def test_lightweight_collection_and_full_detail_routes() -> None:
         "before": "run-2",
         "relation": "input",
     }
-    assert requests[7].url.path == "/api/v1/traces/span/id"
-    assert requests[8].url.path == "/api/v1/runs/run/id/artifacts"
-    assert dict(requests[8].url.params) == {
+    assert requests[7].url.path == "/api/v1/runs/run/id/artifacts"
+    assert dict(requests[7].url.params) == {
         "limit": "4",
         "before": "artifact-2",
         "before_relation": "output",
@@ -488,43 +486,6 @@ def test_alerts_use_bounded_create_and_list_contracts() -> None:
     assert requests[0].url.path == "/api/v1/runs/run/id/alerts"
     assert json.loads(requests[0].read()) == alert
     assert dict(requests[1].url.params) == {"limit": "25", "before": alert["id"]}
-
-
-def test_traces_use_create_and_search_contracts() -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if request.method == "POST":
-            body = json.loads(request.read())
-            return httpx.Response(201, json={"span": body, "duplicate": False})
-        return httpx.Response(200, json={"spans": [], "next_before": None})
-
-    span = {
-        "id": "019c1234-5678-7000-8000-000000000022",
-        "trace_id": "trace-1",
-        "parent_span_id": None,
-        "name": "generate",
-        "kind": "llm",
-        "status": "ok",
-        "start_time_ms": 1,
-        "end_time_ms": 2,
-        "step": 4,
-        "attributes": {},
-        "preview": {},
-        "payload": None,
-    }
-    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
-        client.create_trace_span("run/id", span)
-        client.trace_spans("run/id", q="assistant reward", before=span["id"], limit=25)
-
-    assert requests[0].url.path == "/api/v1/runs/run/id/traces"
-    assert json.loads(requests[0].read()) == span
-    assert dict(requests[1].url.params) == {
-        "limit": "25",
-        "q": "assistant reward",
-        "before": span["id"],
-    }
 
 
 def test_public_run_query_uses_a_structured_filter_body() -> None:

@@ -9,8 +9,6 @@ import type {
   RichValueSummary,
   RunArtifactCursor,
   RunArtifactPage,
-  TraceSpan,
-  TraceSpanSummary,
 } from "./api";
 import { RunResourceController, type RunResourceState } from "./run-resources";
 
@@ -24,8 +22,8 @@ describe("RunResourceController", () => {
     );
     const signal = new AbortController().signal;
 
-    await controller.ensureLoaded("summary", { runId: "run-1", signal, traceSearch: "" });
-    await controller.ensureLoaded("summary", { runId: "run-1", signal, traceSearch: "" });
+    await controller.ensureLoaded("summary", { runId: "run-1", artifactRunIds: ["run-1"], signal });
+    await controller.ensureLoaded("summary", { runId: "run-1", artifactRunIds: ["run-1"], signal });
 
     expect(getAlertPage).toHaveBeenCalledOnce();
     expect(states.some((state) => state.loadingTabs.has("summary"))).toBe(true);
@@ -49,8 +47,8 @@ describe("RunResourceController", () => {
     );
     const context = {
       runId: "run-1",
+      artifactRunIds: ["run-1"],
       signal: new AbortController().signal,
-      traceSearch: "",
     };
 
     await controller.ensureLoaded("summary", context);
@@ -83,8 +81,8 @@ describe("RunResourceController", () => {
     );
     const context = {
       runId: "run-1",
+      artifactRunIds: ["run-1"],
       signal: new AbortController().signal,
-      traceSearch: "",
     };
 
     await controller.ensureLoaded("media", context);
@@ -113,8 +111,8 @@ describe("RunResourceController", () => {
     );
     const context = {
       runId: "run-1",
+      artifactRunIds: ["run-1"],
       signal: new AbortController().signal,
-      traceSearch: "",
     };
 
     await controller.ensureLoaded("summary", context);
@@ -126,34 +124,73 @@ describe("RunResourceController", () => {
     expect(states.at(-1)?.loadedTabs.has("summary")).toBe(true);
   });
 
+  it("filters and deduplicates artifacts across the selected runs", async () => {
+    const states: RunResourceState[] = [];
+    const shared = artifact("shared");
+    const getRunArtifactPage = vi.fn(async (runId: string) => ({
+      items:
+        runId === "run-a"
+          ? [artifactLink(shared, "output"), artifactLink(artifact("only-a"), "output")]
+          : [artifactLink(shared, "input"), artifactLink(artifact("only-b"), "output")],
+      nextCursor: null,
+    }));
+    const controller = new RunResourceController(
+      (state) => states.push(state),
+      fakeApi({ getRunArtifactPage }),
+    );
+    const signal = new AbortController().signal;
+
+    await controller.ensureLoaded("artifacts", {
+      runId: "run-a",
+      artifactRunIds: ["run-a", "run-b"],
+      signal,
+    });
+
+    const sharedGroup = states.at(-1)?.artifacts.find((group) => group.artifact.id === "shared");
+    expect(getRunArtifactPage.mock.calls.map(([runId]) => runId)).toEqual(["run-a", "run-b"]);
+    expect(states.at(-1)?.artifacts).toHaveLength(3);
+    expect(sharedGroup?.links).toEqual([
+      { runId: "run-a", relation: "output" },
+      { runId: "run-b", relation: "input" },
+    ]);
+
+    await controller.updateArtifactSelection(
+      { runId: "run-b", artifactRunIds: ["run-b"], signal },
+      true,
+    );
+    expect(states.at(-1)?.artifactRunIds).toEqual(["run-b"]);
+    expect(
+      states
+        .at(-1)
+        ?.artifacts.map((group) => group.artifact.id)
+        .sort(),
+    ).toEqual(["only-b", "shared"]);
+  });
+
   it("loads full records only for an explicitly selected summary", async () => {
     const states: RunResourceState[] = [];
     const value = richValue("value-1", 4);
     const getRichValue = vi.fn(async () => ({ ...value, metadata: { caption: "preview" } }));
     const getArtifact = vi.fn(async () => artifact("artifact-1"));
-    const getTrace = vi.fn(async () => trace("span-1"));
     const controller = new RunResourceController(
       (state) => states.push(state),
-      fakeApi({ getRichValue, getArtifact, getTrace }),
+      fakeApi({ getRichValue, getArtifact }),
     );
     const context = {
       runId: "run-1",
+      artifactRunIds: ["run-1"],
       signal: new AbortController().signal,
-      traceSearch: "",
     };
 
     await controller.loadRichDetail("value-1", context);
     await controller.loadArtifactDetail("artifact-1", context);
-    await controller.loadTraceDetail("span-1", context);
 
     expect(getRichValue).toHaveBeenCalledOnce();
     expect(getArtifact).toHaveBeenCalledOnce();
-    expect(getTrace).toHaveBeenCalledOnce();
     expect(states.at(-1)?.richValueDetails["value-1"]?.metadata).toEqual({
       caption: "preview",
     });
     expect(states.at(-1)?.artifactDetails["artifact-1"]?.entries).toEqual([]);
-    expect(states.at(-1)?.traceDetails["span-1"]?.attributes).toEqual({});
   });
 
   it("bounds cursor-fed rows and selected-detail caches", async () => {
@@ -172,8 +209,8 @@ describe("RunResourceController", () => {
     );
     const context = {
       runId: "run-1",
+      artifactRunIds: ["run-1"],
       signal: new AbortController().signal,
-      traceSearch: "",
     };
 
     await controller.ensureLoaded("summary", context);
@@ -181,7 +218,6 @@ describe("RunResourceController", () => {
     for (let index = 0; index < 30; index += 1) {
       await controller.loadRichDetail(`value-${index}`, context);
       await controller.loadArtifactDetail(`artifact-${index}`, context);
-      await controller.loadTraceDetail(`span-${index}`, context);
     }
 
     const state = states.at(-1)!;
@@ -189,7 +225,6 @@ describe("RunResourceController", () => {
     expect(state.truncatedTabs.has("summary")).toBe(true);
     expect(Object.keys(state.richValueDetails)).toHaveLength(24);
     expect(Object.keys(state.artifactDetails)).toHaveLength(24);
-    expect(Object.keys(state.traceDetails)).toHaveLength(24);
     expect(state.richValueDetails["value-0"]).toBeUndefined();
     expect(state.richValueDetails["value-29"]).toBeDefined();
   });
@@ -206,8 +241,8 @@ describe("RunResourceController", () => {
     );
     const context = {
       runId: "old-run",
+      artifactRunIds: ["old-run"],
       signal: new AbortController().signal,
-      traceSearch: "",
     };
 
     const request = controller.ensureLoaded("summary", context);
@@ -235,8 +270,8 @@ describe("RunResourceController", () => {
     );
     const context = {
       runId: "run-1",
+      artifactRunIds: ["run-1"],
       signal: new AbortController().signal,
-      traceSearch: "",
     };
 
     const initial = controller.ensureLoaded("summary", context);
@@ -259,8 +294,8 @@ describe("RunResourceController", () => {
     );
     const context = {
       runId: "run-1",
+      artifactRunIds: ["run-1"],
       signal: new AbortController().signal,
-      traceSearch: "",
     };
 
     for (let index = 0; index < 40; index += 1) {
@@ -271,33 +306,6 @@ describe("RunResourceController", () => {
     await vi.waitFor(() => expect(states.at(-1)?.richDetailLoading.size).toBe(28));
     controller.reset();
     expect(states.at(-1)?.richDetailLoading.size).toBe(0);
-  });
-
-  it("keeps only the latest trace search queued behind an active request", async () => {
-    const states: RunResourceState[] = [];
-    let resolveFirst!: (value: CursorPage<TraceSpanSummary>) => void;
-    const first = new Promise<CursorPage<TraceSpanSummary>>((resolve) => {
-      resolveFirst = resolve;
-    });
-    const getTracePage = vi
-      .fn<() => Promise<CursorPage<TraceSpanSummary>>>()
-      .mockImplementationOnce(() => first)
-      .mockResolvedValueOnce({ items: [trace("latest")], nextBefore: null });
-    const controller = new RunResourceController(
-      (state) => states.push(state),
-      fakeApi({ getTracePage }),
-    );
-    const signal = new AbortController().signal;
-
-    const staleSearch = controller.searchTraces({ runId: "run-1", signal, traceSearch: "old" });
-    await vi.waitFor(() => expect(getTracePage).toHaveBeenCalledOnce());
-    await controller.searchTraces({ runId: "run-1", signal, traceSearch: "latest" });
-    resolveFirst({ items: [trace("stale")], nextBefore: null });
-    await staleSearch;
-    await vi.waitFor(() => expect(getTracePage).toHaveBeenCalledTimes(2));
-    await vi.waitFor(() => expect(states.at(-1)?.traces[0]?.id).toBe("latest"));
-
-    expect(states.at(-1)?.traces.map((span) => span.id)).toEqual(["latest"]);
   });
 });
 
@@ -322,13 +330,6 @@ function fakeApi(
       signal?: AbortSignal,
     ): Promise<RunArtifactPage>;
     getArtifact(artifactId: string, signal?: AbortSignal): Promise<Artifact>;
-    getTracePage(
-      runId: string,
-      query?: string,
-      before?: string,
-      signal?: AbortSignal,
-    ): Promise<CursorPage<TraceSpanSummary>>;
-    getTrace(spanId: string, signal?: AbortSignal): Promise<TraceSpan>;
   }> = {},
 ) {
   return {
@@ -338,8 +339,6 @@ function fakeApi(
     getRichValue: async (valueId: string) => ({ ...richValue(valueId, 0), metadata: {} }),
     getRunArtifactPage: async () => ({ items: [], nextCursor: null }),
     getArtifact: async (artifactId: string) => artifact(artifactId),
-    getTracePage: async () => ({ items: [], nextBefore: null }),
-    getTrace: async (spanId: string) => trace(spanId),
     ...overrides,
   };
 }
@@ -391,21 +390,19 @@ function artifact(id: string): Artifact {
   };
 }
 
-function trace(id: string): TraceSpan {
+function artifactLink(value: Artifact, relation: "input" | "output") {
   return {
-    id,
-    run_id: "run-1",
-    trace_id: "trace-1",
-    parent_span_id: null,
-    name: "generate",
-    kind: "llm",
-    status: "ok",
-    start_time_ms: 1,
-    end_time_ms: 2,
-    step: 1,
-    attributes: {},
-    preview: {},
-    payload: null,
-    created_at: "2026-08-30T00:00:00Z",
+    relation,
+    artifact: {
+      id: value.id,
+      project_id: value.project_id,
+      project: value.project,
+      name: value.name,
+      type: value.type,
+      version: value.version,
+      entry_count: value.entries.length,
+      created_by_run: value.created_by_run,
+      created_at: value.created_at,
+    },
   };
 }

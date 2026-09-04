@@ -57,12 +57,6 @@ const TABLES: &[MutationTable] = &[
         deleted_project: "(SELECT project_id FROM artifact_versions WHERE id = OLD.artifact_id)",
     },
     MutationTable {
-        name: "trace_spans",
-        inserted_project: "(SELECT project_id FROM runs WHERE id = NEW.run_id)",
-        updated_project: "(SELECT project_id FROM runs WHERE id = NEW.run_id)",
-        deleted_project: "(SELECT project_id FROM runs WHERE id = OLD.run_id)",
-    },
-    MutationTable {
         name: "sweeps",
         inserted_project: "NEW.project_id",
         updated_project: "NEW.project_id",
@@ -120,7 +114,6 @@ mod tests {
             "artifact_versions",
             "artifact_aliases",
             "artifact_lineage",
-            "trace_spans",
             "sweeps",
             "sweep_trials",
             "reports",

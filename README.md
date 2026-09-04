@@ -10,13 +10,13 @@
 </p>
 
 EpochDeck is a high-performance, self-hosted experiment tracker for logging,
-comparing, and exploring training runs, metrics, traces, videos, and artifacts.
+comparing, and exploring training runs, metrics, videos, and artifacts.
 It stays fast and responsive even with long runs and very large metric
 histories.
 
 > [!WARNING]
 > EpochDeck is pre-alpha. Scalar metrics, host telemetry, alerts, rich media,
-> versioned artifacts, traces, finite sweeps, persisted reports, and streaming
+> versioned artifacts, finite sweeps, persisted reports, and streaming
 > W&B import/export are usable end to end. Authentication, multi-user
 > authorization, and the wider compatibility surface are still in development.
 > For remote access, place the server behind an authenticated HTTPS reverse
@@ -58,13 +58,13 @@ run.finish(summary={"result": "complete"})
 ```
 
 Open [http://127.0.0.1:8787](http://127.0.0.1:8787) to compare runs and inspect
-metrics, media, artifacts, traces, configuration, and summaries.
+metrics, media, artifacts, configuration, and summaries.
 
 ## Features
 
 - Durable, nonblocking online and offline logging.
 - Scalar and system metrics with bounded, spike-preserving chart queries.
-- Native images, audio, video, tables, histograms, traces, and alerts.
+- Native images, audio, video, tables, histograms, and alerts.
 - Versioned artifacts, lineage, reports, sweeps, and multi-run comparison.
 - Resumable W&B imports and lossless EpochDeck project exports.
 - One self-contained server binary with no hosted service dependency.

@@ -66,7 +66,6 @@
   import RunHeaderTabs from "./lib/RunHeaderTabs.svelte";
   import RunMediaPanel from "./lib/RunMediaPanel.svelte";
   import RunMetricsPanel from "./lib/RunMetricsPanel.svelte";
-  import RunTracePanel from "./lib/RunTracePanel.svelte";
   import { QueryScheduler } from "./lib/query-scheduler";
   import { appendUniquePage, reasonMessage } from "./lib/resource-state";
   import { retainHeadAndTail, retainRecord } from "./lib/retained-window";
@@ -188,7 +187,6 @@
   let selectedReport: Report | null = null;
   let activeRunTab: RunTab = "metrics";
   let metricSearch = "";
-  let traceSearch = "";
   let runResources = emptyRunResourceState();
   const runResourceController = new RunResourceController((state) => {
     runResources = state;
@@ -584,7 +582,6 @@
     runController = controller;
     selectedReport = null;
     resetReportState();
-    traceSearch = "";
     selectedRun = null;
     error = null;
     runResourceController.reset();
@@ -650,19 +647,59 @@
 
   async function toggleRun(run: RunListItem, selected: boolean): Promise<void> {
     selectionNotice = null;
+    let nextRunIds = selectedRunIds;
     if (selected) {
       if (selectedRunIds.includes(run.id)) return;
       if (selectedRunIds.length >= MAX_SELECTED_RUNS) {
         selectionNotice = `Up to ${MAX_SELECTED_RUNS} runs can be visible at once.`;
         return;
       }
-      selectedRunIds = [...selectedRunIds, run.id];
-      await loadMetricCatalog(null, []);
-      if (!selectedRun) await activatePrimaryRun(run.id, true);
+      nextRunIds = [...selectedRunIds, run.id];
     } else {
-      selectedRunIds = selectedRunIds.filter((runId) => runId !== run.id);
-      await loadMetricCatalog(null, []);
-      if (selectedRun?.id === run.id) await activatePrimaryRun(selectedRunIds[0] ?? null, true);
+      nextRunIds = selectedRunIds.filter((runId) => runId !== run.id);
+    }
+    await applyRunSelection(
+      nextRunIds,
+      selectedRun?.id === run.id ? null : (selectedRun?.id ?? null),
+    );
+  }
+
+  async function selectOnlyRun(run: RunListItem): Promise<void> {
+    selectionNotice = null;
+    await applyRunSelection([run.id], run.id);
+  }
+
+  async function hideAllRuns(): Promise<void> {
+    selectionNotice = null;
+    await applyRunSelection([], null);
+  }
+
+  async function showAllRuns(): Promise<void> {
+    const visibleRunIds = navigationRuns.slice(0, MAX_SELECTED_RUNS).map((run) => run.id);
+    selectionNotice =
+      navigationRuns.length > MAX_SELECTED_RUNS
+        ? `Showing the first ${MAX_SELECTED_RUNS} loaded runs.`
+        : null;
+    await applyRunSelection(visibleRunIds, selectedRun?.id ?? visibleRunIds[0] ?? null);
+  }
+
+  async function applyRunSelection(
+    runIds: string[],
+    preferredPrimaryId: string | null,
+  ): Promise<void> {
+    selectedRunIds = [...new Set(runIds)].slice(0, MAX_SELECTED_RUNS);
+    await loadMetricCatalog(null, []);
+    const primaryRunId =
+      preferredPrimaryId && selectedRunIds.includes(preferredPrimaryId)
+        ? preferredPrimaryId
+        : (selectedRunIds[0] ?? null);
+    if (selectedRun?.id !== primaryRunId) {
+      await activatePrimaryRun(primaryRunId, true);
+    } else {
+      const context = activeResourceContext();
+      if (context) {
+        await runResourceController.updateArtifactSelection(context, activeRunTab === "artifacts");
+      }
     }
     resetChartState(false);
     queueVisibleMetrics();
@@ -1049,7 +1086,6 @@
     metricBackHistoryTruncated = false;
     metricCatalogLoading = false;
     metricCatalogError = null;
-    traceSearch = "";
     activeRunTab = "metrics";
     metricSearch = "";
     runResourceController.reset();
@@ -1106,7 +1142,6 @@
     runController = controller;
     selectedRun = null;
     selectedReport = null;
-    traceSearch = "";
     runResourceController.reset();
     liveChartRefresh.clear();
     chartScheduler.cancelAll();
@@ -1841,17 +1876,16 @@
 
   function activeResourceContext(): RunResourceContext | null {
     if (!selectedRun || !runController) return null;
-    return { runId: selectedRun.id, signal: runController.signal, traceSearch };
+    return {
+      runId: selectedRun.id,
+      artifactRunIds: selectedRunIds,
+      signal: runController.signal,
+    };
   }
 
   function retryRunTab(tab: RunTab): void {
     const context = activeResourceContext();
     if (context) void runResourceController.retry(tab, context);
-  }
-
-  function searchTraces(): void {
-    const context = activeResourceContext();
-    if (context) void runResourceController.searchTraces(context);
   }
 
   async function selectRunTab(tab: RunTab): Promise<void> {
@@ -1894,18 +1928,12 @@
     if (context) void runResourceController.loadArtifactDetail(artifactId, context);
   }
 
-  function loadTraceDetail(spanId: string): void {
-    const context = activeResourceContext();
-    if (context) void runResourceController.loadTraceDetail(spanId, context);
-  }
-
   function runTabCount(tab: RunTab): number {
     if (tab === "summary") return Object.keys(selectedRun?.summary ?? {}).length;
     if (tab === "configuration") return Object.keys(selectedRun?.config ?? {}).length;
     if (tab === "media") {
       return runResources.richKeys.reduce((total, key) => total + key.count, 0);
     }
-    if (tab === "traces") return runResources.traces.length;
     return runResources.artifacts.length;
   }
 
@@ -1913,16 +1941,17 @@
     if (runResources.loadingTabs.has(tab) || (tab === "metrics" && metricCatalogLoading)) {
       return "…";
     }
-    if (["media", "traces", "artifacts"].includes(tab) && !runResources.loadedTabs.has(tab)) {
+    if (["media", "artifacts"].includes(tab) && !runResources.loadedTabs.has(tab)) {
       return "—";
     }
     if (tab === "metrics") return metricCatalogTotalCount.toLocaleString();
     const hasMore =
       (tab === "media" && Boolean(runResources.richKeyCursor || runResources.truncatedRichKeys)) ||
-      (tab === "traces" &&
-        Boolean(runResources.traceCursor || runResources.truncatedTabs.has("traces"))) ||
       (tab === "artifacts" &&
-        Boolean(runResources.artifactCursor || runResources.truncatedTabs.has("artifacts")));
+        Boolean(
+          Object.values(runResources.artifactCursors).some(Boolean) ||
+          runResources.truncatedTabs.has("artifacts"),
+        ));
     return `${runTabCount(tab).toLocaleString()}${hasMore ? "+" : ""}`;
   }
 </script>
@@ -2025,6 +2054,9 @@
           onloadruns={() => void loadMoreRuns()}
           ontogglerun={(run, selected) => void toggleRun(run, selected)}
           onchooserun={(run) => void chooseRun(run)}
+          onselectonly={(run) => void selectOnlyRun(run)}
+          onhideall={() => void hideAllRuns()}
+          onshowall={() => void showAllRuns()}
           onhoverrun={hoverRun}
           onrunstylechange={updateRunStyle}
           onresetrunstyle={resetRunStyle}
@@ -2133,22 +2165,10 @@
               onloadmore={() => void loadMore("media")}
             />
 
-            <RunTracePanel
-              active={activeRunTab === "traces"}
-              state={runResources}
-              bind:search={traceSearch}
-              error={runResources.errors.traces}
-              loading={runResources.loadingTabs.has("traces")}
-              loadingMoreTab={runResources.loadingMoreTab}
-              onsearch={searchTraces}
-              onretry={() => retryRunTab("traces")}
-              onselectdetail={loadTraceDetail}
-              onloadmore={() => void loadMore("traces")}
-            />
-
             <RunArtifactPanel
               active={activeRunTab === "artifacts"}
               state={runResources}
+              runs={comparisonRuns}
               error={runResources.errors.artifacts}
               loading={runResources.loadingTabs.has("artifacts")}
               loadingMoreTab={runResources.loadingMoreTab}

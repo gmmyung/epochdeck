@@ -10,6 +10,8 @@
     CircleCheck,
     Download,
     Ellipsis,
+    Eye,
+    EyeOff,
     File,
     Folder,
     Hand,
@@ -18,7 +20,6 @@
     Maximize2,
     Minimize2,
     RotateCcw,
-    Route,
     Scan,
     Search,
     SlidersHorizontal,
@@ -37,6 +38,7 @@
     | "chevron-right"
     | "download"
     | "expand"
+    | "hide"
     | "file"
     | "folder"
     | "hand"
@@ -47,9 +49,9 @@
     | "reset"
     | "search"
     | "select"
+    | "show"
     | "settings"
-    | "summary"
-    | "trace";
+    | "summary";
 
   const icons: Record<IconName, LucideIcon> = {
     activity: Activity,
@@ -62,6 +64,7 @@
     "chevron-right": ChevronRight,
     download: Download,
     expand: Maximize2,
+    hide: EyeOff,
     file: File,
     folder: Folder,
     hand: Hand,
@@ -72,9 +75,9 @@
     reset: RotateCcw,
     search: Search,
     select: Scan,
+    show: Eye,
     settings: SlidersHorizontal,
     summary: List,
-    trace: Route,
   };
 </script>
 

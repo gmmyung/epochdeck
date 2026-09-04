@@ -7,6 +7,7 @@ so storage and APIs may change without migration or compatibility shims.
 
 ### Added
 
+- The metrics toolbar now has a persistent one-to-four-column density selector.
 - A minimal stacked-epoch logo now serves as the default dashboard mark and
   favicon, and the README presents the project with CI and release badges.
 - Dashboard favicon configuration is independent from the logo, with safe
@@ -26,6 +27,11 @@ so storage and APIs may change without migration or compatibility shims.
   light and dark themes use quieter chart dividers, transparent plot and legend
   surfaces, omit empty report navigation, and use more consistent sidebar and
   content alignment.
+- Run visibility controls now include icon-labeled Hide all, Show all, and Show
+  only actions. The desktop sidebar stays fixed while its bounded run list
+  scrolls independently.
+- The artifact browser follows the checked runs, deduplicates shared artifacts,
+  and shows every selected-run input/output relationship.
 - Metric charts now render with uPlot; dashboard selects and enlarged-chart
   dialogs use Bits UI accessibility primitives, dashboard icons use Lucide, and
   the Python SDK derives its default spool root from the operating system's
@@ -47,8 +53,16 @@ so storage and APIs may change without migration or compatibility shims.
   cargo-zigbuild, emulation, and cross-compilation are no longer in the release
   toolchain.
 
+### Removed
+
+- Structured execution traces, including the Python API, durable spool, HTTP
+  routes, catalog tables, export records, and dashboard tab. EpochDeck now
+  focuses on experiment metrics, media, artifacts, alerts, sweeps, and reports.
+
 ### Fixed
 
+- Metric pagination uses compact arrow controls beside the filters instead of a
+  separate low-density row.
 - Mobile run cards no longer overlap inside the horizontally scrolling run
   selector, its collapsed state stays in a compact strip above the run, and the
   disclosure arrow reflects its vertical motion.
@@ -85,7 +99,7 @@ so storage and APIs may change without migration or compatibility shims.
 
 - Rust server with SQLite catalog, Arrow/Parquet histories, and split CAS storage.
 - Python SDK with durable online and offline delivery.
-- Native rich media, artifacts, traces, sweeps, reports, alerts, and host telemetry.
+- Native rich media, artifacts, sweeps, reports, alerts, and host telemetry.
 - Lazy multi-run dashboard with bounded uPlot charts and searchable resources.
 - Standard reverse-proxy deployment, diagnostics, physical backup/restore, and
   project export.

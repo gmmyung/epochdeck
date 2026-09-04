@@ -5,8 +5,8 @@ The pre-alpha API is versioned under `/api/v1`. Request bodies are capped at
 
 Every integer nested in an arbitrary JSON document must be in JavaScript's
 exact range, `-9007199254740991` through `9007199254740991`. This applies to
-config and explicit-summary documents, rich/artifact/trace metadata and trace
-previews, run-query document equality values, and sweep parameter values.
+config and explicit-summary documents, rich/artifact metadata, run-query
+document equality values, and sweep parameter values.
 Values at both limits are accepted; an integer one step outside either limit is
 rejected before persistence or comparison. The check walks only the already
 bounded serialized document or request.
@@ -41,8 +41,8 @@ summary was truncated.
 
 `document_revision` increments once for each real config, explicit-summary, or
 finish mutation and does not increment for an idempotent no-op. Metric ingest
-and its derived preview use `metric_revision`. Alerts, rich values, artifact
-lineage, and traces use `rich_data_revision`. These integer revisions, rather
+and its derived preview use `metric_revision`. Alerts, rich values, and artifact
+lineage use `rich_data_revision`. These integer revisions, rather
 than the one-second `updated_at` timestamp, are the cache-invalidation contract.
 
 ## Metrics
@@ -288,23 +288,6 @@ may occur once as an input and once as an output. Both values must be omitted or
 supplied together. Artifact lineage is paginated separately for `input` and
 `output` relations and returns lightweight run summaries plus `next_before`.
 
-## Traces
-
-- `POST /runs/{run_id}/traces` creates a structured span.
-- `GET /runs/{run_id}/traces?limit=100&before=<span_id>` returns bounded
-  newest-first span summaries.
-- `GET /runs/{run_id}/traces?q=assistant+reward&limit=100` searches indexed
-  names, attributes, and bounded message previews.
-- `GET /traces/{span_id}` returns one span.
-
-Span bodies contain an optional stable UUIDv7 `id`, a caller-selected
-`trace_id`, optional `parent_span_id`, name, `span`, `llm`, `tool`, `chain`, or
-`agent` kind, `unset`, `ok`, or `error` status, start/end times, optional run
-step, bounded attributes and preview documents, and an optional uploaded JSON
-payload blob. Complete inputs, outputs, and messages belong in the payload;
-SQLite retains only the metadata needed to list and search. Exact span retries
-are idempotent, and reusing an ID with different contents returns a conflict.
-
 ## Sweeps and agents
 
 - `POST /projects/{project}/sweeps` creates an idempotent sweep definition.
@@ -387,12 +370,12 @@ and the page limit must cover the set. Document filters use typed JSON equality,
 including null. Unknown fields, unsupported operators, and alternate sort
 orders fail explicitly.
 
-Newest-first project, run, report, artifact, rich-value, trace, sweep, and alert
+Newest-first project, run, report, artifact, rich-value, sweep, and alert
 lists order by their event time and ID. Although the cursor is represented by an
 ID, the server resolves its full ordering tuple and rejects missing or foreign
 cursors. This is stable for imported deterministic IDs that do not encode time.
-List records deliberately omit large config, summary, layout, manifest, and
-trace documents; fetch the detail route only after selection.
+List records deliberately omit large config, summary, layout, and manifest
+documents; fetch the detail route only after selection.
 
 Every project summary contains `id`, `name`, `created_at`, `run_count`, and an
 opaque decimal-string `mutation_token`. The token changes monotonically for

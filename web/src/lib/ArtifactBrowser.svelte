@@ -3,13 +3,7 @@
 
   import Icon from "./Icon.svelte";
   import JsonTreeNode from "./JsonTreeNode.svelte";
-  import {
-    artifactArchiveUrl,
-    artifactFileUrl,
-    type Artifact,
-    type ArtifactEntry,
-    type RunArtifact,
-  } from "./api";
+  import { artifactArchiveUrl, artifactFileUrl, type Artifact, type ArtifactEntry } from "./api";
   import {
     ARTIFACT_ITEM_PAGE_SIZE,
     artifactBreadcrumbs,
@@ -19,19 +13,21 @@
     type ArtifactBrowserItem,
     type ArtifactBreadcrumb,
   } from "./artifact-browser";
+  import type { SelectedRunArtifact } from "./run-resources";
 
-  export let artifacts: RunArtifact[];
+  export let artifacts: SelectedRunArtifact[];
+  export let runNames: Record<string, string> = {};
   export let details: Record<string, Artifact> = {};
   export let detailLoading = new Set<string>();
   export let detailErrors: Record<string, string> = {};
   export let onselect: (artifactId: string) => void = () => {};
 
   let activeKey = "";
-  let orderedArtifacts: RunArtifact[] = [];
+  let orderedArtifacts: SelectedRunArtifact[] = [];
   let previousActiveKey = "";
   let currentDirectory = "";
   let tabRail: HTMLElement;
-  let selectedLink: RunArtifact | undefined;
+  let selectedLink: SelectedRunArtifact | undefined;
   let selectedArtifact: Artifact | undefined;
   let items: ArtifactBrowserItem[] = [];
   let breadcrumbs: ArtifactBreadcrumb[] = [];
@@ -90,15 +86,15 @@
     return () => media.removeEventListener("change", update);
   });
 
-  function linkKey(linked: RunArtifact): string {
-    return `${linked.artifact.id}:${linked.relation}`;
+  function linkKey(linked: SelectedRunArtifact): string {
+    return linked.artifact.id;
   }
 
-  function tabId(linked: RunArtifact): string {
-    return `artifact-tab-${linked.artifact.id}-${linked.relation}`;
+  function tabId(linked: SelectedRunArtifact): string {
+    return `artifact-tab-${linked.artifact.id}`;
   }
 
-  function chooseArtifact(linked: RunArtifact): void {
+  function chooseArtifact(linked: SelectedRunArtifact): void {
     activeKey = linkKey(linked);
   }
 
@@ -162,12 +158,22 @@
     return `${artifact.name}-v${artifact.version}.zip`;
   }
 
-  function compareArtifactLinks(left: RunArtifact, right: RunArtifact): number {
+  function compareArtifactLinks(left: SelectedRunArtifact, right: SelectedRunArtifact): number {
     return (
       right.artifact.name.localeCompare(left.artifact.name, undefined, { numeric: true }) ||
       right.artifact.version - left.artifact.version ||
       right.artifact.created_at.localeCompare(left.artifact.created_at)
     );
+  }
+
+  function relations(linked: SelectedRunArtifact): string {
+    return [...new Set(linked.links.map((link) => link.relation))].join(" + ");
+  }
+
+  function linkedRuns(linked: SelectedRunArtifact): string {
+    const names = [...new Set(linked.links.map((link) => runNames[link.runId] ?? link.runId))];
+    if (names.length <= 2) return names.join(", ");
+    return `${names.slice(0, 2).join(", ")} +${names.length - 2}`;
   }
 </script>
 
@@ -195,7 +201,7 @@
           <Icon name="archive" size={15} />
           <span>
             <strong>{linked.artifact.name}:v{linked.artifact.version}</strong>
-            <small>{linked.relation} · {linked.artifact.type}</small>
+            <small>{relations(linked)} · {linkedRuns(linked)}</small>
           </span>
         </button>
       {/each}
@@ -211,11 +217,13 @@
         <div>
           <div class="artifact-title">
             <strong>{selectedLink.artifact.name}:v{selectedLink.artifact.version}</strong>
-            <span>{selectedLink.relation}</span>
+            <span>{relations(selectedLink)}</span>
             <span>{selectedLink.artifact.type}</span>
           </div>
           <p>
-            {selectedLink.artifact.entry_count.toLocaleString()} files{selectedArtifact
+            {selectedLink.artifact.entry_count.toLocaleString()} files · {linkedRuns(
+              selectedLink,
+            )}{selectedArtifact
               ? ` · ${formatBytes(artifactTotalSize(selectedArtifact.entries))}`
               : ""}
           </p>
@@ -358,7 +366,7 @@
     </div>
   </div>
 {:else}
-  <div class="empty-artifacts">No artifacts linked to this run.</div>
+  <div class="empty-artifacts">No artifacts linked to the selected runs.</div>
 {/if}
 
 <style>

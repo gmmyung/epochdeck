@@ -27,10 +27,9 @@ tested.
 | Rich values       | Images, audio, video, tables, and histograms                    | Compatible |
 | Alerts            | Levels, titles, text, steps, and timestamps                     | Compatible |
 | Artifacts         | Manifests, versions, aliases, and lineage                       | Compatible |
-| Traces            | Structured spans, messages, payloads, and search                | Compatible |
 | Python API        | Synchronous logging, background delivery, and read APIs         | Partial    |
 | CLI               | Health, query, sync, W&B import, and EpochDeck export           | Partial    |
-| Dashboard         | Runs, comparison charts, media, artifacts, traces, and reports  | Partial    |
+| Dashboard         | Runs, comparison charts, media, artifacts, and reports          | Partial    |
 | Import and export | Resumable W&B import and lossless EpochDeck export              | Partial    |
 
 ## W&B compatibility
@@ -49,7 +48,8 @@ tested.
 | W&B import with resumable checkpoints                  | Partial    |
 
 Hosted-platform features are out of scope. EpochDeck owns its server, storage,
-dashboard, and deployment model.
+dashboard, and deployment model. Structured execution traces are deliberately
+not supported.
 
 ## Contract rules
 

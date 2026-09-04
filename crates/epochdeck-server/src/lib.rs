@@ -39,20 +39,19 @@ use epochdeck_protocol::{
     ClaimSweepTrialResponse, CompleteSweepTrialRequest, ConfigUpdateRequest, CreateAlertRequest,
     CreateAlertResponse, CreateArtifactRequest, CreateArtifactResponse, CreateReportRequest,
     CreateReportResponse, CreateRichValueRequest, CreateRichValueResponse, CreateRunRequest,
-    CreateRunResponse, CreateSweepRequest, CreateSweepResponse, CreateTraceSpanRequest,
-    CreateTraceSpanResponse, DiagnosticsResponse, FinishRunRequest, FinishRunResponse,
-    HealthResponse, HeartbeatSweepTrialRequest, HistoryResponse, IngestBatchRequest,
-    IngestBatchResponse, MAX_ALERT_TEXT_BYTES, MAX_ALERT_TITLE_BYTES, MAX_ARTIFACT_ENTRIES,
-    MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS, MAX_CHART_BUCKET_CELLS, MAX_CHART_BUCKETS,
-    MAX_CHART_QUERY_CELLS, MAX_CHART_QUERY_RUNS, MAX_CHART_QUERY_SERIES, MAX_CONFIG_BYTES,
-    MAX_HISTORY_KEYS, MAX_HISTORY_POINTS, MAX_JSON_SAFE_INTEGER, MAX_METRICS_PER_POINT,
-    MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES, MAX_SUMMARY_BYTES, MAX_TRACE_METADATA_BYTES,
-    ReportId, ReportLayout, ReportListResponse, ReportPanelKind, ReportRecord, ResumePolicy,
-    RichValueId, RichValueKeyListResponse, RichValueKind, RichValueListResponse,
+    CreateRunResponse, CreateSweepRequest, CreateSweepResponse, DiagnosticsResponse,
+    FinishRunRequest, FinishRunResponse, HealthResponse, HeartbeatSweepTrialRequest,
+    HistoryResponse, IngestBatchRequest, IngestBatchResponse, MAX_ALERT_TEXT_BYTES,
+    MAX_ALERT_TITLE_BYTES, MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_MANIFEST_BYTES, MAX_BATCH_POINTS,
+    MAX_CHART_BUCKET_CELLS, MAX_CHART_BUCKETS, MAX_CHART_QUERY_CELLS, MAX_CHART_QUERY_RUNS,
+    MAX_CHART_QUERY_SERIES, MAX_CONFIG_BYTES, MAX_HISTORY_KEYS, MAX_HISTORY_POINTS,
+    MAX_JSON_SAFE_INTEGER, MAX_METRICS_PER_POINT, MAX_RICH_KEY_BYTES, MAX_RICH_METADATA_BYTES,
+    MAX_SUMMARY_BYTES, ReportId, ReportLayout, ReportListResponse, ReportPanelKind, ReportRecord,
+    ResumePolicy, RichValueId, RichValueKeyListResponse, RichValueKind, RichValueListResponse,
     RunArtifactListResponse, RunId, RunQueryRequest, RunState, RunUpdateResponse,
     SlowRequestRecord, SummaryUpdateRequest, SweepId, SweepListResponse, SweepTrialId,
-    SweepTrialListResponse, SweepTrialRecord, SweepTrialState, TraceSpanId, TraceSpanListResponse,
-    UpdateReportRequest, UseArtifactRequest,
+    SweepTrialListResponse, SweepTrialRecord, SweepTrialState, UpdateReportRequest,
+    UseArtifactRequest,
 };
 use epochdeck_storage::{
     BlobInstallation, BlobStore, ChartAxisExtent, ChartAxisExtentScanner, ChartCoordinate,
@@ -103,9 +102,6 @@ const MAX_ARTIFACT_PATH_BYTES: usize = 1_024;
 const MAX_ARTIFACT_DESCRIPTION_BYTES: usize = 64 * 1024;
 const ARTIFACT_ZIP_CHUNK_BYTES: usize = 64 * 1024;
 const ARTIFACT_ZIP_CHANNEL_CAPACITY: usize = 2;
-const MAX_TRACE_ID_BYTES: usize = 128;
-const MAX_TRACE_NAME_BYTES: usize = 256;
-const MAX_TRACE_SEARCH_BYTES: usize = 256;
 const MAX_SWEEP_PARAMETERS: usize = 64;
 const MAX_SWEEP_VALUES: usize = 256;
 const MAX_SWEEP_RUNS: u64 = 100_000;
@@ -539,11 +535,6 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/artifacts/{artifact_id}/files/{*artifact_path}",
             get(get_artifact_file),
         )
-        .route(
-            "/api/v1/runs/{run_id}/traces",
-            post(create_trace_span).get(list_trace_spans),
-        )
-        .route("/api/v1/traces/{span_id}", get(get_trace_span))
         .route("/api/v1/blobs/{digest}", put(upload_blob).get(get_blob))
         .route("/api/v1/runs/{run_id}/history", get(history))
         .route("/api/v1/runs/{run_id}/chart-history", get(chart_history))
@@ -1962,84 +1953,6 @@ async fn get_artifact_file(
     .await
 }
 
-async fn create_trace_span(
-    State(state): State<AppState>,
-    Path(run_id): Path<RunId>,
-    Json(mut request): Json<CreateTraceSpanRequest>,
-) -> Result<(StatusCode, Json<CreateTraceSpanResponse>), HttpError> {
-    let span_id = request.id.unwrap_or_default();
-    request.id = Some(span_id);
-    validate_trace_span(&request)?;
-    if let Some(payload) = &request.payload {
-        let actual_size = state
-            .blobs
-            .size(&payload.digest)
-            .map_err(|error| HttpError::invalid(error.to_string()))?
-            .ok_or_else(|| HttpError::invalid("trace payload blob has not been uploaded"))?;
-        if actual_size != payload.size {
-            return Err(HttpError::invalid(
-                "trace payload size does not match uploaded content",
-            ));
-        }
-    }
-    let _mutation = acquire_mutation_locks(
-        &state,
-        vec![mutation_lock_index(&run_id), mutation_lock_index(&span_id)],
-    )
-    .await;
-    let (span, duplicate) = state.catalog.create_trace_span(run_id, &request).await?;
-    let status = if duplicate {
-        StatusCode::OK
-    } else {
-        StatusCode::CREATED
-    };
-    Ok((status, Json(CreateTraceSpanResponse { span, duplicate })))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TraceListQuery {
-    before: Option<TraceSpanId>,
-    q: Option<String>,
-    #[serde(default = "default_list_limit")]
-    limit: usize,
-}
-
-async fn list_trace_spans(
-    State(state): State<AppState>,
-    Path(run_id): Path<RunId>,
-    Query(query): Query<TraceListQuery>,
-) -> Result<Json<TraceSpanListResponse>, HttpError> {
-    validate_list_limit(query.limit)?;
-    if query.q.as_ref().is_some_and(|value| {
-        value.len() > MAX_TRACE_SEARCH_BYTES || value.chars().any(char::is_control)
-    }) {
-        return Err(HttpError::invalid(format!(
-            "trace search cannot exceed {MAX_TRACE_SEARCH_BYTES} non-control bytes"
-        )));
-    }
-    let mut spans = state
-        .catalog
-        .list_trace_spans(
-            run_id,
-            query.before,
-            query.q.as_deref(),
-            page_limit(query.limit),
-        )
-        .await?;
-    let has_more = spans.len() > query.limit;
-    spans.truncate(query.limit);
-    let next_before = has_more.then(|| spans.last().map(|span| span.id)).flatten();
-    Ok(Json(TraceSpanListResponse { spans, next_before }))
-}
-
-async fn get_trace_span(
-    State(state): State<AppState>,
-    Path(span_id): Path<TraceSpanId>,
-) -> Result<Json<epochdeck_protocol::TraceSpanRecord>, HttpError> {
-    Ok(Json(state.catalog.get_trace_span(span_id).await?))
-}
-
 async fn upload_blob(
     State(state): State<AppState>,
     Path(digest): Path<String>,
@@ -3249,46 +3162,6 @@ fn verify_artifact_blobs(
     Ok(())
 }
 
-fn validate_trace_span(request: &CreateTraceSpanRequest) -> Result<(), HttpError> {
-    if request.trace_id.is_empty()
-        || request.trace_id.len() > MAX_TRACE_ID_BYTES
-        || request.trace_id.chars().any(char::is_control)
-    {
-        return Err(HttpError::invalid(format!(
-            "trace ID must contain 1 to {MAX_TRACE_ID_BYTES} non-control bytes"
-        )));
-    }
-    if request.name.is_empty()
-        || request.name.len() > MAX_TRACE_NAME_BYTES
-        || request.name.chars().any(char::is_control)
-    {
-        return Err(HttpError::invalid(format!(
-            "trace name must contain 1 to {MAX_TRACE_NAME_BYTES} non-control bytes"
-        )));
-    }
-    validate_json_safe_timestamp(request.start_time_ms, "trace start timestamp")?;
-    validate_json_safe_timestamp(request.end_time_ms, "trace end timestamp")?;
-    if request.end_time_ms < request.start_time_ms {
-        return Err(HttpError::invalid(
-            "trace end timestamp must be at or after start",
-        ));
-    }
-    if let Some(step) = request.step {
-        validate_json_safe_unsigned(step, "trace step")?;
-    }
-    validate_document_size(
-        &request.attributes,
-        "trace attributes",
-        MAX_TRACE_METADATA_BYTES,
-    )?;
-    validate_document_size(&request.preview, "trace preview", MAX_TRACE_METADATA_BYTES)?;
-    if let Some(payload) = &request.payload {
-        validate_mime_type(&payload.mime_type)?;
-        validate_file_name(payload.file_name.as_deref())?;
-    }
-    Ok(())
-}
-
 fn validate_mime_type(value: &str) -> Result<(), HttpError> {
     if value.is_empty()
         || value.len() > MAX_MIME_TYPE_BYTES
@@ -4134,18 +4007,16 @@ mod tests {
         ConfigUpdateRequest, CreateAlertRequest, CreateAlertResponse, CreateArtifactRequest,
         CreateArtifactResponse, CreateReportRequest, CreateReportResponse, CreateRichValueRequest,
         CreateRichValueResponse, CreateRunRequest, CreateRunResponse, CreateSweepRequest,
-        CreateSweepResponse, CreateTraceSpanRequest, CreateTraceSpanResponse,
-        DashboardConfigResponse, DiagnosticsResponse, EarlyTerminateConfig, FinishRunRequest,
-        FinishRunResponse, HealthResponse, HealthStatus, HeartbeatSweepTrialRequest,
-        HistoryResponse, IngestBatchRequest, IngestBatchResponse, MetricCatalogMode, MetricGoal,
-        MetricKeyListResponse, MetricPoint, ProjectListResponse, ProjectMetricCatalogRequest,
-        ProjectMetricCatalogResponse, ProjectSummary, ReportLayout, ReportListResponse,
-        ReportPanel, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId,
+        CreateSweepResponse, DashboardConfigResponse, DiagnosticsResponse, EarlyTerminateConfig,
+        FinishRunRequest, FinishRunResponse, HealthResponse, HealthStatus,
+        HeartbeatSweepTrialRequest, HistoryResponse, IngestBatchRequest, IngestBatchResponse,
+        MetricCatalogMode, MetricGoal, MetricKeyListResponse, MetricPoint, ProjectListResponse,
+        ProjectMetricCatalogRequest, ProjectMetricCatalogResponse, ProjectSummary, ReportLayout,
+        ReportListResponse, ReportPanel, ReportPanelKind, ReportRecord, ResumePolicy, RichValueId,
         RichValueKeyListResponse, RichValueKind, RichValueListResponse, RunArtifactListResponse,
         RunId, RunListResponse, RunQueryRequest, RunQueryResponse, RunState, RunUpdateResponse,
         SummaryUpdateRequest, SweepMethod, SweepMetric, SweepParameter, SweepTrialListResponse,
-        SweepTrialState, TraceKind, TraceSpanId, TraceSpanListResponse, TraceSpanRecord,
-        TraceStatus, UpdateReportRequest, UseArtifactRequest,
+        SweepTrialState, UpdateReportRequest, UseArtifactRequest,
     };
     use epochdeck_storage::{BlobStore, ChartAxisExtent, MetricStore, StorageError};
     use sha2::{Digest, Sha256};
@@ -4351,28 +4222,6 @@ mod tests {
                 })
                 .is_err()
             );
-            for (attributes, preview) in [
-                (document.clone(), BTreeMap::new()),
-                (BTreeMap::new(), document.clone()),
-            ] {
-                assert!(
-                    super::validate_trace_span(&CreateTraceSpanRequest {
-                        id: None,
-                        trace_id: "trace".to_owned(),
-                        parent_span_id: None,
-                        name: "span".to_owned(),
-                        kind: TraceKind::Span,
-                        status: TraceStatus::Ok,
-                        start_time_ms: 0,
-                        end_time_ms: 0,
-                        step: None,
-                        attributes,
-                        preview,
-                        payload: None,
-                    })
-                    .is_err()
-                );
-            }
             for (config_equals, summary_equals) in [
                 (document.clone(), BTreeMap::new()),
                 (BTreeMap::new(), document.clone()),
@@ -7656,79 +7505,6 @@ mod tests {
             file.read_to_end(&mut contents)?;
             assert_eq!(contents, video);
         }
-
-        let trace_payload = br#"{"inputs":{"prompt":"reward"},"outputs":{"text":"reward is 3"},"messages":[{"role":"assistant","content":"reward is 3"}]}"#;
-        let trace_digest = format!("{:x}", Sha256::digest(trace_payload));
-        let response = router
-            .clone()
-            .oneshot(
-                Request::put(format!("/api/v1/blobs/{trace_digest}"))
-                    .header("content-type", "application/vnd.epochdeck.trace+json")
-                    .header("content-length", trace_payload.len())
-                    .body(Body::from(trace_payload.as_slice()))?,
-            )
-            .await?;
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let trace_id = TraceSpanId::new();
-        let trace_path = format!("/api/v1/runs/{}/traces", created.run.id);
-        let trace_request = CreateTraceSpanRequest {
-            id: Some(trace_id),
-            trace_id: "trace-answer".to_owned(),
-            parent_span_id: None,
-            name: "generate-answer".to_owned(),
-            kind: TraceKind::Llm,
-            status: TraceStatus::Ok,
-            start_time_ms: 2_200,
-            end_time_ms: 2_250,
-            step: Some(12),
-            attributes: BTreeMap::from([("model".to_owned(), "local-model".into())]),
-            preview: BTreeMap::from([(
-                "messages".to_owned(),
-                serde_json::json!([{"role": "assistant", "content": "reward is 3"}]),
-            )]),
-            payload: Some(BlobRef {
-                digest: trace_digest,
-                size: trace_payload.len() as u64,
-                mime_type: "application/vnd.epochdeck.trace+json".to_owned(),
-                file_name: None,
-            }),
-        };
-        let response = router
-            .clone()
-            .oneshot(json_request("POST", &trace_path, &trace_request)?)
-            .await?;
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let created_trace: CreateTraceSpanResponse = response_json(response).await?;
-        assert!(!created_trace.duplicate);
-        let replayed_trace: CreateTraceSpanResponse = response_json(
-            router
-                .clone()
-                .oneshot(json_request("POST", &trace_path, &trace_request)?)
-                .await?,
-        )
-        .await?;
-        assert!(replayed_trace.duplicate);
-        assert_eq!(replayed_trace.span, created_trace.span);
-        let traces: TraceSpanListResponse = response_json(
-            router
-                .clone()
-                .oneshot(
-                    Request::get(format!("{trace_path}?q=assistant%20reward&limit=10"))
-                        .body(Body::empty())?,
-                )
-                .await?,
-        )
-        .await?;
-        assert_eq!(traces.spans.len(), 1);
-        assert_eq!(traces.spans[0].id, created_trace.span.id);
-        let loaded_trace: TraceSpanRecord = response_json(
-            router
-                .clone()
-                .oneshot(Request::get(format!("/api/v1/traces/{trace_id}")).body(Body::empty())?)
-                .await?,
-        )
-        .await?;
-        assert_eq!(loaded_trace, created_trace.span);
 
         let response = router
             .clone()

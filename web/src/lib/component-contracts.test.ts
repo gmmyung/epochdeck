@@ -66,7 +66,13 @@ describe("dashboard component contracts", () => {
       },
     };
     const { body } = render(ArtifactBrowser, {
-      props: { artifacts: [linked], details: { "artifact-id": detail } },
+      props: {
+        artifacts: [
+          { artifact: linked.artifact, links: [{ runId: "run-id", relation: "output" }] },
+        ],
+        runNames: { "run-id": "training-run" },
+        details: { "artifact-id": detail },
+      },
     });
 
     expect(body).toContain("file-199.bin");

@@ -13,14 +13,13 @@ use epochdeck_protocol::{
     AlertId, AlertLevel, AlertRecord, ArtifactEntry, ArtifactId, ArtifactRecord, ArtifactRelation,
     ArtifactSummary, BlobRef, CompleteSweepTrialRequest, CreateAlertRequest, CreateArtifactRequest,
     CreateReportRequest, CreateRichValueRequest, CreateRunRequest, CreateSweepRequest,
-    CreateTraceSpanRequest, EarlyTerminateConfig, MAX_CONFIG_BYTES, MAX_DERIVED_SUMMARY_KEYS,
-    MAX_JSON_SAFE_INTEGER, MAX_SUMMARY_BYTES, MetricGoal, ProjectId, ProjectMetricCatalogRequest,
-    ProjectMetricKeySummary, ProjectSummary, ReportId, ReportLayout, ReportRecord, ReportSummary,
-    ResumePolicy, RichValueId, RichValueKeySummary, RichValueKind, RichValueRecord,
-    RichValueSummary, RunArtifactRecord, RunId, RunListItem, RunQueryRequest, RunRecord, RunState,
-    SweepId, SweepMethod, SweepMetric, SweepParameter, SweepRecord, SweepState, SweepSummary,
-    SweepTrialId, SweepTrialRecord, SweepTrialState, SweepTrialSummary, TraceKind, TraceSpanId,
-    TraceSpanRecord, TraceSpanSummary, TraceStatus, UpdateReportRequest,
+    EarlyTerminateConfig, MAX_CONFIG_BYTES, MAX_DERIVED_SUMMARY_KEYS, MAX_JSON_SAFE_INTEGER,
+    MAX_SUMMARY_BYTES, MetricGoal, ProjectId, ProjectMetricCatalogRequest, ProjectMetricKeySummary,
+    ProjectSummary, ReportId, ReportLayout, ReportRecord, ReportSummary, ResumePolicy, RichValueId,
+    RichValueKeySummary, RichValueKind, RichValueRecord, RichValueSummary, RunArtifactRecord,
+    RunId, RunListItem, RunQueryRequest, RunRecord, RunState, SweepId, SweepMethod, SweepMetric,
+    SweepParameter, SweepRecord, SweepState, SweepSummary, SweepTrialId, SweepTrialRecord,
+    SweepTrialState, SweepTrialSummary, UpdateReportRequest,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -202,33 +201,6 @@ CREATE INDEX IF NOT EXISTS idx_artifact_lineage_run_created
 
 CREATE INDEX IF NOT EXISTS idx_artifact_lineage_artifact_created
     ON artifact_lineage(artifact_id, relation, created_at DESC, run_id DESC);
-
-CREATE TABLE IF NOT EXISTS trace_spans (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL REFERENCES runs(id),
-    trace_id TEXT NOT NULL,
-    parent_span_id TEXT,
-    name TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    status TEXT NOT NULL,
-    start_time_ms INTEGER NOT NULL,
-    end_time_ms INTEGER NOT NULL,
-    step INTEGER,
-    attributes_json TEXT NOT NULL,
-    preview_json TEXT NOT NULL,
-    payload_json TEXT,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_trace_spans_run_created
-    ON trace_spans(run_id, created_at DESC, id DESC);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS trace_search USING fts5(
-    span_id UNINDEXED,
-    run_id UNINDEXED,
-    search_text,
-    tokenize = 'unicode61'
-);
 
 CREATE TABLE IF NOT EXISTS sweeps (
     id TEXT PRIMARY KEY,
@@ -2064,178 +2036,6 @@ impl Catalog {
         rows.into_iter().map(run_list_item_from_row).collect()
     }
 
-    pub async fn create_trace_span(
-        &self,
-        run_id: RunId,
-        request: &CreateTraceSpanRequest,
-    ) -> Result<(TraceSpanRecord, bool), CatalogError> {
-        let mut transaction = self.begin_write_transaction().await?;
-        ensure_running(&mut transaction, run_id).await?;
-        let span_id = request.id.unwrap_or_default();
-        if let Some(existing) = load_trace_span(&mut transaction, span_id).await? {
-            let matches = existing.run_id == run_id
-                && existing.trace_id == request.trace_id
-                && existing.parent_span_id == request.parent_span_id
-                && existing.name == request.name
-                && existing.kind == request.kind
-                && existing.status == request.status
-                && existing.start_time_ms == request.start_time_ms
-                && existing.end_time_ms == request.end_time_ms
-                && existing.step == request.step
-                && existing.attributes == request.attributes
-                && existing.preview == request.preview
-                && existing.payload == request.payload;
-            if !matches {
-                return Err(CatalogError::Conflict(
-                    "trace span ID was reused with different contents".to_owned(),
-                ));
-            }
-            transaction.commit().await?;
-            return Ok((existing, true));
-        }
-        let attributes_json = serde_json::to_string(&request.attributes)
-            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
-        let preview_json = serde_json::to_string(&request.preview)
-            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
-        let payload_json = request
-            .payload
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
-        let step = request
-            .step
-            .map(|value| to_i64(value, "trace step"))
-            .transpose()?;
-        query(
-            "INSERT INTO trace_spans \
-             (id, run_id, trace_id, parent_span_id, name, kind, status, start_time_ms, \
-              end_time_ms, step, attributes_json, preview_json, payload_json, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)",
-        )
-        .bind(span_id.to_string())
-        .bind(run_id.to_string())
-        .bind(&request.trace_id)
-        .bind(request.parent_span_id.map(|value| value.to_string()))
-        .bind(&request.name)
-        .bind(request.kind.to_string())
-        .bind(request.status.to_string())
-        .bind(request.start_time_ms)
-        .bind(request.end_time_ms)
-        .bind(step)
-        .bind(attributes_json)
-        .bind(preview_json)
-        .bind(payload_json)
-        .execute(&mut *transaction)
-        .await?;
-        query("INSERT INTO trace_search (span_id, run_id, search_text) VALUES (?, ?, ?)")
-            .bind(span_id.to_string())
-            .bind(run_id.to_string())
-            .bind(trace_search_text(request))
-            .execute(&mut *transaction)
-            .await?;
-        increment_rich_data_revision(&mut transaction, run_id).await?;
-        touch_run(&mut transaction, run_id).await?;
-        let span = load_required_trace_span(&mut transaction, span_id).await?;
-        transaction.commit().await?;
-        Ok((span, false))
-    }
-
-    pub async fn get_trace_span(
-        &self,
-        span_id: TraceSpanId,
-    ) -> Result<TraceSpanRecord, CatalogError> {
-        let mut transaction = self.pool.begin().await?;
-        let span = load_required_trace_span(&mut transaction, span_id).await?;
-        transaction.commit().await?;
-        Ok(span)
-    }
-
-    pub async fn list_trace_spans(
-        &self,
-        run_id: RunId,
-        before: Option<TraceSpanId>,
-        search: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<TraceSpanSummary>, CatalogError> {
-        ensure_run_exists(&self.pool, run_id).await?;
-        let search = search.filter(|value| !value.trim().is_empty());
-        let cursor = if let Some(before) = before {
-            let row = query("SELECT created_at, id FROM trace_spans WHERE id = ? AND run_id = ?")
-                .bind(before.to_string())
-                .bind(run_id.to_string())
-                .fetch_optional(&self.pool)
-                .await?;
-            let search_matches = if let Some(search) = search {
-                query(
-                    "SELECT EXISTS(SELECT 1 FROM trace_search \
-                     WHERE span_id = ? AND run_id = ? AND trace_search MATCH ?)",
-                )
-                .bind(before.to_string())
-                .bind(run_id.to_string())
-                .bind(trace_match_query(search))
-                .fetch_one(&self.pool)
-                .await?
-                .get(0)
-            } else {
-                true
-            };
-            if !search_matches {
-                return Err(CatalogError::NotFound {
-                    resource: format!("trace list cursor {before} for run {run_id}"),
-                });
-            }
-            Some(row.ok_or_else(|| CatalogError::NotFound {
-                resource: format!("trace list cursor {before} for run {run_id}"),
-            })?)
-        } else {
-            None
-        };
-        let (cursor_created_at, cursor_id) = cursor.map_or((None, None), |row| {
-            (
-                Some(row.get::<String, _>("created_at")),
-                Some(row.get::<String, _>("id")),
-            )
-        });
-        let rows = if let Some(search) = search {
-            query(
-                "SELECT t.id, t.run_id, t.trace_id, t.parent_span_id, t.name, t.kind, t.status, \
-                        t.start_time_ms, t.end_time_ms, t.step, t.payload_json, t.created_at \
-                 FROM trace_search s JOIN trace_spans t ON t.id = s.span_id \
-                 WHERE s.run_id = ? AND trace_search MATCH ? \
-                 AND (? IS NULL OR t.created_at < ? \
-                      OR (t.created_at = ? AND t.id < ?)) \
-                 ORDER BY t.created_at DESC, t.id DESC LIMIT ?",
-            )
-            .bind(run_id.to_string())
-            .bind(trace_match_query(search))
-            .bind(&cursor_created_at)
-            .bind(&cursor_created_at)
-            .bind(&cursor_created_at)
-            .bind(&cursor_id)
-            .bind(to_i64(limit as u64, "trace list limit")?)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            query(
-                "SELECT id, run_id, trace_id, parent_span_id, name, kind, status, start_time_ms, \
-                        end_time_ms, step, payload_json, created_at \
-                 FROM trace_spans WHERE run_id = ? \
-                 AND (? IS NULL OR created_at < ? OR (created_at = ? AND id < ?)) \
-                 ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(run_id.to_string())
-            .bind(&cursor_created_at)
-            .bind(&cursor_created_at)
-            .bind(&cursor_created_at)
-            .bind(&cursor_id)
-            .bind(to_i64(limit as u64, "trace list limit")?)
-            .fetch_all(&self.pool)
-            .await?
-        };
-        rows.into_iter().map(trace_span_summary_from_row).collect()
-    }
-
     pub async fn create_or_resume_run(
         &self,
         project_name: &str,
@@ -3104,32 +2904,6 @@ async fn insert_artifact_lineage(
     Ok(result.rows_affected() == 1)
 }
 
-async fn load_trace_span(
-    transaction: &mut Transaction<'_, Sqlite>,
-    span_id: TraceSpanId,
-) -> Result<Option<TraceSpanRecord>, CatalogError> {
-    let row = query(
-        "SELECT id, run_id, trace_id, parent_span_id, name, kind, status, start_time_ms, \
-                end_time_ms, step, attributes_json, preview_json, payload_json, created_at \
-         FROM trace_spans WHERE id = ?",
-    )
-    .bind(span_id.to_string())
-    .fetch_optional(&mut **transaction)
-    .await?;
-    row.map(trace_span_from_row).transpose()
-}
-
-async fn load_required_trace_span(
-    transaction: &mut Transaction<'_, Sqlite>,
-    span_id: TraceSpanId,
-) -> Result<TraceSpanRecord, CatalogError> {
-    load_trace_span(transaction, span_id)
-        .await?
-        .ok_or_else(|| CatalogError::NotFound {
-            resource: format!("trace span {span_id}"),
-        })
-}
-
 async fn load_document(
     transaction: &mut Transaction<'_, Sqlite>,
     run_id: RunId,
@@ -3353,106 +3127,6 @@ fn artifact_base_from_row(row: SqliteRow) -> Result<ArtifactBase, CatalogError> 
         created_by_run: parse_id(row.get::<String, _>("created_by_run"), "run ID")?,
         created_at: row.get("created_at"),
     })
-}
-
-fn trace_span_from_row(row: SqliteRow) -> Result<TraceSpanRecord, CatalogError> {
-    let parent_span_id = row
-        .get::<Option<String>, _>("parent_span_id")
-        .map(|value| parse_id(value, "parent span ID"))
-        .transpose()?;
-    let step = row
-        .get::<Option<i64>, _>("step")
-        .map(|value| from_i64(value, "trace step"))
-        .transpose()?;
-    let payload = row
-        .get::<Option<String>, _>("payload_json")
-        .map(|value| {
-            serde_json::from_str::<BlobRef>(&value)
-                .map_err(|error| CatalogError::InvalidData(error.to_string()))
-        })
-        .transpose()?;
-    Ok(TraceSpanRecord {
-        id: parse_id(row.get::<String, _>("id"), "trace span ID")?,
-        run_id: parse_id(row.get::<String, _>("run_id"), "run ID")?,
-        trace_id: row.get("trace_id"),
-        parent_span_id,
-        name: row.get("name"),
-        kind: TraceKind::from_str(&row.get::<String, _>("kind"))
-            .map_err(|error| CatalogError::InvalidData(error.to_owned()))?,
-        status: TraceStatus::from_str(&row.get::<String, _>("status"))
-            .map_err(|error| CatalogError::InvalidData(error.to_owned()))?,
-        start_time_ms: row.get("start_time_ms"),
-        end_time_ms: row.get("end_time_ms"),
-        step,
-        attributes: parse_document(row.get::<String, _>("attributes_json"), "trace attributes")?,
-        preview: parse_document(row.get::<String, _>("preview_json"), "trace preview")?,
-        payload,
-        created_at: row.get("created_at"),
-    })
-}
-
-fn trace_span_summary_from_row(row: SqliteRow) -> Result<TraceSpanSummary, CatalogError> {
-    let parent_span_id = row
-        .get::<Option<String>, _>("parent_span_id")
-        .map(|value| parse_id(value, "parent span ID"))
-        .transpose()?;
-    let step = row
-        .get::<Option<i64>, _>("step")
-        .map(|value| from_i64(value, "trace step"))
-        .transpose()?;
-    let payload = row
-        .get::<Option<String>, _>("payload_json")
-        .map(|value| {
-            serde_json::from_str::<BlobRef>(&value)
-                .map_err(|error| CatalogError::InvalidData(error.to_string()))
-        })
-        .transpose()?;
-    Ok(TraceSpanSummary {
-        id: parse_id(row.get::<String, _>("id"), "trace span ID")?,
-        run_id: parse_id(row.get::<String, _>("run_id"), "run ID")?,
-        trace_id: row.get("trace_id"),
-        parent_span_id,
-        name: row.get("name"),
-        kind: TraceKind::from_str(&row.get::<String, _>("kind"))
-            .map_err(|error| CatalogError::InvalidData(error.to_owned()))?,
-        status: TraceStatus::from_str(&row.get::<String, _>("status"))
-            .map_err(|error| CatalogError::InvalidData(error.to_owned()))?,
-        start_time_ms: row.get("start_time_ms"),
-        end_time_ms: row.get("end_time_ms"),
-        step,
-        payload,
-        created_at: row.get("created_at"),
-    })
-}
-
-fn trace_search_text(request: &CreateTraceSpanRequest) -> String {
-    const MAX_SEARCH_TEXT_BYTES: usize = 16 * 1024;
-    let mut value = format!(
-        "{} {} {} {} {} {}",
-        request.trace_id,
-        request.name,
-        request.kind,
-        request.status,
-        serde_json::to_string(&request.attributes).unwrap_or_default(),
-        serde_json::to_string(&request.preview).unwrap_or_default(),
-    );
-    if value.len() > MAX_SEARCH_TEXT_BYTES {
-        let mut boundary = MAX_SEARCH_TEXT_BYTES;
-        while !value.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        value.truncate(boundary);
-    }
-    value
-}
-
-fn trace_match_query(value: &str) -> String {
-    value
-        .split_whitespace()
-        .take(16)
-        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" AND ")
 }
 
 async fn load_sweep(
@@ -4014,10 +3688,9 @@ mod tests {
     use epochdeck_protocol::{
         AlertId, AlertLevel, ArtifactId, CompleteSweepTrialRequest, CreateAlertRequest,
         CreateArtifactRequest, CreateRichValueRequest, CreateRunRequest, CreateSweepRequest,
-        CreateTraceSpanRequest, MAX_DERIVED_SUMMARY_KEYS, MetricCatalogMode, MetricGoal,
-        ProjectMetricCatalogRequest, ResumePolicy, RichValueId, RichValueKind, RunId,
-        RunQueryRequest, RunState, SweepId, SweepMethod, SweepMetric, SweepParameter,
-        SweepTrialState, TraceKind, TraceSpanId, TraceStatus,
+        MAX_DERIVED_SUMMARY_KEYS, MetricCatalogMode, MetricGoal, ProjectMetricCatalogRequest,
+        ResumePolicy, RichValueId, RichValueKind, RunId, RunQueryRequest, RunState, SweepId,
+        SweepMethod, SweepMetric, SweepParameter, SweepTrialState,
     };
     use sqlx::Row;
     use tempfile::tempdir;
@@ -4546,23 +4219,6 @@ mod tests {
         catalog.use_artifact(run.id, created_artifact.id).await?;
         assert_eq!(catalog.get_run(run.id).await?.rich_data_revision, 4);
 
-        let trace = CreateTraceSpanRequest {
-            id: Some(TraceSpanId::new()),
-            trace_id: "trace-1".to_owned(),
-            parent_span_id: None,
-            name: "inference".to_owned(),
-            kind: TraceKind::Span,
-            status: TraceStatus::Ok,
-            start_time_ms: 1,
-            end_time_ms: 2,
-            step: Some(2),
-            attributes: BTreeMap::new(),
-            preview: BTreeMap::new(),
-            payload: None,
-        };
-        assert!(!catalog.create_trace_span(run.id, &trace).await?.1);
-        assert!(catalog.create_trace_span(run.id, &trace).await?.1);
-        assert_eq!(catalog.get_run(run.id).await?.rich_data_revision, 5);
         Ok(())
     }
 

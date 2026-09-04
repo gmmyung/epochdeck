@@ -21,7 +21,6 @@ runs/<run-id>/
   metrics/0000.jsonl
   alerts.jsonl
   rich-values.jsonl
-  traces.jsonl
   artifact-links.jsonl
 blobs/sha256/<prefix>/<sha256>
 ```
@@ -50,7 +49,7 @@ Publication follows these rules:
 Unix also fsyncs directories and the destination parent. Windows validates each
 directory but cannot provide the same directory-entry power-loss guarantee.
 
-Only referenced CAS content belongs to the portable project: rich values, trace
-payloads, and artifact entries. Orphaned upload objects have no project
+Only referenced CAS content belongs to the portable project: rich values and
+artifact entries. Orphaned upload objects have no project
 ownership and are not exported. Physical disaster-recovery snapshots of the
 server's complete storage roots are a separate production-operations feature.

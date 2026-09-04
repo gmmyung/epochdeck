@@ -51,16 +51,12 @@ class _Spool:
         self.artifacts_path = self.directory / "artifacts.jsonl"
         self.artifact_ack_path = self.directory / "artifact-ack"
         self.artifact_delivery_path = self.directory / "artifact-delivery.json"
-        self.traces_path = self.directory / "traces.jsonl"
-        self.trace_ack_path = self.directory / "trace-ack"
-        self.trace_delivery_path = self.directory / "trace-delivery.json"
         self._lock = threading.Lock()
         for path in (
             self.events_path,
             self.alerts_path,
             self.rich_values_path,
             self.artifacts_path,
-            self.traces_path,
         ):
             _ensure_private_file(path)
         _ensure_private_directory(self.blob_root, parents=False)
@@ -101,9 +97,6 @@ class _Spool:
     def append_artifact(self, artifact: dict[str, Any]) -> None:
         self._append_record(self.artifacts_path, artifact)
 
-    def append_trace(self, trace: dict[str, Any]) -> None:
-        self._append_record(self.traces_path, trace)
-
     def _append_record(self, path: Path, record: dict[str, Any]) -> int:
         encoded = encode_json_request(record)
         if len(encoded) > _MAX_JOURNAL_RECORD_BYTES:
@@ -135,7 +128,6 @@ class _Spool:
                 self.alert_delivery_path,
                 self.rich_delivery_path,
                 self.artifact_delivery_path,
-                self.trace_delivery_path,
             ):
                 delivery_path.unlink(missing_ok=True)
             _verify_directory(self.blob_root)
@@ -149,7 +141,6 @@ class _Spool:
             (self.alert_ack_path, self.alerts_path),
             (self.rich_ack_path, self.rich_values_path),
             (self.artifact_ack_path, self.artifacts_path),
-            (self.trace_ack_path, self.traces_path),
         )
 
     def read_batch(
@@ -192,15 +183,6 @@ class _Spool:
             1,
         )
         return (artifacts[0] if artifacts else None), offset
-
-    def read_trace(self) -> tuple[dict[str, Any] | None, int]:
-        traces, offset = self._read_record_batch(
-            self.traces_path,
-            self.trace_ack_path,
-            self.trace_delivery_path,
-            1,
-        )
-        return (traces[0] if traces else None), offset
 
     def _read_record_batch(
         self,
@@ -313,9 +295,6 @@ class _Spool:
     def acknowledge_artifact(self, offset: int) -> None:
         self._acknowledge(self.artifact_ack_path, self.artifact_delivery_path, offset)
 
-    def acknowledge_trace(self, offset: int) -> None:
-        self._acknowledge(self.trace_ack_path, self.trace_delivery_path, offset)
-
     def _acknowledge(self, ack_path: Path, delivery_path: Path, offset: int) -> None:
         with self._lock:
             if _path_exists(delivery_path):
@@ -343,7 +322,6 @@ class _Spool:
             or self.pending_alerts()
             or self.pending_rich_values()
             or self.pending_artifacts()
-            or self.pending_traces()
         )
 
     def pending_metrics(self) -> bool:
@@ -357,9 +335,6 @@ class _Spool:
 
     def pending_artifacts(self) -> bool:
         return self._pending(self.artifact_ack_path, self.artifacts_path)
-
-    def pending_traces(self) -> bool:
-        return self._pending(self.trace_ack_path, self.traces_path)
 
     def _pending(self, ack_path: Path, journal_path: Path) -> bool:
         with self._lock:

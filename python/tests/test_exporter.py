@@ -131,8 +131,6 @@ def test_export_project_streams_all_current_resources_and_deduplicates_blobs(
                     "blob": blob,
                 },
             )
-        if path.endswith("/traces"):
-            return httpx.Response(200, json={"spans": [], "next_before": None})
         if path == "/api/v1/runs/run-1/artifacts":
             return httpx.Response(
                 200,
@@ -188,7 +186,6 @@ def test_export_project_streams_all_current_resources_and_deduplicates_blobs(
         "runs": 1,
         "sweep_trials": 0,
         "sweeps": 0,
-        "traces": 0,
     }
     assert json.loads((destination / "manifest.json").read_text()) == manifest
     assert manifest["format"] == "epochdeck-export"
@@ -375,8 +372,6 @@ def test_export_rejects_a_changed_project_mutation_token(tmp_path) -> None:
                     "blob": None,
                 },
             )
-        if path == "/api/v1/runs/run-1/traces":
-            return httpx.Response(200, json={"spans": [], "next_before": None})
         if path == "/api/v1/runs/run-1/artifacts":
             return httpx.Response(
                 200,

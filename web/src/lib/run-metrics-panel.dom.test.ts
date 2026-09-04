@@ -7,6 +7,7 @@ import RunMetricsPanel from "./RunMetricsPanel.svelte";
 import type { RunListItem } from "./api";
 
 beforeEach(() => {
+  window.localStorage.clear();
   class IntersectionObserverMock {
     constructor(private readonly callback: IntersectionObserverCallback) {}
 
@@ -46,6 +47,7 @@ describe("metric run counts", () => {
     const target = document.createElement("div");
     document.body.append(target);
     const runs = ["run-a", "run-b", "run-c", "run-d"].map(runSummary);
+    const changePage = vi.fn();
     const component = mount(RunMetricsPanel, {
       target,
       props: {
@@ -61,7 +63,7 @@ describe("metric run counts", () => {
         mode: "union",
         alignment: "step",
         after: null,
-        nextAfter: null,
+        nextAfter: "train/reward",
         cursorDepth: 0,
         backHistoryTruncated: false,
         histories: {},
@@ -72,7 +74,7 @@ describe("metric run counts", () => {
         onmodechange: vi.fn(),
         onalignmentchange: vi.fn(),
         onretrycatalog: vi.fn(),
-        oncursor: vi.fn(),
+        oncursor: changePage,
         onretrymetric: vi.fn(),
         onvisibilitychange: vi.fn(),
         onviewportchange: vi.fn(),
@@ -91,6 +93,31 @@ describe("metric run counts", () => {
     expect(target.querySelector(".metric-pagination")?.textContent?.replace(/\s+/g, " ")).toContain(
       "1–1 of 1 metric",
     );
+    const pagination = target.querySelector<HTMLElement>(".metric-pagination")!;
+    expect(pagination.parentElement?.classList.contains("comparison-controls")).toBe(true);
+    expect(pagination.textContent).not.toContain("Previous");
+    expect(pagination.textContent).not.toContain("Next");
+    expect(
+      pagination.querySelector<HTMLButtonElement>('[aria-label="Previous metric page"]')?.disabled,
+    ).toBe(true);
+    pagination.querySelector<HTMLButtonElement>('[aria-label="Next metric page"]')!.click();
+    expect(changePage).toHaveBeenCalledWith("next");
+
+    const metricGrid = target.querySelector<HTMLElement>(".metric-grid")!;
+    expect(metricGrid.dataset.columns).toBe("auto");
+    const densityTrigger = [
+      ...target.querySelectorAll<HTMLButtonElement>('[aria-haspopup="listbox"]'),
+    ].find((button) => button.textContent?.trim() === "Auto")!;
+    densityTrigger.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+    await tick();
+    const threeColumns = document.body.querySelector<HTMLElement>(
+      '[role="option"][aria-label="3"]',
+    )!;
+    threeColumns.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0 }));
+    await tick();
+    expect(metricGrid.dataset.columns).toBe("3");
+    expect(metricGrid.classList.contains("fixed-columns")).toBe(true);
+    expect(window.localStorage.getItem("epochdeck:metric-columns")).toBe("3");
 
     await unmount(component);
     target.remove();

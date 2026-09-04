@@ -7,7 +7,7 @@
 
 Dashboard navigation previously reused complete resource records for lists. A
 project page could therefore repeat run configuration and summary documents,
-artifact manifests, report layouts, and trace payload metadata before the user
+artifact manifests and report layouts before the user
 selected any of them. Sweep lists similarly repeated parameter definitions and
 trial configurations. Metric discovery compounded that cost by draining every
 selected run's complete key catalog into the browser. These costs grew with
@@ -16,7 +16,7 @@ stored metadata and metric cardinality even though the visible page was bounded.
 Several imported resources use deterministic UUIDs rather than time-ordered
 UUIDv7 values. Treating an identifier as a chronology cursor can consequently
 skip or repeat records. Likewise, polling only scalar metric revisions leaves
-already-open media, artifact, trace, and alert tabs stale.
+already-open media, artifact, and alert tabs stale.
 
 ## Decision
 
@@ -101,8 +101,8 @@ ordering is deterministic but is not a valid newest-first chronology.
 ### Return complete records in bounded lists
 
 A row count limit does not bound bytes when each row embeds configuration,
-summary, sweep parameters, trial configurations, layouts, manifests, or trace
-documents. Summary/detail separation is the explicit payload bound.
+summary, sweep parameters, trial configurations, layouts, or manifests.
+Summary/detail separation is the explicit payload bound.
 
 ### Keep one revision per rich resource type
 

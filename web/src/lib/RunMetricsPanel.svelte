@@ -14,6 +14,11 @@
   } from "./comparison-state";
   import Icon from "./Icon.svelte";
   import MetricChart from "./MetricChart.svelte";
+  import {
+    readMetricColumnCount,
+    rememberMetricColumnCount,
+    type MetricColumnCount,
+  } from "./metric-layout";
   import SelectControl from "./SelectControl.svelte";
   import { resolveRunStyle, type RunStylePreferences } from "./sidebar-preferences";
 
@@ -50,6 +55,12 @@
     minimum: number | null,
     maximum: number | null,
   ) => void;
+
+  let metricColumnCount = readMetricColumnCount();
+
+  function setMetricColumnCount(value: string): void {
+    metricColumnCount = rememberMetricColumnCount(value as MetricColumnCount);
+  }
 
   function chartSeries(
     metric: string,
@@ -134,6 +145,54 @@
         onvaluechange={(value) => onalignmentchange(value as RunAlignment)}
       />
     </label>
+    <label class="alignment-control">
+      <span>Columns</span>
+      <SelectControl
+        ariaLabel="Chart columns"
+        compact
+        fit
+        value={metricColumnCount}
+        options={[
+          { value: "auto", label: "Auto" },
+          { value: "1", label: "1" },
+          { value: "2", label: "2" },
+          { value: "3", label: "3" },
+          { value: "4", label: "4" },
+        ]}
+        onvaluechange={setMetricColumnCount}
+      />
+    </label>
+    {#if catalog.length > 0}
+      <nav class="metric-pagination" aria-label="Metric chart pages">
+        <button
+          type="button"
+          disabled={cursorDepth === 0 && !after}
+          aria-label={cursorDepth === 0 && after ? "First metric page" : "Previous metric page"}
+          title={cursorDepth === 0 && after ? "First metric page" : "Previous metric page"}
+          onclick={() => oncursor("previous")}
+        >
+          <Icon name="chevron-left" size={15} />
+        </button>
+        <span>
+          {(cursorDepth * METRIC_CATALOG_PAGE_SIZE + 1).toLocaleString()}–{Math.min(
+            cursorDepth * METRIC_CATALOG_PAGE_SIZE + catalog.length,
+            totalCount,
+          ).toLocaleString()} of {totalCount.toLocaleString()}
+          {totalCount === 1 ? "metric" : "metrics"}{backHistoryTruncated
+            ? " · back history limited"
+            : ""}
+        </span>
+        <button
+          type="button"
+          disabled={!nextAfter}
+          aria-label="Next metric page"
+          title="Next metric page"
+          onclick={() => oncursor("next")}
+        >
+          <Icon name="chevron-right" size={15} />
+        </button>
+      </nav>
+    {/if}
   </div>
   {#if catalogError}
     <section class="resource-error" role="alert">
@@ -142,25 +201,12 @@
     </section>
   {/if}
   {#if catalog.length > 0}
-    <nav class="metric-pagination" aria-label="Metric chart pages">
-      <button
-        type="button"
-        disabled={cursorDepth === 0 && !after}
-        onclick={() => oncursor("previous")}
-        >{cursorDepth === 0 && after ? "First" : "Previous"}</button
-      >
-      <span>
-        {(cursorDepth * METRIC_CATALOG_PAGE_SIZE + 1).toLocaleString()}–{Math.min(
-          cursorDepth * METRIC_CATALOG_PAGE_SIZE + catalog.length,
-          totalCount,
-        ).toLocaleString()} of {totalCount.toLocaleString()}
-        {totalCount === 1 ? "metric" : "metrics"}{backHistoryTruncated
-          ? " · back history limited"
-          : ""}
-      </span>
-      <button type="button" disabled={!nextAfter} onclick={() => oncursor("next")}>Next</button>
-    </nav>
-    <div class="metric-grid">
+    <div
+      class="metric-grid"
+      class:fixed-columns={metricColumnCount !== "auto"}
+      data-columns={metricColumnCount}
+      style={`--metric-columns: ${metricColumnCount}`}
+    >
       {#each catalog as entry (`${project}:${entry.key}`)}
         <MetricChart
           metric={entry.key}

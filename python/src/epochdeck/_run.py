@@ -24,7 +24,6 @@ from epochdeck.artifact import Artifact
 from epochdeck.client import EpochDeckApiError, EpochDeckClient, _normalize_server_url
 from epochdeck.rich import RichValue
 from epochdeck.system_metrics import SystemMonitor, SystemSampler
-from epochdeck.trace import Trace, TraceKind
 
 Mode = Literal["online", "offline", "disabled"]
 Resume = Literal["never", "allow", "must"]
@@ -247,16 +246,6 @@ class _DeliveryWorker(threading.Thread):
             raise DeliveryError("artifact journal has an unknown operation")
         self._spool.acknowledge_artifact(next_offset)
 
-    def _deliver_trace(self) -> None:
-        trace, next_offset = self._spool.read_trace()
-        if trace is None:
-            return
-        blob = trace.get("payload")
-        if blob is not None:
-            self._upload_blob(blob)
-        self._client.create_trace_span(self._run_id, trace)
-        self._spool.acknowledge_trace(next_offset)
-
     def _deliver_metrics(self) -> None:
         points, next_offset = self._spool.read_batch(
             self._batch_size,
@@ -281,7 +270,6 @@ class _DeliveryWorker(threading.Thread):
             (self._spool.pending_metrics, self._deliver_metrics),
             (self._spool.pending_rich_values, self._deliver_rich_value),
             (self._spool.pending_artifacts, self._deliver_artifact),
-            (self._spool.pending_traces, self._deliver_trace),
             (self._spool.pending_alerts, self._deliver_alert),
         )
         for offset in range(len(deliveries)):
@@ -796,48 +784,6 @@ class Run:
         if self._worker is not None:
             self._worker.notify()
         return artifact_id
-
-    def trace(
-        self,
-        name: str,
-        *,
-        kind: TraceKind = "span",
-        trace_id: str | None = None,
-        parent: Trace | str | None = None,
-        attributes: Mapping[str, Any] | None = None,
-        inputs: Any = None,
-        start_time_ms: int | None = None,
-    ) -> Trace:
-        with self._log_lock:
-            if self._finished or self._finishing:
-                raise RuntimeError("cannot create a trace while a run is finishing or finished")
-        return Trace(
-            name,
-            recorder=self._record_trace,
-            kind=kind,
-            trace_id=trace_id,
-            parent=parent,
-            attributes=attributes,
-            inputs=inputs,
-            start_time_ms=start_time_ms,
-        )
-
-    def _record_trace(self, trace: Trace) -> None:
-        with self._log_lock:
-            if self._finished or self._finishing:
-                raise RuntimeError("cannot finish a trace while a run is finishing or finished")
-            if self.mode == "disabled":
-                return
-            assert self._spool is not None
-            record = trace._prepare(self._spool.blob_root, self._last_user_step)
-            record["attributes"] = _normalize_document(
-                record["attributes"],
-                "trace attributes",
-            )
-            record["preview"] = _normalize_document(record["preview"], "trace preview")
-            self._spool.append_trace(record)
-        if self._worker is not None:
-            self._worker.notify()
 
     def _resolve_artifact_reference(self, reference: str) -> str:
         try:

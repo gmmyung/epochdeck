@@ -245,16 +245,6 @@ class PublicRun:
         _validate_page_size(page_size)
         return _artifact_records(self._client, self.id, page_size)
 
-    def traces(self, *, query: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        _validate_page_size(limit)
-        response = self._client.trace_spans(self.id, q=query, limit=limit)
-        spans = response.get("spans")
-        if not isinstance(spans, list) or not all(isinstance(span, dict) for span in spans):
-            raise TypeError("EpochDeck trace response has no span list")
-        return [
-            deepcopy(self._client.get_trace_span(_record_id(span, "trace span"))) for span in spans
-        ]
-
 
 def _compile_filters(filters: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(filters, Mapping):

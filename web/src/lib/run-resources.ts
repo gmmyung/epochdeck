@@ -5,10 +5,9 @@ import {
   getRichValueKeyPage,
   getRichValuePage,
   getRunArtifactPage,
-  getTrace,
-  getTracePage,
   type Alert,
   type Artifact,
+  type ArtifactSummary,
   type CursorPage,
   type RichValue,
   type RichValueKeySummary,
@@ -16,10 +15,9 @@ import {
   type RunArtifact,
   type RunArtifactCursor,
   type RunArtifactPage,
-  type TraceSpan,
-  type TraceSpanSummary,
 } from "./api";
 import { BoundedRequestScheduler } from "./bounded-request-scheduler";
+import { MAX_SELECTED_RUNS } from "./comparison-state";
 import { appendUniquePage, mergeNewestPage, reasonMessage } from "./resource-state";
 import { retainHeadAndTail, retainRecord } from "./retained-window";
 
@@ -28,18 +26,21 @@ export const RUN_TABS = [
   { id: "configuration", label: "Configuration", icon: "settings" },
   { id: "metrics", label: "Metrics", icon: "chart" },
   { id: "media", label: "Media", icon: "media" },
-  { id: "traces", label: "Traces", icon: "trace" },
   { id: "artifacts", label: "Artifacts", icon: "archive" },
 ] as const;
 
 export type RunTab = (typeof RUN_TABS)[number]["id"];
-export type PaginatedRunTab = Extract<RunTab, "summary" | "media" | "traces" | "artifacts">;
+export type PaginatedRunTab = Extract<RunTab, "summary" | "media" | "artifacts">;
+
+export type SelectedRunArtifact = {
+  artifact: ArtifactSummary;
+  links: Array<{ runId: string; relation: RunArtifact["relation"] }>;
+};
 
 const MAX_RETAINED_ALERTS = 500;
 const MAX_RETAINED_RICH_KEYS = 300;
 const MAX_RETAINED_RICH_VALUES = 500;
 const MAX_RETAINED_ARTIFACTS = 500;
-const MAX_RETAINED_TRACES = 500;
 const MAX_RETAINED_DETAILS = 24;
 const MAX_ACTIVE_DETAIL_REQUESTS = 4;
 const MAX_PENDING_DETAIL_REQUESTS = 24;
@@ -59,17 +60,12 @@ export type RunResourceState = {
   truncatedRichKeys: boolean;
   richDetailLoading: Set<string>;
   richDetailErrors: Record<string, string>;
-  artifacts: RunArtifact[];
+  artifacts: SelectedRunArtifact[];
   artifactDetails: Record<string, Artifact>;
   artifactDetailLoading: Set<string>;
   artifactDetailErrors: Record<string, string>;
-  artifactCursor: RunArtifactCursor | null;
-  traces: TraceSpanSummary[];
-  traceDetails: Record<string, TraceSpan>;
-  traceDetailLoading: Set<string>;
-  traceDetailErrors: Record<string, string>;
-  traceCursor: string | null;
-  traceSearchLoading: boolean;
+  artifactRunIds: string[];
+  artifactCursors: Record<string, RunArtifactCursor | null>;
   loadedTabs: Set<RunTab>;
   loadingTabs: Set<RunTab>;
   errors: Partial<Record<RunTab, string>>;
@@ -80,8 +76,8 @@ export type RunResourceState = {
 
 export type RunResourceContext = {
   runId: string;
+  artifactRunIds: string[];
   signal: AbortSignal;
-  traceSearch: string;
 };
 
 type RunResourceApi = {
@@ -104,13 +100,6 @@ type RunResourceApi = {
     signal?: AbortSignal,
   ): Promise<RunArtifactPage>;
   getArtifact(artifactId: string, signal?: AbortSignal): Promise<Artifact>;
-  getTracePage(
-    runId: string,
-    query?: string,
-    before?: string,
-    signal?: AbortSignal,
-  ): Promise<CursorPage<TraceSpanSummary>>;
-  getTrace(spanId: string, signal?: AbortSignal): Promise<TraceSpan>;
 };
 
 const DEFAULT_API: RunResourceApi = {
@@ -120,8 +109,6 @@ const DEFAULT_API: RunResourceApi = {
   getRichValue,
   getRunArtifactPage,
   getArtifact,
-  getTracePage,
-  getTrace,
 };
 
 export function emptyRunResourceState(loadedTabs: readonly RunTab[] = []): RunResourceState {
@@ -144,13 +131,8 @@ export function emptyRunResourceState(loadedTabs: readonly RunTab[] = []): RunRe
     artifactDetails: {},
     artifactDetailLoading: new Set(),
     artifactDetailErrors: {},
-    artifactCursor: null,
-    traces: [],
-    traceDetails: {},
-    traceDetailLoading: new Set(),
-    traceDetailErrors: {},
-    traceCursor: null,
-    traceSearchLoading: false,
+    artifactRunIds: [],
+    artifactCursors: {},
     loadedTabs: new Set(loadedTabs),
     loadingTabs: new Set(),
     errors: {},
@@ -166,7 +148,7 @@ export class RunResourceController {
   private generation = 0;
   private richSelectionGeneration = 0;
   private requestController = new AbortController();
-  private queuedTraceSearch: RunResourceContext | null = null;
+  private artifactRequestController = new AbortController();
   private readonly detailScheduler = new BoundedRequestScheduler(
     MAX_ACTIVE_DETAIL_REQUESTS,
     MAX_PENDING_DETAIL_REQUESTS,
@@ -179,11 +161,35 @@ export class RunResourceController {
 
   reset(loadedTabs: readonly RunTab[] = []): void {
     this.restartRequests();
+    this.restartArtifactRequests();
     this.generation += 1;
     this.richSelectionGeneration += 1;
-    this.queuedTraceSearch = null;
     this.state = emptyRunResourceState(loadedTabs);
     this.emit();
+  }
+
+  async updateArtifactSelection(context: RunResourceContext, reload: boolean): Promise<void> {
+    const runIds = boundedRunIds(context.artifactRunIds);
+    if (sameValues(runIds, this.state.artifactRunIds)) return;
+    this.restartArtifactRequests();
+    this.state = {
+      ...this.state,
+      artifacts: [],
+      artifactRunIds: runIds,
+      artifactCursors: {},
+      artifactDetailLoading: new Set(),
+      artifactDetailErrors: {},
+      loadedTabs: withoutValue(this.state.loadedTabs, "artifacts"),
+      loadingTabs: withoutValue(this.state.loadingTabs, "artifacts"),
+      loadedMoreTabs: withoutValue(this.state.loadedMoreTabs, "artifacts"),
+      truncatedTabs: withoutValue(this.state.truncatedTabs, "artifacts"),
+      loadingMoreTab: this.state.loadingMoreTab === "artifacts" ? null : this.state.loadingMoreTab,
+      errors: withoutKey(this.state.errors, "artifacts"),
+    };
+    this.emit();
+    if (reload && runIds.length > 0) {
+      await this.ensureLoaded("artifacts", { ...context, artifactRunIds: runIds });
+    }
   }
 
   async retry(tab: RunTab, context: RunResourceContext): Promise<void> {
@@ -205,7 +211,7 @@ export class RunResourceController {
     ) {
       return;
     }
-    context = this.requestContext(context);
+    context = this.requestContext(context, tab === "artifacts");
     const generation = this.generation;
     this.state = {
       ...this.state,
@@ -236,13 +242,12 @@ export class RunResourceController {
 
   /** Marks hidden rich-resource tabs stale and refreshes the visible loaded tab in place. */
   async applyResourceRevision(tab: RunTab, context: RunResourceContext): Promise<string | null> {
-    const revisionTabs = new Set<RunTab>(["summary", "media", "traces", "artifacts"]);
+    const revisionTabs = new Set<RunTab>(["summary", "media", "artifacts"]);
     const reloadActive =
       revisionTabs.has(tab) && (this.state.loadedTabs.has(tab) || this.state.loadingTabs.has(tab));
     this.restartRequests();
     this.generation += 1;
     this.richSelectionGeneration += 1;
-    this.queuedTraceSearch = null;
     this.state = {
       ...this.state,
       loadedTabs: new Set([...this.state.loadedTabs].filter((loaded) => !revisionTabs.has(loaded))),
@@ -253,8 +258,6 @@ export class RunResourceController {
       loadingRichKeys: false,
       richDetailLoading: new Set(),
       artifactDetailLoading: new Set(),
-      traceDetailLoading: new Set(),
-      traceSearchLoading: false,
       loadingMoreTab: null,
     };
     this.emit();
@@ -444,104 +447,18 @@ export class RunResourceController {
     }
   }
 
-  async loadTraceDetail(spanId: string, context: RunResourceContext): Promise<void> {
-    if (this.state.traceDetails[spanId] || this.state.traceDetailLoading.has(spanId)) return;
-    context = this.requestContext(context);
-    const generation = this.generation;
-    this.state = {
-      ...this.state,
-      traceDetailLoading: withValue(this.state.traceDetailLoading, spanId),
-      traceDetailErrors: withoutStringKey(this.state.traceDetailErrors, spanId),
-    };
-    this.emit();
-    try {
-      const span = await this.detailScheduler.run({
-        identity: `trace:${spanId}`,
-        parentSignal: context.signal,
-        request: (signal) => this.api.getTrace(spanId, signal),
-      });
-      if (!span) return;
-      if (!this.isCurrent(generation, context.signal)) return;
-      this.state = {
-        ...this.state,
-        traceDetails: retainRecord(this.state.traceDetails, spanId, span, MAX_RETAINED_DETAILS),
-      };
-    } catch (reason) {
-      if (this.isCurrent(generation, context.signal)) {
-        this.state = {
-          ...this.state,
-          traceDetailErrors: retainRecord(
-            this.state.traceDetailErrors,
-            spanId,
-            reasonMessage(reason),
-            MAX_RETAINED_DETAILS,
-          ),
-        };
-      }
-    } finally {
-      if (this.isCurrent(generation, context.signal)) {
-        this.state = {
-          ...this.state,
-          traceDetailLoading: withoutValue(this.state.traceDetailLoading, spanId),
-        };
-        this.emit();
-      }
-    }
-  }
-
-  async searchTraces(context: RunResourceContext): Promise<void> {
-    if (this.state.traceSearchLoading) {
-      this.queuedTraceSearch = context;
-      return;
-    }
-    context = this.requestContext(context);
-    const generation = this.generation;
-    this.state = {
-      ...this.state,
-      traceSearchLoading: true,
-      errors: withoutKey(this.state.errors, "traces"),
-    };
-    this.emit();
-    try {
-      const page = await this.api.getTracePage(
-        context.runId,
-        context.traceSearch,
-        undefined,
-        context.signal,
-      );
-      if (!this.isCurrent(generation, context.signal)) return;
-      if (this.queuedTraceSearch) return;
-      const retained = retainHeadAndTail(page.items, MAX_RETAINED_TRACES, (span) => span.id);
-      this.state = {
-        ...this.state,
-        traces: retained.items,
-        traceCursor: page.nextBefore,
-        loadedMoreTabs: withoutValue(this.state.loadedMoreTabs, "traces"),
-        truncatedTabs: setTruncated(this.state.truncatedTabs, "traces", retained.truncated),
-      };
-    } catch (reason) {
-      if (this.isCurrent(generation, context.signal))
-        this.setError("traces", reasonMessage(reason));
-    } finally {
-      if (this.isCurrent(generation, context.signal)) {
-        this.state = { ...this.state, traceSearchLoading: false };
-        this.emit();
-        const queued = this.queuedTraceSearch;
-        this.queuedTraceSearch = null;
-        if (queued && !queued.signal.aborted) void this.searchTraces(queued);
-      }
-    }
-  }
-
   async loadMore(tab: PaginatedRunTab, context: RunResourceContext): Promise<void> {
     const cursor = this.cursor(tab);
     if (!cursor || this.state.loadingMoreTab) return;
-    context = this.requestContext(context);
+    context = this.requestContext(context, tab === "artifacts");
     const generation = this.generation;
     this.state = { ...this.state, loadingMoreTab: tab, errors: withoutKey(this.state.errors, tab) };
     this.emit();
     try {
-      const patch = await this.loadPage(tab, cursor, context);
+      const patch =
+        tab === "artifacts"
+          ? await this.loadArtifactPages(context, false)
+          : await this.loadPage(tab, cursor, context);
       if (!this.isCurrent(generation, context.signal)) return;
       this.state = {
         ...this.state,
@@ -563,6 +480,7 @@ export class RunResourceController {
     context: RunResourceContext,
   ): Promise<Partial<RunResourceState>> {
     if (tab === "media") return this.loadNewestMedia(context);
+    if (tab === "artifacts") return this.loadArtifactPages(context, true);
     return this.loadPage(tab, undefined, context, true);
   }
 
@@ -637,7 +555,7 @@ export class RunResourceController {
 
   private async loadPage(
     tab: PaginatedRunTab,
-    before: string | RunArtifactCursor | undefined,
+    before: string | true | undefined,
     context: RunResourceContext,
     newest = false,
   ): Promise<Partial<RunResourceState>> {
@@ -690,63 +608,61 @@ export class RunResourceController {
         ),
       };
     }
-    if (tab === "artifacts") {
-      const page = await this.api.getRunArtifactPage(
-        context.runId,
-        typeof before === "object" ? before : undefined,
-        context.signal,
-      );
-      const retained = retainHeadAndTail(
-        mergePage(
-          this.state.artifacts,
-          page.items,
-          (linked) => `${linked.artifact.id}:${linked.relation}`,
-          newest,
+    throw new Error(`unsupported paginated tab: ${tab}`);
+  }
+
+  private async loadArtifactPages(
+    context: RunResourceContext,
+    newest: boolean,
+  ): Promise<Partial<RunResourceState>> {
+    const runIds = boundedRunIds(context.artifactRunIds);
+    const requestedRunIds = newest
+      ? runIds
+      : runIds.filter((runId) => this.state.artifactCursors[runId]);
+    const pages = await Promise.all(
+      requestedRunIds.map(async (runId) => ({
+        runId,
+        page: await this.api.getRunArtifactPage(
+          runId,
+          newest ? undefined : (this.state.artifactCursors[runId] ?? undefined),
+          context.signal,
         ),
-        MAX_RETAINED_ARTIFACTS,
-        (linked) => `${linked.artifact.id}:${linked.relation}`,
-      );
-      return {
-        artifacts: retained.items,
-        artifactCursor:
-          newest && this.state.loadedMoreTabs.has(tab)
-            ? this.state.artifactCursor
-            : page.nextCursor,
-        truncatedTabs: setTruncated(
-          this.state.truncatedTabs,
-          tab,
-          retained.truncated || this.state.truncatedTabs.has(tab),
-        ),
-      };
-    }
-    const page = await this.api.getTracePage(
-      context.runId,
-      context.traceSearch,
-      typeof before === "string" ? before : undefined,
-      context.signal,
+      })),
     );
+    const incoming = groupArtifactLinks(
+      pages.flatMap(({ runId, page }) => page.items.map((linked) => ({ runId, linked }))),
+    );
+    const sameSelection = sameValues(runIds, this.state.artifactRunIds);
+    const merged =
+      newest && !sameSelection ? incoming : mergeArtifactGroups(this.state.artifacts, incoming);
     const retained = retainHeadAndTail(
-      mergePage(this.state.traces, page.items, (span) => span.id, newest),
-      MAX_RETAINED_TRACES,
-      (span) => span.id,
+      merged,
+      MAX_RETAINED_ARTIFACTS,
+      (group) => group.artifact.id,
     );
+    const artifactCursors = sameSelection ? { ...this.state.artifactCursors } : {};
+    for (const { runId, page } of pages) {
+      if (!(newest && sameSelection && this.state.loadedMoreTabs.has("artifacts"))) {
+        artifactCursors[runId] = page.nextCursor;
+      }
+    }
+    for (const runId of runIds) artifactCursors[runId] ??= null;
     return {
-      traces: retained.items,
-      traceCursor:
-        newest && this.state.loadedMoreTabs.has(tab) ? this.state.traceCursor : page.nextBefore,
+      artifacts: retained.items,
+      artifactRunIds: runIds,
+      artifactCursors,
       truncatedTabs: setTruncated(
         this.state.truncatedTabs,
-        tab,
-        retained.truncated || this.state.truncatedTabs.has(tab),
+        "artifacts",
+        retained.truncated || (sameSelection && this.state.truncatedTabs.has("artifacts")),
       ),
     };
   }
 
-  private cursor(tab: PaginatedRunTab): string | RunArtifactCursor | null {
+  private cursor(tab: PaginatedRunTab): string | true | null {
     if (tab === "summary") return this.state.alertCursor;
     if (tab === "media") return this.state.richValueCursor;
-    if (tab === "artifacts") return this.state.artifactCursor;
-    return this.state.traceCursor;
+    return Object.values(this.state.artifactCursors).some(Boolean) ? true : null;
   }
 
   private setError(tab: RunTab, message: string): void {
@@ -758,10 +674,12 @@ export class RunResourceController {
     return generation === this.generation && !signal.aborted;
   }
 
-  private requestContext(context: RunResourceContext): RunResourceContext {
+  private requestContext(context: RunResourceContext, artifacts = false): RunResourceContext {
+    const signals = [context.signal, this.requestController.signal];
+    if (artifacts) signals.push(this.artifactRequestController.signal);
     return {
       ...context,
-      signal: AbortSignal.any([context.signal, this.requestController.signal]),
+      signal: AbortSignal.any(signals),
     };
   }
 
@@ -769,6 +687,11 @@ export class RunResourceController {
     this.requestController.abort();
     this.requestController = new AbortController();
     this.detailScheduler.cancelAll();
+  }
+
+  private restartArtifactRequests(): void {
+    this.artifactRequestController.abort();
+    this.artifactRequestController = new AbortController();
   }
 
   private isRichSelectionCurrent(
@@ -794,6 +717,64 @@ function mergePage<T>(
 ): T[] {
   if (newest) return current.length > 0 ? mergeNewestPage(current, page, identity) : [...page];
   return appendUniquePage(current, page, identity);
+}
+
+function groupArtifactLinks(
+  values: ReadonlyArray<{ runId: string; linked: RunArtifact }>,
+): SelectedRunArtifact[] {
+  const groups = new Map<string, SelectedRunArtifact>();
+  for (const { runId, linked } of values) {
+    const group = groups.get(linked.artifact.id) ?? {
+      artifact: linked.artifact,
+      links: [],
+    };
+    if (!group.links.some((link) => link.runId === runId && link.relation === linked.relation)) {
+      group.links.push({ runId, relation: linked.relation });
+    }
+    groups.set(linked.artifact.id, group);
+  }
+  return [...groups.values()].sort(compareArtifactGroups);
+}
+
+function mergeArtifactGroups(
+  current: readonly SelectedRunArtifact[],
+  incoming: readonly SelectedRunArtifact[],
+): SelectedRunArtifact[] {
+  const groups = new Map(current.map((group) => [group.artifact.id, group]));
+  for (const next of incoming) {
+    const existing = groups.get(next.artifact.id);
+    if (!existing) {
+      groups.set(next.artifact.id, next);
+      continue;
+    }
+    const links = [...existing.links];
+    for (const link of next.links) {
+      if (
+        !links.some(
+          (candidate) => candidate.runId === link.runId && candidate.relation === link.relation,
+        )
+      ) {
+        links.push(link);
+      }
+    }
+    groups.set(next.artifact.id, { artifact: next.artifact, links });
+  }
+  return [...groups.values()].sort(compareArtifactGroups);
+}
+
+function compareArtifactGroups(left: SelectedRunArtifact, right: SelectedRunArtifact): number {
+  return (
+    right.artifact.created_at.localeCompare(left.artifact.created_at) ||
+    right.artifact.id.localeCompare(left.artifact.id)
+  );
+}
+
+function boundedRunIds(values: readonly string[]): string[] {
+  return [...new Set(values)].slice(0, MAX_SELECTED_RUNS);
+}
+
+function sameValues(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function withValue<T>(values: ReadonlySet<T>, value: T): Set<T> {
