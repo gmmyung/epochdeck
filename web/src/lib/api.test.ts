@@ -55,6 +55,7 @@ describe("getHealth", () => {
     const fetchMock = vi.fn(async () =>
       Response.json({
         logo_url: "/api/v1/dashboard/logo",
+        favicon_url: "/api/v1/dashboard/favicon?v=1234",
         accent_color: "#8a31c7",
       }),
     );
@@ -62,6 +63,7 @@ describe("getHealth", () => {
 
     await expect(getDashboardConfig()).resolves.toEqual({
       logo_url: "/api/v1/dashboard/logo",
+      favicon_url: "/api/v1/dashboard/favicon?v=1234",
       accent_color: "#8a31c7",
     });
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/dashboard/config", { signal: undefined });

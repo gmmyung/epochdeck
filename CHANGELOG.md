@@ -9,6 +9,9 @@ so storage and APIs may change without migration or compatibility shims.
 
 - A minimal stacked-epoch logo now serves as the default dashboard mark and
   favicon, and the README presents the project with CI and release badges.
+- Dashboard favicon configuration is independent from the logo, with safe
+  server-side validation, content-versioned URLs, and Safari-compatible bundled
+  ICO, PNG, Apple touch, and pinned-tab fallbacks.
 - Metric catalog responses include the exact number of matching keys, allowing
   the dashboard to show total metric counts without eagerly loading histories.
 - Python clients can authenticate to an HTTPS reverse proxy with paired

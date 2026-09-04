@@ -8,6 +8,7 @@ export type Health = {
 
 export type DashboardConfig = {
   logo_url: string | null;
+  favicon_url: string | null;
   accent_color: string;
 };
 

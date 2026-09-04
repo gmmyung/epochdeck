@@ -86,6 +86,7 @@ pub struct HealthResponse {
 pub struct DashboardConfigResponse {
     pub accent_color: String,
     pub logo_url: Option<String>,
+    pub favicon_url: Option<String>,
 }
 
 impl HealthResponse {
@@ -1419,12 +1420,14 @@ mod tests {
         let response = DashboardConfigResponse {
             accent_color: "#2766ad".to_owned(),
             logo_url: Some("/api/v1/dashboard/logo".to_owned()),
+            favicon_url: Some("/api/v1/dashboard/favicon".to_owned()),
         };
         assert_eq!(
             serde_json::to_value(response)?,
             serde_json::json!({
                 "accent_color": "#2766ad",
                 "logo_url": "/api/v1/dashboard/logo",
+                "favicon_url": "/api/v1/dashboard/favicon",
             })
         );
         Ok(())

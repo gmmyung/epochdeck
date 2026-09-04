@@ -130,6 +130,7 @@
   const VALID_RUN_TABS = new Set<RunTab>(RUN_TABS.map((tab) => tab.id));
   const DEFAULT_DASHBOARD_CONFIG: DashboardConfig = {
     logo_url: null,
+    favicon_url: null,
     accent_color: "#2766ad",
   };
   type ReportSelectionResult = "selected" | "missing" | "failed" | "cancelled";
@@ -266,11 +267,13 @@
         if (!/^#[0-9a-f]{6}$/i.test(result.accent_color)) {
           throw new Error("EpochDeck dashboard config returned an invalid accent color");
         }
-        if (
-          result.logo_url !== null &&
-          (!result.logo_url.startsWith("/") || result.logo_url.startsWith("//"))
-        ) {
-          throw new Error("EpochDeck dashboard config returned an invalid logo URL");
+        for (const [name, url] of [
+          ["logo", result.logo_url],
+          ["favicon", result.favicon_url],
+        ] as const) {
+          if (url !== null && (!url.startsWith("/") || url.startsWith("//"))) {
+            throw new Error(`EpochDeck dashboard config returned an invalid ${name} URL`);
+          }
         }
         dashboardConfig = result;
         dashboardLogoFailed = false;
@@ -1930,8 +1933,9 @@
     name="description"
     content="EpochDeck is a lossless, self-hosted experiment tracker built for large histories."
   />
-  {#if dashboardConfig.logo_url && !dashboardLogoFailed}
-    <link rel="icon" href={dashboardConfig.logo_url} />
+  {#if dashboardConfig.favicon_url}
+    <link rel="icon" href={dashboardConfig.favicon_url} />
+    <link rel="apple-touch-icon" href={dashboardConfig.favicon_url} />
   {/if}
 </svelte:head>
 

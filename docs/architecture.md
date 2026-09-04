@@ -235,8 +235,8 @@ data.
 
 The Svelte dashboard initially loads the server's immutable branding contract
 alongside project, run, report, and metric metadata. Branding is validated and
-loaded once at server startup; its optional logo is served only through a
-same-origin bounded image endpoint.
+loaded once at server startup; optional logo and favicon files are served only
+through same-origin bounded image endpoints.
 
 It requests values only for visible charts and selected metrics. Off-screen
 charts use browser content visibility and intersection observers; bounded

@@ -75,7 +75,7 @@ use tower_http::services::ServeFile;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
-use dashboard::{dashboard_config, dashboard_logo};
+use dashboard::{dashboard_config, dashboard_favicon, dashboard_logo};
 use diagnostics::collect_storage_root_diagnostics;
 use discovery::{
     get_project, get_run, list_projects, list_runs, metric_keys, query_project_metrics, query_runs,
@@ -457,6 +457,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/dashboard/config", get(dashboard_config))
         .route("/api/v1/dashboard/logo", get(dashboard_logo))
+        .route("/api/v1/dashboard/favicon", get(dashboard_favicon))
         .route("/api/v1/diagnostics", get(diagnostics))
         .route("/api/v1/projects", get(list_projects))
         .route("/api/v1/projects/{project}", get(get_project))
@@ -4634,9 +4635,18 @@ mod tests {
         .await?;
         assert_eq!(default_config.accent_color, "#2766ad");
         assert_eq!(default_config.logo_url, None);
+        assert_eq!(default_config.favicon_url, None);
         assert_eq!(
             default_router
+                .clone()
                 .oneshot(Request::get("/api/v1/dashboard/logo").body(Body::empty())?)
+                .await?
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            default_router
+                .oneshot(Request::get("/api/v1/dashboard/favicon").body(Body::empty())?)
                 .await?
                 .status(),
             StatusCode::NOT_FOUND
@@ -4645,7 +4655,7 @@ mod tests {
         let logo_bytes = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><path fill="#fff" d="M0 0h8v8H0z"/></svg>"##;
         let logo_path = directory.path().join("logo.svg");
         std::fs::write(&logo_path, logo_bytes)?;
-        let dashboard = DashboardConfig::new("#A1b2C3", Some(&logo_path))?;
+        let dashboard = DashboardConfig::new("#A1b2C3", Some(&logo_path), None)?;
         let router = app(
             Catalog::open(directory.path().join("custom-catalog.sqlite3")).await?,
             MetricRuntime::new(MetricStore::new(directory.path().join("custom-metrics"))),
@@ -4660,9 +4670,21 @@ mod tests {
         )
         .await?;
         assert_eq!(config.accent_color, "#A1b2C3");
-        assert_eq!(config.logo_url.as_deref(), Some("/api/v1/dashboard/logo"));
+        assert!(
+            config
+                .logo_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("/api/v1/dashboard/logo?v="))
+        );
+        assert!(
+            config
+                .favicon_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("/api/v1/dashboard/favicon?v="))
+        );
 
         let logo = router
+            .clone()
             .oneshot(Request::get("/api/v1/dashboard/logo").body(Body::empty())?)
             .await?;
         assert_eq!(logo.status(), StatusCode::OK);
@@ -4680,6 +4702,18 @@ mod tests {
         assert!(!csp.contains("default-src 'self'"));
         assert_eq!(
             to_bytes(logo.into_body(), 1024 * 1024 + 1).await?,
+            logo_bytes.as_slice()
+        );
+        let favicon = router
+            .oneshot(Request::get("/api/v1/dashboard/favicon").body(Body::empty())?)
+            .await?;
+        assert_eq!(favicon.status(), StatusCode::OK);
+        assert_eq!(
+            favicon.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("image/svg+xml"))
+        );
+        assert_eq!(
+            to_bytes(favicon.into_body(), 1024 * 1024 + 1).await?,
             logo_bytes.as_slice()
         );
         Ok(())
@@ -4715,6 +4749,20 @@ mod tests {
             assert!(response.headers().contains_key("content-security-policy"));
             let body = to_bytes(response.into_body(), 1024 * 1024).await?;
             assert!(String::from_utf8_lossy(&body).contains("<title>EpochDeck</title>"));
+        }
+        for path in [
+            "/favicon.ico",
+            "/favicon.svg",
+            "/favicon-32x32.png",
+            "/apple-touch-icon.png",
+            "/safari-pinned-tab.svg",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK, "missing asset {path}");
+            assert!(response.headers().contains_key(header::CONTENT_TYPE));
         }
         let missing_asset = router
             .clone()

@@ -408,12 +408,12 @@ record. `summary_equals` tests an explicit value first and falls back to the
 derived metric preview only when the explicit layer lacks that key.
 
 Dashboard configuration has the shape
-`{"accent_color":"#2766ad","logo_url":null}`. When a logo is configured,
-`logo_url` is `/api/v1/dashboard/logo`; the response never exposes its server
-filesystem path. Logo responses use the validated `image/png`, `image/jpeg`,
-`image/webp`, or `image/svg+xml` content type and `Cache-Control: no-cache`.
-SVG responses carry a route-specific sandboxed `default-src 'none'` content
-security policy in addition to startup validation.
+`{"accent_color":"#2766ad","logo_url":null,"favicon_url":null}`. Configured
+image URLs use same-origin `/api/v1/dashboard/logo` and
+`/api/v1/dashboard/favicon` routes with content-digest query strings; server
+filesystem paths are never exposed. Image responses use their validated MIME
+type and `Cache-Control: no-cache`. SVG responses also carry a sandboxed
+`default-src 'none'` content security policy.
 
 Authentication and network-exposure requirements are defined in the
 [security policy](../SECURITY.md).

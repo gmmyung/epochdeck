@@ -58,6 +58,7 @@ describe("dashboard orchestration", () => {
       if (path === "/api/v1/dashboard/config") {
         return json({
           logo_url: "/api/v1/dashboard/logo",
+          favicon_url: "/api/v1/dashboard/favicon?v=1234",
           accent_color: "#8a31c7",
         });
       }
@@ -121,6 +122,16 @@ describe("dashboard orchestration", () => {
     expect(target.querySelector<HTMLImageElement>('.brand img[alt="EpochDeck"]')?.src).toContain(
       "/api/v1/dashboard/logo",
     );
+    expect(
+      document.head.querySelector<HTMLLinkElement>(
+        'link[rel="icon"][href="/api/v1/dashboard/favicon?v=1234"]',
+      ),
+    ).not.toBeNull();
+    expect(
+      document.head.querySelector<HTMLLinkElement>(
+        'link[rel="apple-touch-icon"][href="/api/v1/dashboard/favicon?v=1234"]',
+      ),
+    ).not.toBeNull();
     expect(target.querySelector<HTMLElement>(".app-shell")?.getAttribute("style")).toContain(
       "#8a31c7",
     );
@@ -239,7 +250,7 @@ describe("dashboard orchestration", () => {
         return json({ service: "epochdeck", version: "0.1.0", status: "healthy" });
       }
       if (path === "/api/v1/dashboard/config") {
-        return json({ logo_url: null, accent_color: "#2766ad" });
+        return json({ logo_url: null, favicon_url: null, accent_color: "#2766ad" });
       }
       if (path === "/api/v1/projects?limit=100") {
         return json({
@@ -374,7 +385,7 @@ describe("dashboard orchestration", () => {
         return json({ service: "epochdeck", version: "0.1.0", status: "healthy" });
       }
       if (path === "/api/v1/dashboard/config") {
-        return json({ logo_url: null, accent_color: "#2766ad" });
+        return json({ logo_url: null, favicon_url: null, accent_color: "#2766ad" });
       }
       if (path === "/api/v1/projects?limit=100") {
         return json({
@@ -449,7 +460,7 @@ describe("dashboard orchestration", () => {
         return json({ service: "epochdeck", version: "0.1.0", status: "healthy" });
       }
       if (path === "/api/v1/dashboard/config") {
-        return json({ logo_url: null, accent_color: "#2766ad" });
+        return json({ logo_url: null, favicon_url: null, accent_color: "#2766ad" });
       }
       if (path === "/api/v1/projects?limit=100") {
         return json({
@@ -616,7 +627,7 @@ describe("dashboard orchestration", () => {
         return json({ service: "epochdeck", version: "0.1.0", status: "healthy" });
       }
       if (path === "/api/v1/dashboard/config") {
-        return json({ logo_url: null, accent_color: "#2766ad" });
+        return json({ logo_url: null, favicon_url: null, accent_color: "#2766ad" });
       }
       if (path === "/api/v1/projects?limit=100") {
         return json({
@@ -740,7 +751,7 @@ describe("dashboard orchestration", () => {
         return json({ service: "epochdeck", version: "0.1.0", status: "healthy" });
       }
       if (path === "/api/v1/dashboard/config") {
-        return json({ logo_url: null, accent_color: "#2766ad" });
+        return json({ logo_url: null, favicon_url: null, accent_color: "#2766ad" });
       }
       if (path === "/api/v1/projects?limit=100") {
         return json({

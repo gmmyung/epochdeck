@@ -130,10 +130,13 @@ support same-filesystem hard links and must not overlap.
 ```text
 EPOCHDECK_DASHBOARD_ACCENT_COLOR="#8a3ffc"
 EPOCHDECK_DASHBOARD_LOGO_PATH=/etc/epochdeck/logo.svg
+EPOCHDECK_DASHBOARD_FAVICON_PATH=/etc/epochdeck/favicon.ico
 ```
 
 The color must be `#RRGGBB`. Logos may be PNG, JPEG, WebP, or self-contained
-SVG files up to 1 MiB. Restart the server after changing either value.
+SVG files up to 1 MiB. Favicons accept those formats plus ICO. When no favicon
+is configured, EpochDeck reuses the custom logo or its bundled browser icons.
+Restart the server after changing a value.
 
 ## Next steps
 
