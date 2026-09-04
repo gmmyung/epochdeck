@@ -517,6 +517,12 @@
     padding-bottom: 10px;
   }
 
+  @media (max-width: 760px) {
+    .sidebar-header button :global(svg) {
+      transform: rotate(90deg);
+    }
+  }
+
   .nav-search,
   .nav-section-heading {
     display: grid;

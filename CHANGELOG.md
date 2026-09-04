@@ -50,7 +50,8 @@ so storage and APIs may change without migration or compatibility shims.
 ### Fixed
 
 - Mobile run cards no longer overlap inside the horizontally scrolling run
-  selector, and its collapsed state stays in a compact strip above the run.
+  selector, its collapsed state stays in a compact strip above the run, and the
+  disclosure arrow reflects its vertical motion.
 - W&B imports now recover from an initial authoritative-refresh failure, verify
   retried iterator identity in constant memory, reject shortened resumed
   listings, handle overflowing source numbers deterministically, recognize
