@@ -1018,10 +1018,6 @@ canvas {
   font-size: 10px;
 }
 
-.histogram-canvas {
-  height: 220px;
-}
-
 .table-preview {
   max-height: 320px;
   overflow: auto;

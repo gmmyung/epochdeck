@@ -49,8 +49,8 @@
   {:else}
     {#if state.richKeys.length > 0}
       <div class="media-key-toolbar">
-        <label>
-          <span>Media key</span>
+        <label class="media-key-field">
+          <span class="media-key-label">Media key</span>
           <SelectControl
             ariaLabel="Media key"
             value={state.selectedRichKey ?? ""}
@@ -58,6 +58,7 @@
               value: key.key,
               label: `${key.key} · ${key.count.toLocaleString()}`,
             }))}
+            compact
             onvaluechange={onselectkey}
           />
         </label>
@@ -97,3 +98,52 @@
     {/if}
   {/if}
 </div>
+
+<style>
+  .media-key-toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    margin: 8px 0 18px;
+  }
+
+  .media-key-field {
+    width: min(420px, 100%);
+    display: grid;
+    gap: 5px;
+  }
+
+  .media-key-label {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .media-key-toolbar > button {
+    min-height: 30px;
+    padding: 0 9px;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--muted);
+    font-size: 10px;
+  }
+
+  .media-key-toolbar > button:hover:not(:disabled) {
+    border-color: var(--line-strong);
+    background: var(--button-hover);
+    color: var(--text);
+  }
+
+  @media (max-width: 760px) {
+    .media-key-toolbar {
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .media-key-field {
+      width: 100%;
+    }
+  }
+</style>

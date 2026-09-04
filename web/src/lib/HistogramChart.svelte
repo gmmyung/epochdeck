@@ -1,16 +1,28 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { boundedHistogramCounts } from "./histogram-data";
+
+  import { boundedHistogramBins, type HistogramBin } from "./histogram-data";
 
   export let counts: number[];
+  export let edges: number[] = [];
   export let label: string;
+
+  const ACCESSIBLE_BIN_LIMIT = 500;
+  const PLOT_LEFT = 42;
+  const PLOT_RIGHT = 8;
+  const PLOT_TOP = 8;
+  const PLOT_BOTTOM = 25;
 
   let canvas: HTMLCanvasElement;
   let revision = 0;
-  const ACCESSIBLE_BIN_LIMIT = 500;
+  let hoveredIndex: number | null = null;
+  let hoverX = 0;
 
-  $: visibleCounts = counts.slice(0, ACCESSIBLE_BIN_LIMIT);
-  $: drawableCounts = boundedHistogramCounts(counts);
+  $: bins = boundedHistogramBins(counts, edges);
+  $: exactBins = boundedHistogramBins(counts, edges, Math.max(counts.length, 1));
+  $: visibleBins = exactBins.slice(0, ACCESSIBLE_BIN_LIMIT);
+  $: total = exactBins.reduce((sum, bin) => sum + bin.count, 0);
+  $: hoveredBin = hoveredIndex === null ? null : bins[hoveredIndex];
 
   onMount(() => {
     const observer = new ResizeObserver(() => (revision += 1));
@@ -18,9 +30,26 @@
     return () => observer.disconnect();
   });
 
-  $: if (canvas && revision >= 0) draw(canvas, drawableCounts);
+  $: if (canvas && revision >= 0) draw(canvas, bins, hoveredIndex);
 
-  function draw(target: HTMLCanvasElement, values: number[]): void {
+  function updateHover(event: PointerEvent): void {
+    if (bins.length === 0) return clearHover();
+    const bounds = canvas.getBoundingClientRect();
+    const plotWidth = Math.max(bounds.width - PLOT_LEFT - PLOT_RIGHT, 1);
+    const localX = event.clientX - bounds.left;
+    if (localX < PLOT_LEFT || localX > PLOT_LEFT + plotWidth) return clearHover();
+    hoveredIndex = Math.min(
+      Math.floor(((localX - PLOT_LEFT) / plotWidth) * bins.length),
+      bins.length - 1,
+    );
+    hoverX = localX;
+  }
+
+  function clearHover(): void {
+    hoveredIndex = null;
+  }
+
+  function draw(target: HTMLCanvasElement, values: HistogramBin[], highlight: number | null): void {
     const width = Math.max(target.clientWidth, 1);
     const height = Math.max(target.clientHeight, 1);
     const ratio = window.devicePixelRatio || 1;
@@ -30,42 +59,120 @@
     if (!context) return;
     context.scale(ratio, ratio);
     context.clearRect(0, 0, width, height);
-    let maximum = 1;
-    for (const value of values) maximum = Math.max(maximum, value);
-    const gap = values.length > 128 ? 0 : 1;
-    const barWidth = width / Math.max(values.length, 1);
+    if (values.length === 0) return;
+
+    const plotWidth = Math.max(width - PLOT_LEFT - PLOT_RIGHT, 1);
+    const plotHeight = Math.max(height - PLOT_TOP - PLOT_BOTTOM, 1);
+    const maximum = niceCountMaximum(Math.max(1, ...values.map((bin) => bin.count)));
     const styles = getComputedStyle(target);
-    context.fillStyle = styles.getPropertyValue("--series-accent").trim() || "#2766ad";
+    const accent = styles.getPropertyValue("--series-accent").trim() || "#2766ad";
+    const grid = styles.getPropertyValue("--chart-grid").trim() || "#d9dde0";
+    const muted = styles.getPropertyValue("--muted").trim() || "#596168";
+    const surface = styles.getPropertyValue("--surface").trim() || "#f7f8f9";
+
+    context.font = "10px system-ui, sans-serif";
+    context.textBaseline = "middle";
+    context.fillStyle = muted;
+    context.strokeStyle = grid;
+    context.lineWidth = 1;
+    for (let tick = 0; tick <= 4; tick += 1) {
+      const fraction = tick / 4;
+      const y = PLOT_TOP + plotHeight * (1 - fraction);
+      context.beginPath();
+      context.moveTo(PLOT_LEFT, Math.round(y) + 0.5);
+      context.lineTo(PLOT_LEFT + plotWidth, Math.round(y) + 0.5);
+      context.stroke();
+      context.textAlign = "right";
+      context.fillText(formatNumber(maximum * fraction), PLOT_LEFT - 6, y);
+    }
+
+    const gap = values.length > 128 ? 0 : 1;
+    const barWidth = plotWidth / values.length;
     for (let index = 0; index < values.length; index += 1) {
-      const barHeight = (Math.max(values[index], 0) / maximum) * (height - 4);
+      const bin = values[index];
+      const barHeight = (bin.count / maximum) * plotHeight;
+      context.fillStyle = index === highlight ? muted : accent;
       context.fillRect(
-        index * barWidth,
-        height - barHeight,
+        PLOT_LEFT + index * barWidth,
+        PLOT_TOP + plotHeight - barHeight,
         Math.max(barWidth - gap, 1),
         barHeight,
       );
     }
+
+    const xTicks = Math.min(4, values.length);
+    context.fillStyle = muted;
+    context.textBaseline = "bottom";
+    for (let tick = 0; tick <= xTicks; tick += 1) {
+      const index = Math.min(Math.floor((tick * values.length) / xTicks), values.length - 1);
+      const value = tick === xTicks ? values.at(-1)!.upper : values[index].lower;
+      const x = PLOT_LEFT + (tick / xTicks) * plotWidth;
+      context.textAlign = tick === 0 ? "left" : tick === xTicks ? "right" : "center";
+      context.fillText(formatNumber(value), x, height);
+    }
+
+    if (highlight !== null) {
+      const x = PLOT_LEFT + (highlight + 0.5) * barWidth;
+      context.strokeStyle = surface;
+      context.beginPath();
+      context.moveTo(x, PLOT_TOP);
+      context.lineTo(x, PLOT_TOP + plotHeight);
+      context.stroke();
+    }
+  }
+
+  function formatRange(bin: HistogramBin): string {
+    return `${formatNumber(bin.lower)} – ${formatNumber(bin.upper)}`;
+  }
+
+  function formatNumber(value: number): string {
+    return value.toLocaleString(undefined, { maximumSignificantDigits: 5 });
+  }
+
+  function formatPercent(count: number): string {
+    return total > 0 ? `${((count / total) * 100).toFixed(1)}%` : "0%";
+  }
+
+  function niceCountMaximum(value: number): number {
+    const magnitude = 10 ** Math.floor(Math.log10(value));
+    const normalized = value / magnitude;
+    const ceiling = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+    return ceiling * magnitude;
   }
 </script>
 
 <figure class="histogram">
-  <canvas
-    bind:this={canvas}
-    class="histogram-canvas"
-    aria-label={`${label} histogram with ${counts.length.toLocaleString()} bins`}
-  ></canvas>
+  <div class="histogram-plot" style={`--hover-x: ${hoverX}px`}>
+    <canvas
+      bind:this={canvas}
+      class="histogram-canvas"
+      aria-label={`${label} histogram with ${counts.length.toLocaleString()} bins`}
+      onpointermove={updateHover}
+      onpointerleave={clearHover}
+    ></canvas>
+    {#if hoveredBin}
+      <div class="histogram-tooltip" role="status">
+        <strong>{formatRange(hoveredBin)}</strong>
+        <span>{formatNumber(hoveredBin.count)} · {formatPercent(hoveredBin.count)}</span>
+      </div>
+    {/if}
+  </div>
   <details class="histogram-data">
-    <summary>View histogram values · {counts.length.toLocaleString()} bins</summary>
+    <summary>Exact bin data · {counts.length.toLocaleString()} bins</summary>
     <div>
       <table>
-        <thead><tr><th>Bin</th><th>Count</th></tr></thead>
+        <thead><tr><th>Range</th><th>Count</th><th>Share</th></tr></thead>
         <tbody>
-          {#each visibleCounts as count, index}
-            <tr><th>{index.toLocaleString()}</th><td>{count.toLocaleString()}</td></tr>
+          {#each visibleBins as bin}
+            <tr>
+              <th>{formatRange(bin)}</th>
+              <td>{formatNumber(bin.count)}</td>
+              <td>{formatPercent(bin.count)}</td>
+            </tr>
           {/each}
         </tbody>
       </table>
-      {#if visibleCounts.length < counts.length}
+      {#if visibleBins.length < exactBins.length}
         <p>Showing the first {ACCESSIBLE_BIN_LIMIT.toLocaleString()} bins.</p>
       {/if}
     </div>
@@ -76,33 +183,80 @@
   .histogram {
     width: 100%;
     margin: 0;
+    padding: 8px 10px 7px;
+  }
+
+  .histogram-plot {
+    position: relative;
+    width: 100%;
+  }
+
+  .histogram-canvas {
+    width: 100%;
+    height: 190px;
+    display: block;
+    touch-action: none;
+  }
+
+  .histogram-tooltip {
+    position: absolute;
+    top: 10px;
+    left: clamp(76px, var(--hover-x), calc(100% - 76px));
+    min-width: 128px;
+    display: grid;
+    gap: 3px;
+    padding: 6px 8px;
+    border: 1px solid var(--line-strong);
+    background: color-mix(in srgb, var(--panel) 94%, transparent);
+    box-shadow: 0 5px 14px rgb(0 0 0 / 16%);
+    color: var(--text);
+    font-size: 10px;
+    pointer-events: none;
+    transform: translateX(-50%);
+  }
+
+  .histogram-tooltip span {
+    color: var(--muted);
   }
 
   .histogram-data {
-    margin-top: 6px;
+    margin-top: 5px;
     color: var(--muted);
-    font-size: 11px;
+    font-size: 10px;
   }
 
   .histogram-data summary {
+    width: max-content;
     cursor: pointer;
   }
 
   .histogram-data > div {
-    max-height: 240px;
+    max-height: 220px;
     margin-top: 6px;
     overflow: auto;
+    border-top: 1px solid var(--line);
   }
 
   table {
     width: 100%;
     border-collapse: collapse;
+    font-variant-numeric: tabular-nums;
   }
 
   th,
   td {
-    padding: 4px 7px;
+    padding: 5px 7px;
     border-bottom: 1px solid var(--line);
     text-align: right;
+  }
+
+  thead th {
+    position: sticky;
+    top: 0;
+    background: var(--surface);
+  }
+
+  th:first-child {
+    text-align: left;
   }
 </style>

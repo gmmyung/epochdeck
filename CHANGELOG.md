@@ -32,6 +32,9 @@ so storage and APIs may change without migration or compatibility shims.
   scrolls independently.
 - The artifact browser follows the checked runs, deduplicates shared artifacts,
   and shows every selected-run input/output relationship.
+- Media-key selection is a compact toolbar control, and histograms now show
+  bounded plots with source-value axes, hover inspection, and collapsed exact
+  range/count/share tables.
 - Metric charts now render with uPlot; dashboard selects and enlarged-chart
   dialogs use Bits UI accessibility primitives, dashboard icons use Lucide, and
   the Python SDK derives its default spool root from the operating system's

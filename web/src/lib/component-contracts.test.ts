@@ -20,11 +20,13 @@ describe("dashboard component contracts", () => {
 
   it("offers a semantic table alongside the histogram canvas", () => {
     const { body } = render(HistogramChart, {
-      props: { label: "reward distribution", counts: [2, 5, 3] },
+      props: { label: "reward distribution", counts: [2, 5, 3], edges: [-1, 0, 1, 2] },
     });
 
     expect(body).toContain("reward distribution histogram with 3 bins");
-    expect(body).toContain("View histogram values · 3 bins");
+    expect(body).toContain("Exact bin data · 3 bins");
+    expect(body).toContain("-1 – 0");
+    expect(body).toContain("20.0%");
     expect(body).toContain("<table");
   });
 

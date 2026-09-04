@@ -130,6 +130,14 @@
       : [];
   }
 
+  function histogramEdges(value: RichValue | undefined): number[] {
+    if (!value) return [];
+    const edges = value.metadata.edges;
+    return Array.isArray(edges)
+      ? edges.filter((item): item is number => typeof item === "number" && Number.isFinite(item))
+      : [];
+  }
+
   function tableColumns(value: RichValue | undefined): string[] {
     if (!value) return [];
     const columns = value.metadata.columns;
@@ -226,7 +234,11 @@
             {:else if selected.value.kind === "histogram"}
               {@const counts = histogramCounts(detail)}
               {#if counts.length > 0}
-                <HistogramChart {counts} label={selected.value.key} />
+                <HistogramChart
+                  {counts}
+                  edges={histogramEdges(detail)}
+                  label={selected.value.key}
+                />
               {:else}
                 <div class="unavailable">No histogram preview is available.</div>
               {/if}
