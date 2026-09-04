@@ -2001,6 +2001,10 @@ dd {
     padding-top: 0;
   }
 
+  .workspace.sidebar-collapsed {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .sidebar-resizer {
     display: none;
   }
@@ -2017,19 +2021,16 @@ dd {
   }
 
   .run-list {
-    grid-auto-columns: minmax(190px, 1fr);
+    grid-auto-columns: minmax(210px, 1fr);
     grid-auto-flow: column;
     overflow-x: auto;
   }
 
-  .run-list-row {
-    min-width: 210px;
-  }
-
   .workspace.sidebar-collapsed .run-list {
-    grid-auto-columns: auto;
-    grid-auto-flow: row;
-    overflow-x: visible;
+    grid-auto-columns: 42px;
+    grid-auto-flow: column;
+    margin-top: 0;
+    overflow-x: auto;
   }
 
   .workspace.sidebar-collapsed .run-list-row {
@@ -2037,7 +2038,19 @@ dd {
   }
 
   .workspace.sidebar-collapsed aside {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr);
+    gap: 8px;
+    align-items: start;
+    padding-top: 8px;
     padding-bottom: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .workspace.sidebar-collapsed aside .sidebar-header {
+    min-height: 34px;
+    margin: 0;
+    padding: 0;
     border-bottom: 0;
   }
 
