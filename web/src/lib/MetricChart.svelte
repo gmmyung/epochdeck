@@ -39,7 +39,8 @@
     type Viewport,
   } from "./metric-chart-viewport";
   import MetricChartSettings from "./MetricChartSettings.svelte";
-  import { boundedCanvasPixelRatio, UPlotRenderer } from "./uplot-renderer";
+  import { boundedCanvasPixelRatio } from "./canvas-resolution";
+  import { UPlotRenderer } from "./uplot-renderer";
 
   export let metric: string;
   export let identity = metric;

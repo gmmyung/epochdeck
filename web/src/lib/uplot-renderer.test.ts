@@ -8,25 +8,39 @@ import { UPlotRenderer } from "./uplot-renderer";
 
 const plotCalls = vi.hoisted(() => [] as string[]);
 const plotData = vi.hoisted(() => ({ value: null as unknown }));
+const plotCanvas = vi.hoisted(() => ({ value: null as HTMLCanvasElement | null }));
 
 vi.mock("uplot", () => ({
   default: class MockUPlot {
+    static pxRatio = 1;
+
     width: number;
     height: number;
     series: Array<{ alpha?: number }>;
+    ctx: CanvasRenderingContext2D;
 
     constructor(
       options: {
         width: number;
         height: number;
         series: Array<{ alpha?: number } | null>;
+        hooks?: { drawClear?: Array<(plot: MockUPlot) => void> };
       },
       data: unknown,
     ) {
       this.width = options.width;
       this.height = options.height;
       this.series = options.series.map((entry) => ({ ...(entry ?? {}) }));
+      const canvas = document.createElement("canvas");
+      canvas.width = options.width;
+      canvas.height = options.height;
+      this.ctx = {
+        canvas,
+        setTransform: (...values: number[]) => plotCalls.push(`transform:${values.join(":")}`),
+      } as unknown as CanvasRenderingContext2D;
       plotData.value = data;
+      plotCanvas.value = canvas;
+      options.hooks?.drawClear?.forEach((hook) => hook(this));
     }
 
     batch(operation: () => void): void {
@@ -83,6 +97,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   plotCalls.length = 0;
   plotData.value = null;
+  plotCanvas.value = null;
 });
 
 describe("uPlot renderer", () => {
@@ -117,6 +132,9 @@ describe("uPlot renderer", () => {
         [1, 2],
       ],
     ]);
+    expect(plotCanvas.value?.width).toBe(1_000);
+    expect(plotCanvas.value?.height).toBe(520);
+    expect(plotCalls).toContain("transform:2:0:0:2:0:0");
     plotCalls.length = 0;
     render({ x: { minimum: 20, maximum: 80 }, y: fullViewport.y });
 

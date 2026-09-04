@@ -35,6 +35,8 @@ so storage and APIs may change without migration or compatibility shims.
 - Media-key selection is a compact toolbar control, and histograms now show
   bounded plots with source-value axes, hover inspection, and collapsed exact
   range/count/share tables.
+- Histograms and metric plots use bounded high-resolution canvas buffers so
+  lines, bars, and canvas-rendered labels remain crisp in Chromium at 1x DPR.
 - Metric charts now render with uPlot; dashboard selects and enlarged-chart
   dialogs use Bits UI accessibility primitives, dashboard icons use Lucide, and
   the Python SDK derives its default spool root from the operating system's

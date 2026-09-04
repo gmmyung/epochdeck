@@ -3,6 +3,7 @@ import "uplot/dist/uPlot.min.css";
 
 import type { ScaleMode } from "./chart-data";
 import { lineDash, type PreparedMetricSeries } from "./chart-series";
+import { boundedCanvasPixelRatio } from "./canvas-resolution";
 import type { Frame, Viewport } from "./metric-chart-viewport";
 
 type DisplayMode = "band" | "line";
@@ -22,22 +23,6 @@ type FacetedValues = [number[], Array<number | null>];
 type FacetedData = Array<null | FacetedValues>;
 
 const PADDING = { top: 12, right: 18, bottom: 32, left: 58 } as const;
-const CANVAS_PIXEL_BUDGET = 8_000_000;
-const CANVAS_DIMENSION_LIMIT = 4_096;
-const CANVAS_DPR_LIMIT = 2;
-
-export function boundedCanvasPixelRatio(width: number, height: number): number {
-  const safeWidth = Math.max(width, 1);
-  const safeHeight = Math.max(height, 1);
-  const requestedRatio = Math.min(window.devicePixelRatio || 1, CANVAS_DPR_LIMIT);
-  const pixelBudgetRatio = Math.sqrt(CANVAS_PIXEL_BUDGET / (safeWidth * safeHeight));
-  const dimensionRatio = Math.min(
-    CANVAS_DIMENSION_LIMIT / safeWidth,
-    CANVAS_DIMENSION_LIMIT / safeHeight,
-  );
-  return Math.max(0.01, Math.min(requestedRatio, pixelBudgetRatio, dimensionRatio));
-}
-
 export class UPlotRenderer {
   private plot: uPlot | null = null;
   private candidates: PreparedMetricSeries[] | null = null;
@@ -162,6 +147,9 @@ export class UPlotRenderer {
       ],
       series: series as uPlot.Series[],
       bands,
+      hooks: {
+        drawClear: [prepareHighResolutionCanvas],
+      },
     };
 
     if (!supportsCanvas()) {
@@ -183,6 +171,18 @@ export class UPlotRenderer {
       this.plot.series[index].alpha = emphasized ? 1 : 0.16;
     }
   }
+}
+
+function prepareHighResolutionCanvas(plot: uPlot): void {
+  const desiredRatio = boundedCanvasPixelRatio(plot.width, plot.height);
+  const nativeRatio = Number.isFinite(uPlot.pxRatio) && uPlot.pxRatio > 0 ? uPlot.pxRatio : 1;
+  const canvas = plot.ctx.canvas;
+  const pixelWidth = Math.round(plot.width * desiredRatio);
+  const pixelHeight = Math.round(plot.height * desiredRatio);
+  if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+  if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
+  const scale = desiredRatio / nativeRatio;
+  plot.ctx.setTransform(scale, 0, 0, scale, 0, 0);
 }
 
 function sameDomain(left: Viewport["x"] | undefined, right: Viewport["x"]): boolean {

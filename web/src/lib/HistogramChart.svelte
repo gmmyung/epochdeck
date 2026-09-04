@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
 
+  import { boundedCanvasPixelRatio, snapCanvasCoordinate } from "./canvas-resolution";
   import { boundedHistogramBins, type HistogramBin } from "./histogram-data";
 
   export let counts: number[];
@@ -52,9 +53,9 @@
   function draw(target: HTMLCanvasElement, values: HistogramBin[], highlight: number | null): void {
     const width = Math.max(target.clientWidth, 1);
     const height = Math.max(target.clientHeight, 1);
-    const ratio = window.devicePixelRatio || 1;
-    target.width = Math.floor(width * ratio);
-    target.height = Math.floor(height * ratio);
+    const ratio = boundedCanvasPixelRatio(width, height);
+    target.width = Math.round(width * ratio);
+    target.height = Math.round(height * ratio);
     const context = target.getContext("2d");
     if (!context) return;
     context.scale(ratio, ratio);
@@ -77,10 +78,10 @@
     context.lineWidth = 1;
     for (let tick = 0; tick <= 4; tick += 1) {
       const fraction = tick / 4;
-      const y = PLOT_TOP + plotHeight * (1 - fraction);
+      const y = snapCanvasCoordinate(PLOT_TOP + plotHeight * (1 - fraction), ratio);
       context.beginPath();
-      context.moveTo(PLOT_LEFT, Math.round(y) + 0.5);
-      context.lineTo(PLOT_LEFT + plotWidth, Math.round(y) + 0.5);
+      context.moveTo(PLOT_LEFT, y);
+      context.lineTo(PLOT_LEFT + plotWidth, y);
       context.stroke();
       context.textAlign = "right";
       context.fillText(formatNumber(maximum * fraction), PLOT_LEFT - 6, y);
@@ -92,12 +93,11 @@
       const bin = values[index];
       const barHeight = (bin.count / maximum) * plotHeight;
       context.fillStyle = index === highlight ? muted : accent;
-      context.fillRect(
-        PLOT_LEFT + index * barWidth,
-        PLOT_TOP + plotHeight - barHeight,
-        Math.max(barWidth - gap, 1),
-        barHeight,
-      );
+      const left = snapCanvasCoordinate(PLOT_LEFT + index * barWidth, ratio);
+      const right = snapCanvasCoordinate(PLOT_LEFT + (index + 1) * barWidth - gap, ratio);
+      const top = snapCanvasCoordinate(PLOT_TOP + plotHeight - barHeight, ratio);
+      const bottom = snapCanvasCoordinate(PLOT_TOP + plotHeight, ratio);
+      context.fillRect(left, top, Math.max(right - left, 1 / ratio), bottom - top);
     }
 
     const xTicks = Math.min(4, values.length);
