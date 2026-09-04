@@ -83,4 +83,10 @@ feature surface.
 EpochDeck has no Hugging Face, Hub, Spaces, Buckets, Datasets, or Gradio runtime
 dependency. Trackio and W&B are compatibility references only.
 
+## AI assistance
+
+EpochDeck is developed with substantial AI assistance. Changes are reviewed and
+tested, but AI-generated code can still contain mistakes. Evaluate the software
+independently before relying on it.
+
 EpochDeck is licensed under [Apache-2.0](LICENSE).
