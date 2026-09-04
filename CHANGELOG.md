@@ -23,6 +23,12 @@ so storage and APIs may change without migration or compatibility shims.
   cargo-zigbuild, emulation, and cross-compilation are no longer in the release
   toolchain.
 
+### Fixed
+
+- Windows backups now close SQLite handles before atomic publication, exports
+  flush files through write-capable descriptors, and filename validation tests
+  use paths that can be constructed on every supported platform.
+
 ## [0.1.0-alpha.1] - 2026-08-31
 
 ### Added

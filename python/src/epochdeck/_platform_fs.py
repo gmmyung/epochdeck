@@ -143,6 +143,16 @@ def open_regular_file_descriptor(
         raise
 
 
+def sync_regular_file(path: Path) -> None:
+    """Flush a verified regular file without weakening Windows durability."""
+    flags = os.O_RDWR if IS_WINDOWS else os.O_RDONLY
+    descriptor = open_regular_file_descriptor(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def sync_directory(path: Path) -> None:
     """Flush a directory entry on POSIX; validate it on Windows.
 

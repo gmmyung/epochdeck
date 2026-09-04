@@ -133,6 +133,38 @@ def test_windows_directory_sync_validates_without_opening_directory(monkeypatch,
     assert verified == [directory]
 
 
+def test_native_regular_file_sync_flushes_a_file(tmp_path) -> None:
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"payload")
+
+    platform_fs.sync_regular_file(path)
+
+    assert path.read_bytes() == b"payload"
+
+
+def test_windows_regular_file_sync_requests_write_access(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"payload")
+    opened: list[tuple[Path, int]] = []
+    synced: list[int] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(platform_fs, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        platform_fs,
+        "open_regular_file_descriptor",
+        lambda requested, flags: opened.append((requested, flags)) or 41,
+    )
+    monkeypatch.setattr(platform_fs.os, "fsync", synced.append)
+    monkeypatch.setattr(platform_fs.os, "close", closed.append)
+
+    platform_fs.sync_regular_file(path)
+
+    assert opened == [(path, os.O_RDWR)]
+    assert synced == [41]
+    assert closed == [41]
+
+
 def test_reparse_points_are_treated_as_links() -> None:
     status = SimpleNamespace(st_mode=0o040755, st_file_attributes=0x400)
     assert platform_fs.is_link_or_reparse(status) is True

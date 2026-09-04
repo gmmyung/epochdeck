@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,7 @@ def test_physical_backup_verifies_and_restores_split_storage(tmp_path) -> None:
     (source.metrics / "staging").mkdir()
     (source.blobs / "sha256" / "ab").mkdir(parents=True)
     (source.blobs / "staging").mkdir()
-    with sqlite3.connect(source.catalog) as database:
+    with closing(sqlite3.connect(source.catalog)) as database, database:
         database.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)")
         database.execute("INSERT INTO runs VALUES ('run-1')")
     (source.metrics / "segment.parquet").write_bytes(b"parquet")
@@ -66,7 +67,7 @@ def test_physical_backup_verifies_and_restores_split_storage(tmp_path) -> None:
     )
     restored = restore_storage(bundle, target)
     assert restored == manifest
-    with sqlite3.connect(target.catalog) as database:
+    with closing(sqlite3.connect(target.catalog)) as database, database:
         assert database.execute("SELECT id FROM runs").fetchone() == ("run-1",)
     assert (target.metrics / "segment.parquet").read_bytes() == b"parquet"
     assert (target.blobs / "sha256" / "ab" / "abcdef").read_bytes() == b"blob"
@@ -154,7 +155,7 @@ def test_backup_syncs_the_generated_tree_before_atomic_publish(monkeypatch, tmp_
         blobs=tmp_path / "blobs",
     )
     roots.data.mkdir()
-    with sqlite3.connect(roots.catalog) as database:
+    with closing(sqlite3.connect(roots.catalog)) as database, database:
         database.execute("CREATE TABLE health (ok INTEGER)")
     destination = tmp_path / "backup"
     events: list[tuple[str, Path]] = []
@@ -178,6 +179,33 @@ def test_backup_syncs_the_generated_tree_before_atomic_publish(monkeypatch, tmp_
     assert events[0][1].name.startswith(".backup.partial-")
 
 
+def test_backup_closes_every_internal_sqlite_connection(monkeypatch, tmp_path) -> None:
+    roots = StorageRoots(
+        data=tmp_path / "data",
+        metrics=tmp_path / "metrics",
+        blobs=tmp_path / "blobs",
+    )
+    roots.data.mkdir()
+    with closing(sqlite3.connect(roots.catalog)) as database, database:
+        database.execute("CREATE TABLE health (ok INTEGER)")
+    original_connect = sqlite3.connect
+    connections: list[sqlite3.Connection] = []
+
+    def tracked_connect(*args, **kwargs):
+        database = original_connect(*args, **kwargs)
+        connections.append(database)
+        return database
+
+    monkeypatch.setattr(backup_module.sqlite3, "connect", tracked_connect)
+
+    backup_storage(roots, tmp_path / "backup")
+
+    assert len(connections) == 3
+    for database in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            database.execute("SELECT 1")
+
+
 def test_backup_rejects_a_destination_inside_storage(tmp_path) -> None:
     roots = StorageRoots(
         data=tmp_path / "data",
@@ -185,7 +213,7 @@ def test_backup_rejects_a_destination_inside_storage(tmp_path) -> None:
         blobs=tmp_path / "blobs",
     )
     roots.data.mkdir()
-    with sqlite3.connect(roots.catalog) as database:
+    with closing(sqlite3.connect(roots.catalog)) as database, database:
         database.execute("CREATE TABLE health (ok INTEGER)")
 
     with pytest.raises(BackupError, match="must be disjoint"):
@@ -198,7 +226,7 @@ def test_backup_rejects_a_destination_inside_storage(tmp_path) -> None:
         blobs=ancestor / "blobs",
     )
     nested_roots.data.mkdir(parents=True)
-    with sqlite3.connect(nested_roots.catalog) as database:
+    with closing(sqlite3.connect(nested_roots.catalog)) as database, database:
         database.execute("CREATE TABLE health (ok INTEGER)")
 
     with pytest.raises(BackupError, match="must be disjoint"):
@@ -212,7 +240,7 @@ def test_backup_and_restore_reject_an_ambiguous_shared_content_root(tmp_path) ->
         blobs=tmp_path / "source-blobs",
     )
     source.data.mkdir()
-    with sqlite3.connect(source.catalog) as database:
+    with closing(sqlite3.connect(source.catalog)) as database, database:
         database.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)")
     bundle = tmp_path / "backup"
     backup_storage(source, bundle)
@@ -276,7 +304,7 @@ def test_backup_acquires_every_canonical_storage_root_lock(tmp_path) -> None:
     )
     for root in (roots.data, roots.metrics, roots.blobs):
         root.mkdir()
-    with sqlite3.connect(roots.catalog) as database:
+    with closing(sqlite3.connect(roots.catalog)) as database, database:
         database.execute("CREATE TABLE health (ok INTEGER)")
 
     with (roots.metrics / "epochdeck.lock").open("a+b") as active_metric_lock:
@@ -304,7 +332,7 @@ def test_restore_rejects_invalid_inventory_metadata(tmp_path) -> None:
         blobs=tmp_path / "source-blobs",
     )
     source.data.mkdir()
-    with sqlite3.connect(source.catalog) as database:
+    with closing(sqlite3.connect(source.catalog)) as database, database:
         database.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)")
     bundle = tmp_path / "backup"
     backup_storage(source, bundle)
@@ -342,7 +370,7 @@ def test_failed_restore_rolls_back_every_installed_root(monkeypatch, tmp_path) -
     source.data.mkdir()
     source.metrics.mkdir()
     source.blobs.mkdir()
-    with sqlite3.connect(source.catalog) as database:
+    with closing(sqlite3.connect(source.catalog)) as database, database:
         database.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)")
     (source.metrics / "segment.parquet").write_bytes(b"parquet")
     bundle = tmp_path / "backup"
@@ -381,7 +409,7 @@ def test_restore_rejects_duplicate_inventory_destinations(tmp_path) -> None:
     )
     source.data.mkdir()
     source.metrics.mkdir()
-    with sqlite3.connect(source.catalog) as database:
+    with closing(sqlite3.connect(source.catalog)) as database, database:
         database.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)")
     (source.metrics / "segment.parquet").write_bytes(b"metrics")
     bundle = tmp_path / "backup"
@@ -419,7 +447,7 @@ def test_restore_rejects_symbolic_link_bundle_sources(linked_source, tmp_path) -
     )
     source.data.mkdir()
     source.metrics.mkdir()
-    with sqlite3.connect(source.catalog) as database:
+    with closing(sqlite3.connect(source.catalog)) as database, database:
         database.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)")
     (source.metrics / "segment.parquet").write_bytes(b"metrics")
     bundle = tmp_path / "backup"
@@ -455,7 +483,7 @@ def test_restore_rejects_a_bundle_inside_target_storage(tmp_path) -> None:
         blobs=tmp_path / "source-blobs",
     )
     source.data.mkdir()
-    with sqlite3.connect(source.catalog) as database:
+    with closing(sqlite3.connect(source.catalog)) as database, database:
         database.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)")
     target = StorageRoots(
         data=tmp_path / "target-data",
@@ -486,7 +514,7 @@ def test_restore_publishes_the_catalog_after_content_roots(monkeypatch, tmp_path
     source.data.mkdir()
     source.metrics.mkdir()
     source.blobs.mkdir()
-    with sqlite3.connect(source.catalog) as database:
+    with closing(sqlite3.connect(source.catalog)) as database, database:
         database.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)")
     (source.metrics / "nested").mkdir()
     (source.metrics / "nested" / "segment.parquet").write_bytes(b"metrics")

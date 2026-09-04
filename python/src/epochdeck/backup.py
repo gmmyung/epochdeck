@@ -8,7 +8,7 @@ import sqlite3
 import stat
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -232,8 +232,10 @@ def _storage_lock(roots: StorageRoots) -> Iterator[None]:
 def _backup_sqlite(source: Path, destination: Path) -> None:
     try:
         with (
-            sqlite3.connect(_readonly_sqlite_uri(source), uri=True) as source_database,
-            sqlite3.connect(destination) as destination_database,
+            closing(sqlite3.connect(_readonly_sqlite_uri(source), uri=True)) as source_database,
+            closing(sqlite3.connect(destination)) as destination_database,
+            source_database,
+            destination_database,
         ):
             source_database.backup(destination_database)
     except sqlite3.Error as error:
@@ -244,7 +246,7 @@ def _backup_sqlite(source: Path, destination: Path) -> None:
 
 def _verify_sqlite(path: Path) -> None:
     try:
-        with sqlite3.connect(_readonly_sqlite_uri(path), uri=True) as database:
+        with closing(sqlite3.connect(_readonly_sqlite_uri(path), uri=True)) as database:
             result = database.execute("PRAGMA integrity_check").fetchone()
     except sqlite3.Error as error:
         raise BackupError(f"failed to verify SQLite catalog: {error}") from error

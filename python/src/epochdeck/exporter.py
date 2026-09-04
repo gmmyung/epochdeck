@@ -14,8 +14,8 @@ from uuid import uuid4
 from epochdeck._pagination import next_paired_cursor, next_text_cursor
 from epochdeck._platform_fs import (
     is_link_or_reparse,
-    open_regular_file_descriptor,
     sync_directory,
+    sync_regular_file,
 )
 from epochdeck.client import EpochDeckClient
 
@@ -495,11 +495,7 @@ def _sync_private_tree(root: Path, *, depth: int = 0) -> None:
             if not stat.S_ISREG(status.st_mode):
                 raise RuntimeError(f"export tree contains a non-regular file: {path}")
             path.chmod(0o600)
-            descriptor = open_regular_file_descriptor(path, os.O_RDONLY)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+            sync_regular_file(path)
     _fsync_directory_descriptor(root)
 
 
