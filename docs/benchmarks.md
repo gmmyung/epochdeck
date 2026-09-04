@@ -8,26 +8,20 @@ and one bounded query response.
 just benchmark-metrics 200000 180
 ```
 
-It generates 200,000 rows with 180 numeric metric columns, writes immutable
-Zstd-compressed wide Parquet segments, compacts them in bounded 16-segment
-groups, and then scans one projected column into a 5,000-point min/max budget.
-The same workload also exercises the exact chart-history path: one projected
-pass discovers the requested metric's step extent, and a second projected pass
-computes exact per-bucket minimum, maximum, and last values into a 2,000-bucket
-budget. The harness verifies source counts, the bucket cap, and that every last
-value remains inside its exact band. It then requests a centered 512-step
-viewport and records decoded rows plus selected and pruned row groups. Pruning
-is conservative: only exact step statistics can exclude a group.
-The harness also projects eight requested metric columns together, discovers
-their shared per-run origin, and builds a relative-step comparison aggregate
-under the 20,000-cell request ceiling. This exercises the grouped scan shape
-used when several run overlays miss the server cache.
-The comparison number below is therefore a cold storage-path measurement. The
-server separately caches exact per-key axis extents by sequence watermark, so
-an identical natural-range endpoint replay does not repeat this extent pass.
-It also projects the final sequence and step from the last row of the latest
-segment, matching the remote-resume workload. Temporary data is removed after
-each run.
+The workload:
+
+- generates 200,000 rows with 180 numeric metrics;
+- writes Zstd-compressed wide Parquet segments;
+- compacts bounded groups of up to 16 segments;
+- samples one projected column into 5,000 points;
+- builds exact min/max/last chart buckets;
+- measures a 512-step viewport with row-group pruning;
+- compares eight columns on a shared relative-step axis; and
+- reads the final sequence and step for remote resume.
+
+The comparison result is a cold storage-path measurement. The server separately
+caches exact per-key extents by sequence watermark. Temporary data is removed
+after every run.
 
 Reference smoke result on an Apple M5 Pro on 2026-08-29:
 

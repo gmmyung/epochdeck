@@ -62,16 +62,20 @@ than the one-second `updated_at` timestamp, are the cache-invalidation contract.
   multiple runs on one bounded comparison axis.
 
 Batch sequence and canonical request digest form the idempotency contract. An
-identical replay succeeds as a duplicate; reusing a sequence for different
-contents returns a conflict. History requests accept at most 32 columns and
-5,000 points. `limit` selects full-resolution cursor pagination;
-`max_points` selects spike-preserving display sampling, and the two parameters
-are mutually exclusive. Sampled responses set `sampled` and `source_points`;
-full-resolution pages continue with the returned `next_after` cursor. A sampled
-budget must allow at least two extrema per requested metric. History responses
-include `source_last_sequence`, allowing a revision-aware client to request only
-new rows after a sampled snapshot. These response bounds are not retention
-quotas.
+identical replay succeeds as a duplicate. Reusing a sequence for different
+content returns a conflict.
+
+History requests follow these rules:
+
+- at most 32 columns and 5,000 returned points;
+- `limit` selects full-resolution cursor pagination;
+- `max_points` selects spike-preserving display sampling;
+- `limit` and `max_points` are mutually exclusive; and
+- sampled budgets allow at least two extrema per metric.
+
+Sampled responses include `sampled`, `source_points`, and
+`source_last_sequence`. Full-resolution pages continue with `next_after`.
+Response bounds are not retention quotas.
 
 Metric-key pages contain `run_id`, `keys`, and `next_after`. A null cursor means
 the server confirmed exhaustion; clients must continue non-null cursors rather
@@ -88,20 +92,20 @@ selected runs, availability mode, and search text, independent of the current
 page. Pass `next_after` back unchanged. This endpoint returns catalog metadata
 only—metric values still come from the chart-history APIs.
 
-Chart history is a separate aggregate contract; raw cursor pagination on
-`/history` is unchanged. Repeat the percent-encoded `key` parameter to request
-multiple metrics. `max_buckets` is between 1 and 2,000, and the product
-of requested metric keys and buckets cannot exceed 5,000 metric-bucket cells.
-When omitted, the server uses the smaller of 1,000 buckets and the per-key share
-of that global limit. Optional `step_min` and `step_max` are an inclusive
-viewport and must be supplied together in ascending order. Without a viewport,
-the server discovers the union step extent containing a non-null requested
-metric. All scans project only the requested Parquet columns and use a frozen
-sequence watermark, so concurrent ingestion appears in the next snapshot.
-Explicit viewports also prune Parquet row groups whose exact step statistics
-prove they cannot overlap the requested range. Missing, inexact, deprecated, or
-internally inconsistent statistics disable pruning for that row group rather
-than risking the loss of source values.
+Chart history is separate from raw `/history` pagination. Its request rules are:
+
+- repeat the percent-encoded `key` parameter for multiple metrics;
+- set `max_buckets` between 1 and 2,000;
+- keep requested metric-bucket cells at or below 5,000; and
+- provide `step_min` and `step_max` together in ascending order.
+
+Without `max_buckets`, the server uses the smaller of 1,000 buckets and each
+metric's share of the cell limit. Without a viewport, it discovers the union
+step extent containing requested values.
+
+Scans project only requested Parquet columns and freeze the sequence watermark.
+Exact viewport statistics prune disjoint row groups. Missing or untrusted
+statistics disable pruning rather than risking lost values.
 
 The response is columnar and keeps sparse metrics independent:
 
@@ -128,17 +132,18 @@ The response is columnar and keeps sparse metrics independent:
 }
 ```
 
-Each metric's arrays are aligned and omit buckets in which that metric has no
-value. `minimum` and `maximum` are the exact extrema of every source value for
-that metric in the bucket. `last` is selected by greatest run sequence even
-when steps repeat or move backward; `last_step` and `last_timestamp_ms` come
-from that same point. `last_x` equals `last_step` on this absolute-step
-endpoint. The bucket index is
+Each metric's arrays are aligned. Empty buckets are omitted.
+
+- `minimum` and `maximum` are exact source extrema for the bucket.
+- `last` comes from the greatest run sequence, even when steps move backward.
+- `last_step` and `last_timestamp_ms` describe that same point.
+- `last_x` equals `last_step` on the absolute-step endpoint.
+- Each metric reports its own non-null `source_points` count.
+
+The bucket index is
 `floor((step - step_min) * bucket_count / (step_max - step_min + 1))`.
-The dashboard draws Band directly from `minimum`/`maximum` and may smooth the
-`last` trend column; it must not construct a rolling envelope from sampled
-points. `source_points` at the top level counts rows containing any requested
-metric, while each metric reports its own non-null source count.
+Charts draw the band from `minimum` and `maximum`; they do not derive an
+envelope from sampled points.
 
 Multi-run charts send one project-scoped JSON request:
 
@@ -194,14 +199,12 @@ per-run `source_last_sequence` watermarks, and sparse series:
 ```
 
 All series use the same bucket lattice. Empty buckets and missing metrics are
-omitted rather than interpolated or zero-filled. Each occupied bucket retains
-exact source minimum and maximum values and selects `last`, `last_x`, raw
-`last_step`, and `last_timestamp_ms` from the greatest sequence. The server
-groups requested columns by run, scans against one snapshot barrier and fixed
-per-run watermarks, caches exact per-key axis extents (including missing
-metrics) by watermark, and caches individual aggregate series with watermark,
-origin, and lattice-aware keys. Both caches have independent explicit entry and
-byte bounds; aggregate series additionally have a cell bound.
+omitted rather than interpolated or zero-filled. Occupied buckets retain exact
+extrema and select last-point fields by greatest sequence.
+
+The server groups columns by run and scans against one snapshot barrier. Axis
+and aggregate caches use fixed per-run watermarks and have independent entry,
+byte, and cell bounds.
 
 ## Monitoring
 
@@ -233,14 +236,13 @@ from the user summary and do not advance the logical training step.
 - `GET /rich-values/{value_id}` returns the selected complete manifest.
 
 Blob uploads send the digest in the path and content type in the header. The
-optional `x-epochdeck-file-name` header is a percent-encoded UTF-8 basename; after
-one decoding pass it must contain 1 to 512 non-control UTF-8 bytes and no `/` or
-`\\`. The server hashes while streaming to a staging file, rejects mismatches,
-syncs the file, and atomically installs it under `EPOCHDECK_BLOBS_DIR/sha256`.
-Repeating an already installed digest is idempotent and does not rewrite
-content. Successful reads carry a digest-derived strong `ETag` and
-`Cache-Control: public, max-age=31536000, immutable`; conditional and byte-range
-requests retain the same immutable identity.
+optional `x-epochdeck-file-name` is a percent-encoded UTF-8 basename. After one
+decode, it must contain 1 to 512 non-control bytes and no `/` or `\\`.
+
+The server hashes uploads while streaming, rejects mismatches, and atomically
+installs content under `EPOCHDECK_BLOBS_DIR/sha256`. Repeating a digest is
+idempotent. Reads use an immutable digest-derived `ETag` and support conditional
+and byte-range requests.
 
 Rich manifests contain a stable UUIDv7 ID, key, `image`, `audio`, `video`,
 `table`, or `histogram` kind, step, timestamp, optional blob reference, and up
@@ -267,20 +269,18 @@ Exact manifest retries are idempotent.
 - `GET /artifacts/{artifact_id}/files/{path}` streams one manifest entry with
   range support.
 
-Artifact collection names have one stable type per project. Each create request
-contains up to 4,096 unique relative POSIX paths and a total 2 MiB manifest
-budget; these are metadata bounds, not file-size or retention quotas. The server
-verifies every referenced SHA-256 object before allocating the version in one
-SQLite transaction. Stable request IDs make a lost create response replay-safe.
-An occupied explicit version slot conflicts unless the request is an exact
-same-ID replay. Automatic allocation remains `max(existing version) + 1`, so
-explicit imports may preserve sparse source version numbers. An alias always
-targets the highest artifact version that requested it; importing an older
-version later cannot move an alias backward.
-Whole-artifact downloads preserve validated relative POSIX entry paths, use
-stored ZIP entries, and stream through a fixed-size buffer rather than staging
-or retaining the complete archive. Responses provide both an ASCII fallback and
-UTF-8 `filename*` in `Content-Disposition`.
+Artifact collections have one stable type per project. Create requests allow up
+to 4,096 unique relative POSIX paths and 2 MiB of manifest metadata. These are
+not file-size or retention quotas.
+
+- Referenced SHA-256 objects are verified before version allocation.
+- Stable request IDs make lost responses replay-safe.
+- Occupied explicit versions conflict unless the replay is exact.
+- Automatic versions use `max(existing version) + 1`.
+- Aliases never move backward when older versions are imported later.
+
+Whole-artifact ZIP downloads preserve validated paths and stream through a
+fixed-size buffer. `Content-Disposition` includes ASCII and UTF-8 filenames.
 
 Project artifact responses include `next_before`. Run-link responses use the
 paired `next_before` and `next_before_relation` cursor because the same artifact
@@ -378,15 +378,14 @@ Report list responses use the same `next_before` cursor convention.
 - `GET /diagnostics` returns bounded process, queue, storage-capacity, and
   slow-request telemetry.
 
-Run query bodies accept optional `project`, `state`, exact `name`, literal
-`name_contains`, top-level `config_equals` and `summary_equals` JSON maps,
-`run_ids`, `before`, and `limit`. `run_ids` is a unique set of at most 32 IDs for
-one bounded bulk status refresh; it cannot be combined with `before`, and the
-page limit must cover the complete requested set. Document values use typed JSON
-equality, including null; they are not stringified comparisons. Responses
-return `next_before` when a full page may have a continuation. The current
-pre-alpha query contract rejects unknown fields, unimplemented comparison
-operators, and alternate sort orders explicitly.
+Run queries accept `project`, `state`, exact `name`, literal `name_contains`,
+top-level `config_equals` and `summary_equals` maps, `run_ids`, `before`, and
+`limit`.
+
+`run_ids` accepts at most 32 unique IDs. It cannot be combined with `before`,
+and the page limit must cover the set. Document filters use typed JSON equality,
+including null. Unknown fields, unsupported operators, and alternate sort
+orders fail explicitly.
 
 Newest-first project, run, report, artifact, rich-value, trace, sweep, and alert
 lists order by their event time and ID. Although the cursor is represented by an
@@ -416,27 +415,22 @@ filesystem path. Logo responses use the validated `image/png`, `image/jpeg`,
 SVG responses carry a route-specific sandboxed `default-src 'none'` content
 security policy in addition to startup validation.
 
-Native application authentication, multi-user authorization, and stable
-external deployment guarantees are not implemented. Bind the EpochDeck HTTP
-server to loopback and expose it only through an authenticated HTTPS reverse
-proxy that terminates TLS and enforces access control. Never expose the
-EpochDeck HTTP port directly.
+Authentication and network-exposure requirements are defined in the
+[security policy](../SECURITY.md).
 
-Diagnostics retain only the most recent 64 slow requests in memory. They also
-report the catalog, metric, and blob roots with string device IDs and total,
-free, and available bytes, plus the 64-request API admission limit, its
-currently available permits and rejection count, the dedicated two-request
-health pool, and available metric-ingest, blob-upload, artifact-I/O,
-download-stream, and query permits. When all API admission permits are occupied,
-a new API request is rejected before its body is parsed with HTTP 503,
-`server_busy`, and `Retry-After: 1`; it never joins an unbounded worker or
-mutation-lock queue. Health checks use their own non-queuing two-request pool;
-embedded static dashboard assets bypass API admission. Admission permits remain
-attached to response bodies until EOF or disconnect. Raw blob and artifact-file
-responses additionally use a 16-stream pool, preventing slow media clients from
-occupying the general 64-request capacity. The default slow threshold is 1,000 ms and
-`EPOCHDECK_SLOW_REQUEST_MS` accepts values from 1 to 60,000. Counters reset on
-process restart and do not add a telemetry database.
+Diagnostics retain the 64 most recent slow requests. They report:
+
+- catalog, metric, and blob capacity and device IDs;
+- API and health admission capacity;
+- available ingest, upload, artifact, download, and query permits; and
+- request, rejection, timing, and failure counters.
+
+Full API admission returns HTTP 503 `server_busy` with `Retry-After: 1` before
+body parsing. Health checks have a separate two-request pool. Static assets
+bypass API admission, while raw downloads use an additional 16-stream pool.
+
+`EPOCHDECK_SLOW_REQUEST_MS` accepts 1 to 60,000 milliseconds and defaults to
+1,000. Counters reset on process restart.
 
 SQLite writer acquisition is also bounded. If catalog contention outlasts that
 bound, the request receives the same retryable HTTP 503 `server_busy` response

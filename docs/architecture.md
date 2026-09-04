@@ -30,10 +30,10 @@ metric, and blob filesystem roots. It must:
 The server owns ingestion, query scheduling, catalog transactions, storage
 manifests, and HTTP delivery. Tokio and Axum provide the runtime and HTTP
 boundary. CPU-heavy encoding and query work runs in bounded worker pools rather
-than on async executor threads. Native application authentication and multi-user
-authorization are not implemented. The EpochDeck HTTP server binds to loopback;
-an authenticated HTTPS reverse proxy terminates TLS and enforces access control
-at the external boundary. The server port must never be exposed directly.
+than on async executor threads.
+
+The current trust boundary is defined in the
+[security policy](../SECURITY.md).
 
 The `embedded-dashboard` production feature packages the built dashboard into
 the server binary. Single-node operation requires no external database, queue,
@@ -50,11 +50,14 @@ The catalog maintains project run counts and per-run rich-key counts/latest
 references in the same transactions as their source rows, avoiding list-time
 scans of every run or rich value. Newest-first cursors resolve an ID to its
 event-time/ID tuple, so deterministic imported UUIDs do not have to encode
-chronology. See [ADR 0015](adr/0015-bounded-dashboard-discovery.md).
+chronology.
+
 Every project-visible logical mutation also advances a catalog-backed monotonic
 project token. Project summaries expose the token as an opaque decimal string,
 allowing a streaming export to detect even a transient create-delete ABA across
 its traversal. Physical metric compaction does not advance the logical token.
+
+See [ADR 0015](adr/0015-bounded-dashboard-discovery.md).
 
 Explicit user summary data and the derived latest-metric preview are stored
 separately. The explicit document has its own 256 KiB budget. The preview keeps
@@ -84,17 +87,17 @@ converted to Arrow record batches, and flushed as immutable Parquet segments. A
 catalog transaction makes each segment visible atomically.
 
 The Python journal is append-only and fsynced before `log` returns. Its byte
-offset advances atomically only after an idempotent server acknowledgement. The
-server writes each batch to an owned temporary Parquet file under
-`EPOCHDECK_METRICS_DIR/staging`, syncs it, installs it with an atomic no-replace
-operation, and then commits its SQLite manifest. The staging directory is on
-the same filesystem as final segments, so hard-link installation remains
-atomic. Startup proves that both the metric and blob roots support this
-same-filesystem, no-replace hard-link operation and fails explicitly when the
-filesystem cannot provide it. RAII removes temporary files on ordinary errors
-and cancellation; the exclusive server startup path removes crash leftovers
-before accepting work. A client retry after a crash therefore either installs
-the missing batch or receives the same duplicate acknowledgement.
+offset advances only after an idempotent server acknowledgement.
+
+Server publication follows a fixed sequence:
+
+1. Write and sync a temporary Parquet file in the metric root.
+2. Install it with an atomic no-replace hard link.
+3. Commit its SQLite manifest.
+
+Startup verifies the required filesystem operation. Temporary files are removed
+on errors, cancellation, and crash recovery. A retry therefore installs the
+missing batch or receives the same duplicate acknowledgement.
 
 Published files are flushed after installation. Unix hosts then fsync the
 parent directory. Windows reopens the file with write access before
@@ -135,28 +138,28 @@ pages without losing stored data.
 Project comparison queries group requested columns by run and freeze one
 sequence watermark per run under the metric snapshot barrier. Absolute step,
 per-run relative step, and per-run elapsed milliseconds map onto one shared
-bucket lattice; sparse series never acquire interpolated points. A bounded
-2,048-entry/2-MiB per-key LRU reuses exact axis extents at an unchanged
-first/last sequence watermark, including cached missing metrics, so natural
-range replays can resolve the shared lattice without another storage scan. A
-separate bounded per-series LRU reuses exact aggregates when a run's watermark,
-alignment origin, viewport, and lattice are unchanged. Its 512-entry,
-250,000-cell, and 32-MiB limits are independent eviction bounds, not history
-retention limits.
+bucket lattice. Sparse series are never interpolated.
+
+Two bounded caches avoid repeated storage scans:
+
+- a 2,048-entry, 2 MiB per-key cache for exact axis extents; and
+- a 512-entry, 250,000-cell, 32 MiB cache for aggregate series.
+
+These are eviction bounds, not history-retention limits.
 
 The dashboard discovers union or intersection metric keys through a bounded
 project-scoped catalog query for at most 32 selected runs. It then derives
 deterministic chart request groups from the selected runs and requested keys.
-Full-range and viewport refreshes reuse the same
-group, so alignment origins and bucket lattices do not depend on scroll timing.
-Only 24 Canvas charts are instantiated per page, at most four chart requests
-are physically in flight, and offscreen histories leave component state. A
-separate browser LRU is independently capped at 12 responses, 40,000 occupied
-cells, and 4 MiB of estimated column payload. Navigation pages and run-resource
-summaries retain explicit head/tail windows with pinned selections, while full
-run, artifact, rich-value, and trace detail caches have smaller independent
-caps. Truncation is shown in the UI instead of silently presenting a retained
-window as a complete collection.
+Full-range and viewport refreshes reuse the same grouping.
+
+Browser work is bounded to:
+
+- 24 uPlot charts per page;
+- four in-flight chart requests; and
+- a 12-response, 40,000-cell, 4 MiB history cache.
+
+Navigation and resource caches have separate limits. The UI reports truncated
+windows instead of presenting them as complete collections.
 See [ADR 0013](adr/0013-multi-run-chart-comparison.md).
 
 ### Media, artifacts, and traces
@@ -189,18 +192,17 @@ HTTP namespace remains explicitly versioned under `/api/v1`.
 
 ### Import and export
 
-The optional W&B importer is a Python boundary adapter. It scans source runs
-lazily, adapts history windows to sparse step domains, admits a bounded number
-of run workers, and sends deterministic metric batches. One process exclusively
-owns the fsynced checkpoint, which advances only after acknowledgement, allowing
-an ambiguous accepted request to replay under the server's existing idempotency
-contract. Source run files are chunked into ordinary CAS-backed artifacts,
-logged artifacts preserve their canonical W&B `vN` in exact EpochDeck version
-slots, and logged artifacts and history media use fixed transfer windows. Each
-temporary file is uploaded and unlinked before the next is retained. Supported
-media references become deterministic native rich values backed by the same
-CAS. Cooperative cancellation stops queued work; a W&B SDK call already in
-progress is the only non-preemptible unit.
+The optional W&B importer is a Python boundary adapter. It scans lazily, adapts
+history windows to sparse steps, bounds run workers, and sends deterministic
+batches.
+
+One process owns the fsynced checkpoint. It advances after acknowledgement, so
+ambiguous accepted requests can replay idempotently.
+
+Run files and artifacts use the content-addressed store. Canonical W&B `vN`
+versions are preserved, transfers have fixed windows, and temporary files are
+released promptly. Cooperative cancellation stops queued work; only an active
+W&B SDK call is non-preemptible.
 
 Portable EpochDeck export traverses only public bounded APIs. It writes raw
 full-resolution history pages, metadata JSON Lines, lineage links, and verified
@@ -235,37 +237,34 @@ The Svelte dashboard initially loads the server's immutable branding contract
 alongside project, run, report, and metric metadata. Branding is validated and
 loaded once at server startup; its optional logo is served only through a
 same-origin bounded image endpoint.
+
 It requests values only for visible charts and selected metrics. Off-screen
 charts use browser content visibility and intersection observers; bounded
-columnar JSON responses render directly with Canvas.
+columnar JSON responses render with uPlot.
 
 Run data is separated into summary, configuration, metrics, media, traces, and
 artifact tabs. Config and summary documents render as locally searchable,
-expandable trees. Metric keys are searchable, and each chart keeps interaction
-state locally for pan/zoom/selection, manual linear or logarithmic domains,
-smoothing, hover inspection, and line or exact min/max band display. The server
-re-aggregates the settled step viewport after pan, wheel zoom, or region zoom.
-Exact Parquet step statistics prune disjoint row groups; uncertain statistics
-fall back to reading so the aggregate remains lossless. Smoothing applies only
-to the bucket-last center line. Media snapshots are grouped by type and key into
-step timelines.
+expandable trees. Media snapshots are grouped into step timelines.
+
+Charts support search, pan, zoom, region selection, axis settings, smoothing,
+hover inspection, and exact min/max bands. The server re-aggregates settled
+viewports. Exact Parquet statistics prune disjoint row groups; uncertain
+statistics fall back to reading.
+
 Artifact manifests render as a tabbed file browser; whole ZIP responses are
 produced with fixed buffers on a bounded download worker, and the worker permit
 is retained through terminal stream-error delivery.
 
-Live charts compare per-run metric revisions and request a fresh bounded
-aggregate when a revision changes. `document_revision` invalidates selected
-config and summary documents after a real document or finish mutation, and a
-separate unified `rich_data_revision` invalidates already-open media, alert,
-artifact, and trace resources after any real non-scalar mutation; idempotent
-retries do not increment either counter. The dashboard polls all selected
-running IDs through one bounded lightweight-summary query; it hydrates the
-primary run's complete config/summary document only when that document is
-visible. It does not append raw deltas to existing buckets because later
-sequence values can
-update an older step bucket. It can select multiple project runs and render
-every requested metric on the same server-defined lattice. It never requests
-complete histories for chart rendering. See
+Live charts refresh bounded aggregates when per-run revisions change.
+`document_revision` invalidates config and summary data. `rich_data_revision`
+invalidates media, alerts, artifacts, and traces. Idempotent retries do not
+increment either counter.
+
+The dashboard polls selected running IDs with one lightweight query and hydrates
+complete documents only when visible. Charts never request complete histories
+or append raw deltas to existing buckets.
+
+See
 [ADR 0012](adr/0012-exact-bucket-chart-history.md),
 [ADR 0013](adr/0013-multi-run-chart-comparison.md), and
 [ADR 0015](adr/0015-bounded-dashboard-discovery.md).
@@ -297,21 +296,18 @@ The SQLite catalog has one current disposable pre-alpha definition. It carries
 no internal generation marker or upgrade logic; a storage-definition change is
 deployed by archiving the complete old root set and starting with empty roots.
 
-After creating the directories, startup resolves symlinks and validates their
-canonical paths. It also creates, links, flushes, and removes a bounded probe in
-each immutable-file root before accepting requests. Metric and blob roots must
-be disjoint: neither may equal or
-contain the other. The data root may be a strict ancestor of either root (the
-default layout), but it may not equal or live inside the metric or blob root.
-This prevents staging, segment, CAS, lock, and catalog namespaces from mixing.
-The server resolves the three canonical roots, sorts and deduplicates their
-`epochdeck.lock` paths, and holds every advisory lock for its complete lifetime.
-Only after acquiring the whole set may it clear metric or blob staging. Thus a
-second instance with a different data root cannot mutate or clean a shared
-external metric/blob root. Physical backup and restore acquire the identical
-lock set and omit root lock files and staging trees from their payloads, so they
-cannot race catalog or immutable-file mutation. Portable project exports remain
-available through the HTTP API while the server is running.
+Startup resolves symlinks, validates canonical paths, and probes immutable-file
+publication before accepting requests.
+
+Storage paths follow these rules:
+
+- metric and blob roots are disjoint;
+- the data root may be their strict ancestor;
+- the data root cannot equal or live inside either immutable-file root; and
+- one process holds advisory locks for all configured roots.
+
+Backup and restore acquire the same lock set. Portable project exports remain
+available while the server is running.
 
 ## Performance budgets
 

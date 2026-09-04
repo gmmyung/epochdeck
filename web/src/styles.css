@@ -1140,39 +1140,6 @@ canvas {
   align-items: center;
 }
 
-.trace-search {
-  display: flex;
-  gap: 6px;
-}
-
-.trace-search input {
-  width: min(300px, 36vw);
-  min-height: 32px;
-  padding: 0 8px;
-  border: 1px solid var(--line);
-  background: var(--control-bg);
-  color: var(--text);
-  font-size: 11px;
-}
-
-.trace-search button {
-  min-height: 32px;
-  padding: 0 10px;
-  border: 1px solid var(--line-strong);
-  background: var(--panel-alt);
-  color: var(--text);
-  font-size: 10px;
-}
-
-.trace-search button:hover:not(:disabled) {
-  background: var(--button-hover);
-}
-
-.trace-search button:disabled {
-  color: var(--faint);
-  cursor: default;
-}
-
 .trace-list {
   display: grid;
   gap: 8px;
@@ -1571,7 +1538,7 @@ dd {
 .metrics-toolbar {
   display: grid;
   grid-template-columns: minmax(140px, 1fr) minmax(220px, 420px) auto;
-  align-items: end;
+  align-items: center;
 }
 
 .comparison-controls {
@@ -1974,12 +1941,27 @@ dd {
 
 .trace-search {
   min-width: min(420px, 45vw);
-  align-items: flex-end;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  border-bottom: 1px solid var(--line-strong);
 }
 
 .trace-search .search-control {
   min-width: 240px;
   flex: 1;
+  border-bottom: 0;
+}
+
+.trace-search .icon-button {
+  width: 34px;
+  height: 34px;
+  flex: none;
+  border-color: transparent;
+}
+
+.trace-search .icon-button:hover {
+  border-color: transparent;
 }
 
 .trace-title .icon-button {

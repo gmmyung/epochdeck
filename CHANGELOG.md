@@ -78,10 +78,11 @@ so storage and APIs may change without migration or compatibility shims.
 ### Added
 
 - Rust server with SQLite catalog, Arrow/Parquet histories, and split CAS storage.
-- W&B-oriented Python SDK with durable online and offline delivery.
+- Python SDK with durable online and offline delivery.
 - Native rich media, artifacts, traces, sweeps, reports, alerts, and host telemetry.
-- Lazy multi-run dashboard with bounded Canvas charts and searchable resources.
-- Tailnet-only deployment, diagnostics, physical backup/restore, and project export.
+- Lazy multi-run dashboard with bounded uPlot charts and searchable resources.
+- Standard reverse-proxy deployment, diagnostics, physical backup/restore, and
+  project export.
 - Bounded W&B importer for metrics, metadata, media, run files, and logged artifacts.
 
 ### Changed

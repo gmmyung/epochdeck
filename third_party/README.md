@@ -18,7 +18,7 @@ Native server releases also link code that is not represented by Cargo metadata.
 by the ordinary Cargo release workflow. Its components explain which runtime
 bytes may be linked and map each component to immutable, hash-checked license
 documents under `toolchain-runtime/`. The generator checks the manifest against
-the exact workflow version, native runners, and five release targets, and fails
+the exact workflow version, native runners, and release targets, and fails
 on missing pins, components, metadata, text, or a changed document hash.
 
 The dashboard inventory includes locked production packages plus an explicit

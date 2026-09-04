@@ -1,69 +1,33 @@
 # Roadmap
 
-The feature checklist and compatibility definitions live in
-[`compatibility.md`](compatibility.md). Milestones describe implementation order,
-not a reduction in the final parity goal. A checked item means its first supported
-contract exists; it does not waive the correctness, performance, accessibility,
-or operational acceptance criteria for that contract.
+The [compatibility matrix](compatibility.md) records what works today. This page
+lists remaining priorities; it does not duplicate completed feature history.
 
-## Milestone 0: foundation
+## Release foundation
 
-- [x] Reproducible Nix development shell.
-- [x] Rust health API and SQLite catalog.
-- [x] Python health client and CLI.
-- [x] Standalone Svelte dashboard shell.
-- [x] Dependency guard against prohibited hosting integrations.
-- [x] CI for Rust, Python, and web validation.
+- Publish and smoke-test the first public prerelease.
+- Make installation and upgrades predictable on every supported platform.
+- Add representative concurrent-ingestion and dashboard performance gates.
 
-## Milestone 1: run lifecycle and bounded metrics
+## Security and collaboration
 
-- [x] W&B-style `init`, `log`, and `finish` lifecycle for scalar runs.
-- [x] Online, offline, disabled, and explicit resume modes.
-- [x] Idempotent batch-ingest protocol and durable Python spool.
-- [x] Arrow conversion and immutable wide Parquet segments.
-- [x] Initial config, summary, nested scalar metrics, and explicit steps.
-- [x] Metric-key discovery and bounded columnar history APIs.
-- [x] Server-side, spike-preserving min/max downsampling.
-- [x] Workload-shaped storage benchmark harness.
-- [x] Config mutation and non-numeric summary semantics.
-- [x] Background compaction.
-- [x] Full W&B lifecycle contract suite for the supported scalar surface.
+- Add native authentication and scoped API credentials.
+- Add multi-user authorization and project ownership.
+- Define safe public-network and multi-tenant deployment profiles.
 
-## Milestone 2: dashboard and monitoring
+## Compatibility depth
 
-- [x] Project and run navigation.
-- [x] Lazy, paged Canvas metric charts with bounded client history state.
-- [x] Server-side min/max downsampling.
-- [x] Per-run revision caches and bounded aggregate refreshes.
-- [x] System metrics and alerts.
-- [x] Full-width tabbed run workspace and expandable config/summary trees.
-- [x] Searchable charts with hover inspection, pan, zoom, region selection,
-      viewport re-sampling, configurable axes, smoothing, and exact line/band
-      display.
-- [x] Multi-run overlays with shared step, relative-step, and elapsed-time axes.
+- Expand project, run, filter, and file APIs.
+- Complete table mutation and media-sequence semantics.
+- Add groups, jobs, tags, notes, and ownership metadata.
+- Expand sweeps beyond finite value sets and median stopping.
+- Broaden W&B import coverage without weakening bounded-memory behavior.
 
-## Milestone 3: rich data and artifacts
+## Stable release gates
 
-- [x] Images, audio, video, tables, and histograms.
-- [x] Content-addressed blobs and range delivery.
-- [x] Artifact versions, aliases, downloads, and lineage.
-- [x] Structured traces, messages, payloads, and full-text search.
-- [x] Key-grouped media timelines with step navigation and native playback.
-- [x] Artifact tab/file browser and bounded whole-artifact ZIP streaming.
+- Define the public compatibility and deprecation policy.
+- Introduce stored-data migrations only when stable retention requires them.
+- Establish long-running upgrade, rollback, and recovery test suites.
 
-## Milestone 4: APIs and automation
-
-- [x] Public query API and filtering.
-- [x] Sweeps, agents, scheduling, and early termination.
-- [x] Persisted reports and dashboard layouts.
-- [x] Resumable W&B importer and lossless EpochDeck export.
-
-## Milestone 5: production operations
-
-- [x] Single-binary build with embedded dashboard.
-- [x] Native Linux x86_64/ARM64, Apple Silicon macOS, and Windows x86_64
-      release builds and smoke tests.
-- [x] Loopback deployment behind an authenticated HTTPS reverse proxy and
-      systemd documentation.
-- [x] Coordinated catalog, segments, and blob backup/restore.
-- [x] Slow-query diagnostics, bounded telemetry, and disposable pre-alpha storage operations.
+Prior decisions live in the [ADRs](adr/), and shipped changes live in the
+[changelog](../CHANGELOG.md).

@@ -9,11 +9,10 @@
   <a href="https://github.com/gmmyung/epochdeck/releases"><img src="https://img.shields.io/github/v/release/gmmyung/epochdeck?include_prereleases&amp;sort=semver&amp;label=release" alt="Latest release"></a>
 </p>
 
-EpochDeck is a standalone, self-hosted experiment tracker for long-running,
-high-dimensional workloads. Its Python SDK provides a W&B-compatible API, while
-its Rust server owns ingestion, storage, querying, and the Svelte dashboard.
-Trackio feature parity is the immediate milestone; practical W&B compatibility
-is the longer-term contract.
+EpochDeck is a high-performance, self-hosted experiment tracker for logging,
+comparing, and exploring training runs, metrics, traces, videos, and artifacts.
+It stays fast and responsive even with long runs and very large metric
+histories.
 
 > [!WARNING]
 > EpochDeck is pre-alpha. Scalar metrics, host telemetry, alerts, rich media,
@@ -23,90 +22,18 @@ is the longer-term contract.
 > For remote access, place the server behind an authenticated HTTPS reverse
 > proxy and review [SECURITY.md](SECURITY.md).
 
-## Design
+## Quick start
 
-- Dashboard sampling is bounded and never deletes raw metric history.
-- Ingestion, queries, caches, queues, and responses have explicit limits and
-  backpressure.
-- Numeric histories use Arrow/Parquet; SQLite holds catalog and transactional
-  metadata; rich data uses content-addressed storage.
-- Metrics, metadata, and blobs have independently configurable storage roots.
-- Compatibility is tested at the public Python and HTTP boundaries.
-- EpochDeck has no Hugging Face, Hub, Spaces, Buckets, Datasets, or Gradio
-  runtime dependency.
-
-```text
-Python SDK and importers
-  durable local spool -> batched HTTP REST (/api/v1)
-                              |
-                              v
-                         Rust server
-                    |-- SQLite catalog
-                    |-- Arrow/Parquet metrics
-                    `-- content-addressed rich data
-                              |
-Browser dashboard <- bounded query endpoints
-```
-
-The Python SDK talks to `/api/v1` over HTTP REST. Logging first writes to a
-durable local spool; a bounded background worker batches uploads, retries them
-idempotently, and advances acknowledgements only after the server commits a
-batch. Training therefore does not wait for each network request, and a restart
-can replay unacknowledged work.
-
-## Documentation
-
-- [System architecture](docs/architecture.md)
-- [Compatibility matrix](docs/compatibility.md)
-- [HTTP API](docs/api.md)
-- [Deployment](docs/deployment.md) and [operations](docs/operations.md)
-- [Performance benchmarks](docs/benchmarks.md)
-- [Export format](docs/export-format.md)
-- [Roadmap](docs/roadmap.md)
-
-## Install a prerelease
-
-GitHub prereleases include native server archives for Linux x86_64/ARM64,
-Apple Silicon macOS, and Windows x86_64, plus a Python wheel, source
-distribution, and `SHA256SUMS`. Linux archives are static musl builds; every
-server is built and smoke-tested with ordinary Cargo on its target platform.
-
-For Linux, download the matching `.tar.gz` archive and verify it with the files
-from the same release:
+Download the server archive and Python wheel from the
+[latest release](https://github.com/gmmyung/epochdeck/releases). Install the
+wheel in your training project and start the server:
 
 ```bash
-sha256sum --ignore-missing --check --strict SHA256SUMS
-tar -xzf epochdeck-server-<version>-<target>.tar.gz
-sudo install -m 0755 \
-  epochdeck-server-<version>-<target>/epochdeck-server \
-  /usr/local/bin/epochdeck-server
-```
-
-The checksum command verifies every release asset present in the current
-directory and fails if it finds none. Keep only assets from the same release in
-that directory; files for architectures you did not download are intentionally
-ignored.
-
-macOS and Windows server archives are ZIP files. The
-[deployment guide](docs/deployment.md) lists the exact target names, checksum
-commands, and extraction steps for each platform.
-
-Install the wheel with `uv add` in each training project that imports the SDK.
-Use `uv tool install ./epochdeck-*.whl` only for an isolated administration CLI.
-Prereleases are not published to PyPI, crates.io, or npm.
-
-Start the server locally:
-
-```bash
+uv add ./epochdeck-*.whl
 epochdeck-server
 ```
 
-It listens on `127.0.0.1:8787` by default. Before making it remotely reachable,
-put it behind an authenticated HTTPS reverse proxy. Pre-alpha stored data may
-be incompatible between builds, so start incompatible builds with fresh data
-directories. See the [deployment guide](docs/deployment.md) for configuration.
-
-## Log a run
+Log a run with the conventional `ed` alias:
 
 ```python
 import epochdeck as ed
@@ -130,49 +57,30 @@ run.log({"rollout": ed.Video("rollout.mp4", caption="latest policy")})
 run.finish(summary={"result": "complete"})
 ```
 
-The SDK also supports `Image`, `Audio`, `Table`, and `Histogram` values,
-versioned artifacts and lineage, structured traces, alerts, lazy history
-queries, reports, sweeps, and W&B imports. See the
-[compatibility matrix](docs/compatibility.md) for the current contract.
+Open [http://127.0.0.1:8787](http://127.0.0.1:8787) to compare runs and inspect
+metrics, media, artifacts, traces, configuration, and summaries.
 
-For disconnected work, initialize with `mode="offline"`, then upload the
-durable spool later:
+## Features
 
-```bash
-epochdeck sync <platform-data-directory>/epochdeck/spool/<run-id>
-```
+- Durable, nonblocking online and offline logging.
+- Scalar and system metrics with bounded, spike-preserving chart queries.
+- Native images, audio, video, tables, histograms, traces, and alerts.
+- Versioned artifacts, lineage, reports, sweeps, and multi-run comparison.
+- Resumable W&B imports and lossless EpochDeck project exports.
+- One self-contained server binary with no hosted service dependency.
 
-The platform data directory is selected using the operating system convention
-(`~/.local/share` on Linux by default and `~/Library/Application Support` on
-macOS). Set `EPOCHDECK_SPOOL_DIR` to use an explicit spool location.
+See the [compatibility matrix](docs/compatibility.md) for the exact pre-alpha
+feature surface.
 
-## Development
+## Documentation
 
-```bash
-nix develop
-just bootstrap
-just check
-just dev
-```
+- [Python SDK](python/README.md)
+- [Self-hosting](docs/deployment.md)
+- [Backup, upgrades, and diagnostics](docs/operations.md)
+- [Documentation index](docs/index.md)
+- [Contributing](CONTRIBUTING.md)
 
-Run `just bootstrap` after cloning or changing a lockfile. `just dev` starts the
-API on `127.0.0.1:8787` and the Vite dashboard with `/api` proxied to it; Ctrl-C
-stops both. Run `just single-binary` to build the server with the dashboard
-embedded. Release archives contain that single executable.
-
-## Repository layout
-
-```text
-crates/
-  epochdeck-catalog/   catalog and transactional metadata
-  epochdeck-protocol/  shared API types
-  epochdeck-server/    HTTP server and process lifecycle
-  epochdeck-storage/   columnar metric and rich-data storage
-python/                W&B-compatible Python SDK and CLI
-web/                   Svelte dashboard
-docs/                  architecture, compatibility, and operations
-```
-
-Trackio and W&B are compatibility references, not runtime dependencies.
+EpochDeck has no Hugging Face, Hub, Spaces, Buckets, Datasets, or Gradio runtime
+dependency. Trackio and W&B are compatibility references only.
 
 EpochDeck is licensed under [Apache-2.0](LICENSE).

@@ -273,9 +273,9 @@
         onsearchruns();
       }}
     >
-      <label class="nav-search">
-        <span>Runs</span>
-        <span class="search-control">
+      <span class="nav-label">Runs</span>
+      <div class="run-search-control">
+        <label class="search-control">
           <Icon name="search" size={14} />
           <input
             type="search"
@@ -284,11 +284,11 @@
             maxlength="256"
             bind:value={runSearch}
           />
-        </span>
-      </label>
-      <button class="icon-button" type="submit" disabled={loadingRuns} aria-label="Search runs">
-        <Icon name="search" size={14} />
-      </button>
+        </label>
+        <button class="icon-button" type="submit" disabled={loadingRuns} aria-label="Search runs">
+          <Icon name="search" size={14} />
+        </button>
+      </div>
     </form>
     {#if runError}<p class="nav-error" role="alert">{runError}</p>{/if}
   {/if}
@@ -542,8 +542,7 @@
     margin: 0;
   }
 
-  .compact-search,
-  .run-search-form {
+  .compact-search {
     display: flex;
     align-items: center;
   }
@@ -565,14 +564,29 @@
   }
 
   .run-search-form {
-    gap: 5px;
-    align-items: end;
+    display: grid;
+    gap: 6px;
     margin-top: 18px;
   }
 
-  .run-search-form .nav-search {
+  .run-search-control {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    border-bottom: 1px solid var(--line-strong);
+  }
+
+  .run-search-control .search-control {
     min-width: 0;
     flex: 1;
+    margin: 0;
+    border-bottom: 0;
+  }
+
+  .run-search-control .icon-button {
+    width: 34px;
+    height: 34px;
+    flex: none;
   }
 
   .nav-load-more {

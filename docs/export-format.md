@@ -36,17 +36,19 @@ point without dashboard sampling.
 The exporter hydrates these from their lightweight list summaries without
 holding the project-wide collections in memory.
 
-The top-level manifest is written last and records the current EpochDeck export
-format, project, creation time, and resource counts. Export takes place in a
-sibling temporary directory. Every blob is size-checked and SHA-256 verified
-before the directory is atomically renamed to the requested destination. An
-existing destination is never merged or overwritten. All bundle files are
-flushed before rename. Unix also fsyncs every directory and the destination
-parent; CPython has no equivalent directory-fsync primitive on Windows, where
-the exporter instead validates every traversed directory and cannot make the
-same power-loss guarantee for directory entries. Export directories are mode
-`0700` and files are mode `0600` on POSIX filesystems; grant broader filesystem
-access explicitly when a bundle is meant to be shared.
+The top-level manifest is written last. It records the format, project, creation
+time, and resource counts.
+
+Publication follows these rules:
+
+- build in a sibling temporary directory;
+- size-check and SHA-256 verify every blob;
+- flush files before atomic rename;
+- never merge into or overwrite an existing destination; and
+- create POSIX directories as `0700` and files as `0600`.
+
+Unix also fsyncs directories and the destination parent. Windows validates each
+directory but cannot provide the same directory-entry power-loss guarantee.
 
 Only referenced CAS content belongs to the portable project: rich values, trace
 payloads, and artifact entries. Orphaned upload objects have no project

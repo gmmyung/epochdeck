@@ -1,23 +1,12 @@
 # Releasing EpochDeck
 
 EpochDeck releases are explicit GitHub prereleases. The workflow attaches
-native server archives for Linux, macOS, and Windows, a Python wheel and source
-distribution, and `SHA256SUMS`. It does not publish to PyPI, crates.io, or npm.
+native server archives, a Python wheel, a source distribution, and
+`SHA256SUMS`. It does not publish to PyPI, crates.io, or npm.
 
-The four server builds use ordinary Cargo on matching GitHub-hosted runners:
-
-- `x86_64-unknown-linux-musl` on `ubuntu-24.04`
-- `aarch64-unknown-linux-musl` on `ubuntu-24.04-arm`
-- `aarch64-apple-darwin` on `macos-15`
-- `x86_64-pc-windows-msvc` on `windows-2022`
-
-Linux archives are static `.tar.gz` files. macOS and Windows archives are
-`.zip` files; only Linux archives contain the systemd unit and environment-file
-template. macOS binaries target macOS 13 or newer, and Windows binaries link
-the MSVC C runtime statically. Every native job runs the storage and server
-tests on its release target, inspects the resulting binary, then extracts and
-exercises the finished archive. The dashboard bundle tested by the
-source-verification job is reused by every server build.
+The authoritative build matrix lives in
+[`prerelease.yml`](../.github/workflows/prerelease.yml). Each native job tests its
+target, inspects the binary, and smoke-tests the finished archive.
 
 ## Third-party notices
 
@@ -73,10 +62,10 @@ includes the checked `THIRD_PARTY_NOTICES.txt` beside the binary.
 12. Create and push a GitHub-verifiable signed annotated tag without moving any
     existing tag:
 
-   ```bash
-   git tag -s v0.1.0-alpha.1 -m "EpochDeck 0.1.0-alpha.1"
-   git push origin v0.1.0-alpha.1
-   ```
+```bash
+git tag -s v0.1.0-alpha.1 -m "EpochDeck 0.1.0-alpha.1"
+git push origin v0.1.0-alpha.1
+```
 
 13. Wait for the tag-triggered GitHub prerelease workflow to finish.
 14. Download every asset into one directory and verify it there:

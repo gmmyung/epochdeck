@@ -1,43 +1,18 @@
-# Production operations
+# Operations
 
-## Network boundary
+This page covers backup, restore, upgrades, and diagnostics. Installation and
+network exposure live in [self-hosting](deployment.md) and the
+[security policy](../SECURITY.md).
 
-EpochDeck has no native application authentication or multi-user authorization.
-Bind its HTTP listener to loopback and make an authenticated HTTPS reverse proxy
-the only externally reachable service. The proxy must terminate TLS and enforce
-access control before forwarding to EpochDeck. Never expose the EpochDeck HTTP
-port directly on a public or private network interface.
+## Backup
 
-## Physical backup and restore
+A physical backup must include all three roots together:
 
-Portable project export is useful for migration. Disaster recovery needs the
-complete server state: the SQLite catalog, every immutable Parquet segment, and
-the full blob CAS including content not currently reachable from one project.
-Client delivery journals live on each training machine and are backed up
-separately from the server roots.
+- SQLite catalog and metadata;
+- immutable metric segments; and
+- content-addressed blobs.
 
-The server holds an advisory `epochdeck.lock` in each distinct canonical data,
-metric, and blob root for its entire lifetime. It sorts and deduplicates the
-canonical lock paths before taking all locks, so two instances cannot share an
-external metric or blob root even when their data roots differ. Physical backup
-and restore take the same complete lock set and refuse to run while any root is
-active. Root-level lock files and incomplete metric/blob staging files are
-coordination state and are excluded from backup payloads. A backup uses SQLite's
-backup API, streams files through 1 MiB buffers, records a SHA-256 inventory,
-flushes every generated file, and publishes its directory atomically. On Unix,
-every generated directory is fsynced bottom-up and the destination parent is
-fsynced after the rename, so a successful return includes the complete tree in
-the durability boundary. CPython exposes no equivalent directory fsync on
-Windows; there EpochDeck validates every traversed directory and flushes file
-contents, but cannot promise identical power-loss durability for directory
-entries. New bundle roots are mode `0700` and their files are mode `0600` on
-POSIX filesystems, independent of the invoking shell's umask.
-
-Metric and blob roots must support same-filesystem hard links. The server probes
-that exact publication primitive during startup and refuses an unsupported
-filesystem instead of falling back to a non-atomic copy or replacement. The
-staging and final directories are always inside the same configured root, so no
-hard link is required between independently configured roots.
+Stop the server before using the administration command:
 
 ```bash
 sudo systemctl stop epochdeck
@@ -49,12 +24,15 @@ sudo -u epochdeck env \
 sudo systemctl start epochdeck
 ```
 
-For large blob roots, keep downtime short with filesystem snapshots. Stop
-EpochDeck, snapshot every filesystem volume that contains a configured root,
-then start EpochDeck immediately. Replicate or run `epochdeck backup` against
-read-only mounts of those snapshots while the live service continues. The
-stop/snapshot/start window coordinates one consistent point across all
-configured roots.
+The command refuses active roots, verifies content, and publishes a complete
+backup atomically. Client delivery spools live on training machines and require
+separate backups.
+
+For large installations, stop the server briefly and snapshot every filesystem
+containing a root at one coordinated point. Replicate the snapshots after the
+server restarts.
+
+## Restore
 
 Restore only into empty roots:
 
@@ -68,81 +46,56 @@ sudo -u epochdeck env \
 sudo systemctl start epochdeck
 ```
 
-Restore streams each regular bundle file once into exclusive staging while
-verifying every inventory digest, then runs `PRAGMA integrity_check`. Metric and
-blob staging files are flushed before their top-level entries are installed.
-Unix additionally fsyncs the staging trees and destination roots bottom-up, then
-publishes the catalog and fsyncs its parent last, so a failed restore cannot
-expose manifests before their durable files. Windows retains the file-flush and
-publication ordering with the directory-fsync limitation above. Restore rejects
-symbolic-link sources, duplicate inventory destinations, any bundle/storage-root overlap in
-either ancestor direction, an existing catalog, and non-empty metric/blob
-roots other than their acquired `epochdeck.lock` files. Metric and blob roots must
-be disjoint; the data root may contain them but cannot equal or sit inside
-either.
-Practice restore to separate paths and query representative long runs before
-depending on a backup schedule.
+Restore verifies the inventory, file digests, and SQLite integrity before
+publication. Practice restoring to separate paths and inspect representative
+runs before relying on a backup schedule.
 
-## Pre-alpha upgrade and rollback
+## Upgrade and rollback
 
-Treat the executable and its three storage roots as one versioned unit. Before
-an upgrade, stop the service, snapshot or archive the catalog, metric, and blob
-roots together, and record the exact running binary checksum. Install the new
-server and matching Python wheel, point the service at empty replacement roots,
-then start it and run:
+Pre-alpha builds do not migrate stored data. Treat the binary and its three
+storage roots as one versioned unit.
+
+Before upgrading:
+
+1. Stop the service.
+2. Back up or snapshot all roots together.
+3. Record the running binary checksum.
+4. Install the matching new server and Python wheel.
+5. Start the new build with empty roots.
+
+Verify the replacement:
 
 ```bash
 epochdeck doctor --server-url http://127.0.0.1:8787
 curl --fail http://127.0.0.1:8787/api/v1/health
 ```
 
-Log a sample run, inspect metrics and native media in the dashboard, and verify
-a backup/restore exercise before importing production-scale data. To roll back,
-stop the new process and restore the previous binary with its untouched matching
-roots. Never open newer roots with an older binary or mix roots from different
-deployments.
+Log a sample run and inspect metrics and media. To roll back, stop the new build
+and restore the previous binary with its untouched roots.
 
-Dashboard branding is deployment configuration, not EpochDeck storage. Physical
-backups do not include `/etc/epochdeck/epochdeck.env` or a file named by
-`EPOCHDECK_DASHBOARD_LOGO_PATH`; back up and restore those files with the rest of
-the host configuration. The server loads and validates branding once at
-startup, so replacing a logo or changing the accent color requires a restart.
+Dashboard branding is host configuration and is not included in physical
+backups. Back up the environment file and custom logo separately.
 
 ## Diagnostics
 
-`GET /api/v1/diagnostics` and `epochdeck doctor` report a bounded operational
-snapshot:
+Run:
 
-- process uptime;
-- total, active, admission-rejected, slow, and 5xx request counts;
-- history query count plus total and maximum observed duration;
-- the 64-request API admission limit, two-request health limit, rejection count,
-  and currently available permits;
-- available ingest, blob-upload, artifact-I/O, 16-stream raw-download, and query
-  worker permits;
-- catalog, metric, and blob filesystem capacity and device identity; and
-- the most recent 64 slow request paths, statuses, and durations.
+```bash
+epochdeck doctor --server-url http://127.0.0.1:8787
+journalctl -u epochdeck --since today
+```
 
-Counters are in-memory and reset with the process. They diagnose contention and
-slow endpoints without creating another persistent telemetry database.
-`tower-http` emits one structured tracing event when each admitted request
-finishes; service deployments retain those events through journald.
+`epochdeck doctor` reports a bounded snapshot of:
 
-Except for embedded static dashboard assets, a request must acquire a
-non-queuing admission permit before body parsing. General API traffic has 64
-permits and health checks have a separate two permits. A full pool returns HTTP
-503 with `server_busy` and `Retry-After: 1` immediately. The permit remains with
-the response body through EOF or disconnect, so at most 64 general API requests
-can retain parsed bodies, wait on mutation/worker permits, or leave responses
-outstanding. Raw blob and artifact-file responses additionally use a
-16-permit stream pool so slow media clients cannot occupy all general slots.
+- uptime and request counts;
+- rejected, slow, and failed requests;
+- history-query timings;
+- worker and stream capacity;
+- storage capacity and device identity; and
+- the 64 most recent slow requests.
 
-## Disposable pre-alpha storage
+Set `EPOCHDECK_SLOW_REQUEST_MS` to a value from 1 to 60,000 milliseconds to
+change the slow-request threshold. Counters reset when the server restarts.
 
-EpochDeck has one current internal storage definition and no catalog-generation
-marker or automatic upgrade path. When that definition changes, stop the
-service, archive all three configured roots together, and start the new build
-with empty roots. Physical backups preserve bytes and integrity but carry no
-internal catalog or build compatibility marker; they are not storage-upgrade
-vehicles. Keep the archived roots and exact creating build until the replacement
-instance and any required project imports are verified.
+The server emits structured request logs through `tower-http`. systemd services
+retain them in journald.
