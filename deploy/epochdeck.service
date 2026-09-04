@@ -1,9 +1,7 @@
 [Unit]
 Description=EpochDeck experiment tracking server
-After=network-online.target tailscaled.service
-Wants=network-online.target tailscaled.service
-RequiresMountsFor=/srv/epochdeck
-ConditionPathIsMountPoint=/srv/epochdeck
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -31,7 +29,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-ReadWritePaths=/var/lib/epochdeck /srv/epochdeck/blobs
+ReadWritePaths=/var/lib/epochdeck
 LimitNOFILE=1048576
 
 [Install]

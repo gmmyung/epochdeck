@@ -86,16 +86,37 @@ jobs:
   server:
     name: Server ${{ matrix.target }}
     needs: verify
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            binary: epochdeck-server
+            python: python3
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            binary: epochdeck-server
+            python: python3
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: epochdeck-server
+            python: python3
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: epochdeck-server
+            python: python3
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: epochdeck-server.exe
+            python: python
     steps:
       - name: Check out release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -112,54 +133,74 @@ jobs:
           toolchain: 1.85.0
           targets: ${{ matrix.target }}
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.15.1
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
-        with:
-          tool: cargo-zigbuild@0.23.3
-
-      - name: Install binary inspection and emulation tools
+      - name: Install the native musl linker and ELF inspection tools
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends binutils file qemu-user-static
+          sudo apt-get install --yes --no-install-recommends binutils musl-tools
 
-      - name: Build static server
+      - name: Configure native target toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          case "$TARGET" in
+            x86_64-unknown-linux-musl)
+              echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >>"$GITHUB_ENV"
+              echo 'CC_x86_64_unknown_linux_musl=musl-gcc' >>"$GITHUB_ENV"
+              echo 'AR_x86_64_unknown_linux_musl=ar' >>"$GITHUB_ENV"
+              echo 'RUSTFLAGS=-C link-self-contained=yes' >>"$GITHUB_ENV"
+              ;;
+            aarch64-unknown-linux-musl)
+              echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >>"$GITHUB_ENV"
+              echo 'CC_aarch64_unknown_linux_musl=musl-gcc' >>"$GITHUB_ENV"
+              echo 'AR_aarch64_unknown_linux_musl=ar' >>"$GITHUB_ENV"
+              echo 'RUSTFLAGS=-C link-self-contained=yes' >>"$GITHUB_ENV"
+              ;;
+            *-apple-darwin)
+              echo 'MACOSX_DEPLOYMENT_TARGET=13.0' >>"$GITHUB_ENV"
+              ;;
+            x86_64-pc-windows-msvc)
+              echo 'RUSTFLAGS=-C target-feature=+crt-static' >>"$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Run native storage and server tests
+        env:
+          TARGET: ${{ matrix.target }}
+        run: >-
+          cargo +1.85.0 test --locked --target "$TARGET"
+          --package epochdeck-storage --package epochdeck-server
+
+      - name: Build release server
         env:
           TARGET: ${{ matrix.target }}
           CARGO_PROFILE_RELEASE_STRIP: symbols
         run: |
           export SOURCE_DATE_EPOCH
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct)"
-          cargo +1.85.0 zigbuild \
+          cargo +1.85.0 build \
             --release \
             --locked \
             --target "$TARGET" \
             --package epochdeck-server \
             --features embedded-dashboard
 
-      - name: Verify architecture and static linkage
+      - name: Verify native binary architecture
         env:
           TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
         run: |
-          binary="target/$TARGET/release/epochdeck-server"
-          test -x "$binary"
-          launcher=()
-          if [[ "$TARGET" == aarch64-* ]]; then
-            launcher=(qemu-aarch64-static)
-          fi
-          "${launcher[@]}" "$binary" --version | grep --fixed-strings --line-regexp \
-            "epochdeck-server $VERSION"
-          "${launcher[@]}" "$binary" --help | grep --fixed-strings --quiet \
-            'Usage: epochdeck-server [OPTIONS]'
-          if "${launcher[@]}" "$binary" --unknown; then
-            echo "Release binary accepted an unknown command-line argument" >&2
-            exit 1
-          fi
-          file "$binary"
+          "${{ matrix.python }}" scripts/inspect-release-binary.py \
+            --binary "target/$TARGET/release/$BINARY" \
+            --target "$TARGET"
+
+      - name: Verify static Linux linkage
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          binary="target/$TARGET/release/$BINARY"
           if readelf --program-headers "$binary" |
             grep --quiet "Requesting program interpreter"; then
             echo "Release binary has a dynamic interpreter" >&2
@@ -170,141 +211,93 @@ jobs:
             echo "Release binary has dynamic dependencies" >&2
             exit 1
           fi
-          case "$TARGET" in
-            x86_64-*) file "$binary" | grep --quiet "x86-64" ;;
-            aarch64-*) file "$binary" | grep --quiet "ARM aarch64" ;;
-          esac
 
-      - name: Smoke-test API, branding, and embedded dashboard
+      - name: Audit macOS dynamic linkage
+        if: runner.os == 'macOS'
         env:
           TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
         run: |
-          binary="$PWD/target/$TARGET/release/epochdeck-server"
-          runtime="$(mktemp -d)"
-          printf '%s' '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><path d="M0 0h1v1z"/></svg>' >"$runtime/logo.svg"
-          export EPOCHDECK_BIND=127.0.0.1:18787
-          export EPOCHDECK_DATA_DIR="$runtime/data"
-          export EPOCHDECK_METRICS_DIR="$runtime/metrics"
-          export EPOCHDECK_BLOBS_DIR="$runtime/blobs"
-          export EPOCHDECK_DASHBOARD_ACCENT_COLOR="#8a3ffc"
-          export EPOCHDECK_DASHBOARD_LOGO_PATH="$runtime/logo.svg"
-          launcher=()
-          if [[ "$TARGET" == aarch64-* ]]; then
-            launcher=(qemu-aarch64-static)
-          fi
-          "${launcher[@]}" "$binary" >"$runtime/server.log" 2>&1 &
-          pid=$!
-          trap 'kill "$pid" 2>/dev/null || true; cat "$runtime/server.log"' EXIT
-          curl --fail --retry 30 --retry-all-errors --retry-delay 1 \
-            http://127.0.0.1:18787/api/v1/health |
-            jq --exit-status --arg version "$VERSION" \
-              '.status == "healthy" and .version == $version'
-          curl --fail http://127.0.0.1:18787/ | grep --quiet '<title>EpochDeck</title>'
-          curl --fail http://127.0.0.1:18787/api/v1/dashboard/config |
-            jq --exit-status \
-              '.accent_color == "#8a3ffc" and .logo_url == "/api/v1/dashboard/logo"'
-          curl --fail http://127.0.0.1:18787/api/v1/dashboard/logo >"$runtime/served-logo.svg"
-          cmp "$runtime/logo.svg" "$runtime/served-logo.svg"
-          kill -TERM "$pid"
-          set +e
-          wait "$pid"
-          status=$?
-          set -e
-          [[ "$status" -eq 0 || "$status" -eq 143 ]]
-          trap - EXIT
-          cat "$runtime/server.log"
+          binary="target/$TARGET/release/$BINARY"
+          otool -L "$binary" | tee linked-libraries.txt
+          library_count=0
+          while IFS= read -r library; do
+            library_count=$((library_count + 1))
+            case "$library" in
+              /usr/lib/* | /System/Library/Frameworks/*) ;;
+              *)
+                echo "Release binary links a non-system library: $library" >&2
+                exit 1
+                ;;
+            esac
+          done < <(tail -n +2 linked-libraries.txt | awk '{print $1}')
+          [[ "$library_count" -gt 0 ]]
+          minimum_versions=$(otool -l "$binary" | awk '$1 == "minos" {print $2}')
+          [[ "$minimum_versions" == "13.0" ]] || {
+            echo "Release binary has unexpected macOS minimum version: $minimum_versions" >&2
+            exit 1
+          }
 
-      - name: Create deterministic server archive
+      - name: Inspect Windows runtime imports
+        if: runner.os == 'Windows'
+        shell: pwsh
         env:
           TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
         run: |
-          archive="epochdeck-server-${VERSION}-${TARGET}"
-          root="package/$archive"
-          install -Dm0755 "target/$TARGET/release/epochdeck-server" "$root/epochdeck-server"
-          install -Dm0644 LICENSE "$root/LICENSE"
-          install -Dm0644 THIRD_PARTY_NOTICES.txt "$root/THIRD_PARTY_NOTICES.txt"
-          install -Dm0644 README.md "$root/README.md"
-          install -Dm0644 SECURITY.md "$root/SECURITY.md"
-          install -Dm0644 deploy/epochdeck.service "$root/deploy/epochdeck.service"
-          install -Dm0644 deploy/epochdeck.env.example "$root/deploy/epochdeck.env.example"
-          while IFS= read -r document; do
-            install -Dm0644 "$document" "$root/$document"
-          done < <(find docs -type f -name '*.md' -print | LC_ALL=C sort)
-          mkdir -p release-out
+          $binary = "target/$env:TARGET/release/$env:BINARY"
+          $inspection = & llvm-readobj.exe --file-headers --coff-imports $binary
+          if ($LASTEXITCODE -ne 0) {
+            throw "llvm-readobj failed with exit code $LASTEXITCODE"
+          }
+          $inspection | Set-Content -Encoding utf8 windows-imports.txt
+          $imports = @(
+            $inspection |
+              Select-String '^\s*Name:\s*(.+\.dll)\s*$' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value }
+          )
+          if ($imports.Count -eq 0) {
+            throw "release binary has no inspectable Windows imports"
+          }
+          foreach ($library in $imports) {
+            if ([IO.Path]::GetFileName($library) -ne $library) {
+              throw "release binary imports a DLL by path: $library"
+            }
+            if ($library -match '^(?i:vcruntime.*|msvcp.*|ucrtbase|api-ms-win-crt-.*)\.dll$') {
+              throw "release binary dynamically imports the MSVC runtime: $library"
+            }
+          }
+          $imports | Sort-Object -Unique
+
+      - name: Create and verify server archive
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+        run: |
           export SOURCE_DATE_EPOCH
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct)"
-          tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 \
-            --numeric-owner -C package -cf - "$archive" |
-            gzip -n -9 >"release-out/$archive.tar.gz"
+          "${{ matrix.python }}" scripts/package-release-server.py \
+            --target "$TARGET" \
+            --version "$VERSION" \
+            --binary "target/$TARGET/release/$BINARY" \
+            --output-dir release-out
 
       - name: Extract and smoke-test the finished archive
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          archive="epochdeck-server-${VERSION}-${TARGET}"
-          archive_path="release-out/$archive.tar.gz"
-          inspection="$(mktemp -d)"
-          tar -tzf "$archive_path" >"$inspection/listing"
-          if grep --extended-regexp --quiet '(^/|(^|/)\.\.(/|$))' "$inspection/listing"; then
-            echo "Archive contains an unsafe path" >&2
-            exit 1
-          fi
-          tar -xzf "$archive_path" -C "$inspection"
-          root="$inspection/$archive"
-          test -x "$root/epochdeck-server"
-          test -z "$(find "$root" -type l -print -quit)"
-          [[ "$(stat --format='%a' "$root/epochdeck-server")" == "755" ]]
-          cmp "target/$TARGET/release/epochdeck-server" "$root/epochdeck-server"
-          {
-            printf '%s\n' \
-              LICENSE \
-              README.md \
-              SECURITY.md \
-              THIRD_PARTY_NOTICES.txt \
-              deploy/epochdeck.env.example \
-              deploy/epochdeck.service \
-              epochdeck-server
-            find docs -type f -name '*.md' -print
-          } | LC_ALL=C sort >"$inspection/expected-files"
-          find "$root" -type f -printf '%P\n' | LC_ALL=C sort >"$inspection/actual-files"
-          cmp "$inspection/expected-files" "$inspection/actual-files"
-          while IFS= read -r -d '' packaged_file; do
-            if [[ "$packaged_file" != "$root/epochdeck-server" ]]; then
-              [[ "$(stat --format='%a' "$packaged_file")" == "644" ]]
-            fi
-          done < <(find "$root" -type f -print0)
-
-          runtime="$inspection/runtime"
-          mkdir -p "$runtime"
-          export EPOCHDECK_BIND=127.0.0.1:18788
-          export EPOCHDECK_DATA_DIR="$runtime/data"
-          export EPOCHDECK_METRICS_DIR="$runtime/metrics"
-          export EPOCHDECK_BLOBS_DIR="$runtime/blobs"
-          launcher=()
-          if [[ "$TARGET" == aarch64-* ]]; then
-            launcher=(qemu-aarch64-static)
-          fi
-          "${launcher[@]}" "$root/epochdeck-server" >"$runtime/server.log" 2>&1 &
-          pid=$!
-          trap 'kill "$pid" 2>/dev/null || true; cat "$runtime/server.log"' EXIT
-          curl --fail --retry 30 --retry-all-errors --retry-delay 1 \
-            http://127.0.0.1:18788/api/v1/health |
-            jq --exit-status --arg version "$VERSION" \
-              '.status == "healthy" and .version == $version'
-          kill -TERM "$pid"
-          set +e
-          wait "$pid"
-          status=$?
-          set -e
-          [[ "$status" -eq 0 || "$status" -eq 143 ]]
-          trap - EXIT
-          cat "$runtime/server.log"
+          archive=(release-out/*)
+          [[ "${#archive[@]}" -eq 1 ]]
+          "${{ matrix.python }}" scripts/smoke-release-server.py \
+            --archive "${archive[0]}" \
+            --target "$TARGET" \
+            --version "$VERSION"
 
       - name: Upload server archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-server-${{ matrix.target }}
-          path: release-out/*.tar.gz
+          path: release-out/*
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -436,12 +429,105 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  python-smoke:
+    name: Python ${{ matrix.python }} on ${{ matrix.runner }}
+    needs: python
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15, windows-2022]
+        python: ["3.11", "3.13"]
+    steps:
+      - name: Download the exact Python distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-python
+          path: release-python
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: 0.12.7
+          enable-cache: false
+
+      - name: Install and import the wheel
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          wheels=(release-python/*.whl)
+          [[ "${#wheels[@]}" -eq 1 ]]
+          uv run --isolated --no-project --python "$PYTHON_VERSION" \
+            --with "${wheels[0]}" python - <<'PY'
+          import tempfile
+          import sqlite3
+          from pathlib import Path
+
+          import epochdeck
+          import epochdeck.backup
+          import epochdeck.cli
+          from epochdeck._wandb_state import (
+              WandbImportError,
+              checkpoint_process_lock,
+          )
+
+          assert epochdeck.__version__
+
+          with tempfile.TemporaryDirectory(prefix="epochdeck-wheel-") as temporary:
+              root = Path(temporary)
+              run = epochdeck.init(
+                  project="native-wheel-smoke",
+                  name="offline-run",
+                  mode="offline",
+                  dir=root,
+              )
+              run.log({"loss": 1.0}, step=0)
+              run.finish(summary={"result": "complete"})
+              assert any((root / ".epochdeck" / "spool").iterdir())
+
+              storage = epochdeck.backup.StorageRoots(
+                  data=root / "storage-data",
+                  metrics=root / "storage-metrics",
+                  blobs=root / "storage-blobs",
+              )
+              storage.data.mkdir()
+              storage.metrics.mkdir()
+              storage.blobs.mkdir()
+              with sqlite3.connect(storage.catalog) as database:
+                  database.execute("CREATE TABLE health (ok INTEGER)")
+              manifest = epochdeck.backup.backup_storage(
+                  storage,
+                  root / "physical-backup",
+              )
+              assert manifest["format"] == "epochdeck-physical-backup"
+
+              checkpoint = root / "checkpoint.json"
+              with checkpoint_process_lock(checkpoint):
+                  try:
+                      with checkpoint_process_lock(checkpoint):
+                          raise AssertionError("a second checkpoint lock was acquired")
+                  except WandbImportError:
+                      pass
+
+              with checkpoint_process_lock(checkpoint):
+                  pass
+          PY
+
   assemble:
     name: Assemble release candidate
-    needs: [verify, server, python]
+    needs: [verify, server, python, python-smoke]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
     steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Download release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -449,13 +535,10 @@ jobs:
           path: release-dist
           merge-multiple: true
 
-      - name: Generate and verify SHA256SUMS
-        run: |
-          cd release-dist
-          mapfile -t files < <(find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
-          [[ "${#files[@]}" -eq 4 ]]
-          sha256sum "${files[@]}" >SHA256SUMS
-          sha256sum --check --strict SHA256SUMS
+      - name: Verify exact manifest and generate SHA256SUMS
+        run: >-
+          python3 scripts/release-candidate.py create
+          --directory release-dist --version "$VERSION"
 
       - name: Upload complete release candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -489,12 +572,9 @@ jobs:
           path: release-dist
 
       - name: Verify assembled release candidate
-        run: |
-          cd release-dist
-          mapfile -t files < <(find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
-          [[ "${#files[@]}" -eq 5 ]]
-          [[ "$(wc -l <SHA256SUMS)" -eq 4 ]]
-          sha256sum --check --strict SHA256SUMS
+        run: >-
+          python3 scripts/release-candidate.py check
+          --directory release-dist --version "$VERSION"
 
       - name: Revalidate protected signed tag
         env:

@@ -41,8 +41,11 @@ format, project, creation time, and resource counts. Export takes place in a
 sibling temporary directory. Every blob is size-checked and SHA-256 verified
 before the directory is atomically renamed to the requested destination. An
 existing destination is never merged or overwritten. All bundle files are
-fsynced before rename and the destination parent is fsynced afterward. Export
-directories are mode `0700` and files are mode `0600`; grant broader filesystem
+flushed before rename. Unix also fsyncs every directory and the destination
+parent; CPython has no equivalent directory-fsync primitive on Windows, where
+the exporter instead validates every traversed directory and cannot make the
+same power-loss guarantee for directory entries. Export directories are mode
+`0700` and files are mode `0600` on POSIX filesystems; grant broader filesystem
 access explicitly when a bundle is meant to be shared.
 
 Only referenced CAS content belongs to the portable project: rich values, trace

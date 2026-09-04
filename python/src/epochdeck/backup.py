@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -12,8 +11,19 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, TextIO
+
+from epochdeck._platform_fs import (
+    DIRECTORY_DESCRIPTORS_SUPPORTED,
+    FileLockUnavailable,
+    acquire_file_lock,
+    is_link_or_reparse,
+    open_regular_file_descriptor,
+    release_file_lock,
+    sync_directory,
+    verify_directory,
+)
 
 _COPY_CHUNK_BYTES = 1024 * 1024
 _MAX_FILES = 10_000_000
@@ -23,6 +33,17 @@ _MAX_INVENTORY_RECORD_BYTES = 16 * 1024
 _MAX_RELATIVE_PATH_BYTES = 4 * 1024
 _NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_WINDOWS_FORBIDDEN_PATH_CHARACTERS = frozenset('<>:"\\|?*')
+_WINDOWS_RESERVED_PATH_NAMES = {
+    "AUX",
+    "CON",
+    "CONIN$",
+    "CONOUT$",
+    "NUL",
+    "PRN",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 
 class BackupError(RuntimeError):
@@ -193,8 +214,8 @@ def _storage_lock(roots: StorageRoots) -> Iterator[None]:
             stream = lock_path.open("a+b")
             streams.append(stream)
             try:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
+                acquire_file_lock(stream.fileno())
+            except FileLockUnavailable as error:
                 raise BackupError(
                     "EpochDeck storage is active; stop epochdeck-server before backup or restore"
                 ) from error
@@ -202,7 +223,7 @@ def _storage_lock(roots: StorageRoots) -> Iterator[None]:
             yield
         finally:
             for acquired_stream in reversed(streams):
-                fcntl.flock(acquired_stream.fileno(), fcntl.LOCK_UN)
+                release_file_lock(acquired_stream.fileno())
     finally:
         for acquired_stream in reversed(streams):
             acquired_stream.close()
@@ -211,7 +232,7 @@ def _storage_lock(roots: StorageRoots) -> Iterator[None]:
 def _backup_sqlite(source: Path, destination: Path) -> None:
     try:
         with (
-            sqlite3.connect(f"file:{source}?mode=ro", uri=True) as source_database,
+            sqlite3.connect(_readonly_sqlite_uri(source), uri=True) as source_database,
             sqlite3.connect(destination) as destination_database,
         ):
             source_database.backup(destination_database)
@@ -223,7 +244,7 @@ def _backup_sqlite(source: Path, destination: Path) -> None:
 
 def _verify_sqlite(path: Path) -> None:
     try:
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as database:
+        with sqlite3.connect(_readonly_sqlite_uri(path), uri=True) as database:
             result = database.execute("PRAGMA integrity_check").fetchone()
     except sqlite3.Error as error:
         raise BackupError(f"failed to verify SQLite catalog: {error}") from error
@@ -244,7 +265,7 @@ def _walk_files(
     with os.scandir(current) as entries:
         for entry in entries:
             path = Path(entry.path)
-            if entry.is_symlink():
+            if is_link_or_reparse(entry.stat(follow_symlinks=False)):
                 raise BackupError(f"storage roots cannot contain symbolic links: {path}")
             relative = path.relative_to(root)
             if depth == 0 and skip_staging and entry.name in {"staging", "epochdeck.lock"}:
@@ -394,7 +415,7 @@ def _valid_entry(value: Any) -> bool:
         and isinstance(path, str)
         and _safe_relative(path)
         and (category != "catalog" or path == "catalog.sqlite3")
-        and (category == "catalog" or Path(path).parts[0] != "epochdeck.lock")
+        and (category == "catalog" or PurePosixPath(path).parts[0] != "epochdeck.lock")
         and isinstance(size, int)
         and not isinstance(size, bool)
         and size >= 0
@@ -407,11 +428,32 @@ def _valid_entry(value: Any) -> bool:
 def _bundle_relative_path(entry: dict[str, Any]) -> Path:
     if entry["category"] == "catalog":
         return Path("catalog.sqlite3")
-    return Path(entry["category"]) / entry["path"]
+    return Path(entry["category"], *PurePosixPath(entry["path"]).parts)
 
 
 @contextmanager
 def _open_bundle_regular_file(bundle: Path, relative: Path) -> Iterator[BinaryIO]:
+    if not DIRECTORY_DESCRIPTORS_SUPPORTED:
+        current = bundle
+        try:
+            verify_directory(current)
+            for component in relative.parts[:-1]:
+                current /= component
+                verify_directory(current)
+            source_descriptor = open_regular_file_descriptor(
+                current / relative.parts[-1], os.O_RDONLY
+            )
+        except OSError as error:
+            raise BackupError(f"cannot safely read backup source: {bundle / relative}") from error
+        try:
+            with os.fdopen(source_descriptor, "rb") as stream:
+                source_descriptor = -1
+                yield stream
+        finally:
+            if source_descriptor >= 0:
+                os.close(source_descriptor)
+        return
+
     descriptors: list[int] = []
     source_descriptor = -1
     try:
@@ -449,7 +491,7 @@ def _staged_restore_path(staging: dict[str, Path], entry: dict[str, Any]) -> Pat
     relative = entry["path"]
     if category == "catalog":
         return staging["data"] / "catalog.sqlite3"
-    return staging[category] / relative
+    return staging[category].joinpath(*PurePosixPath(relative).parts)
 
 
 def _require_empty_destination(roots: StorageRoots) -> None:
@@ -484,13 +526,24 @@ def _validate_storage_roots(roots: StorageRoots) -> None:
 
 
 def _safe_relative(value: str) -> bool:
-    path = Path(value)
+    path = PurePosixPath(value)
     return (
         bool(value)
         and len(value.encode("utf-8")) <= _MAX_RELATIVE_PATH_BYTES
         and not path.is_absolute()
         and all(part not in {"", ".", ".."} for part in path.parts)
+        and all(_portable_path_component(part) for part in path.parts)
+        and str(path) == value
         and not any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value)
+    )
+
+
+def _portable_path_component(value: str) -> bool:
+    stem = value.split(".", maxsplit=1)[0].upper()
+    return (
+        not any(character in _WINDOWS_FORBIDDEN_PATH_CHARACTERS for character in value)
+        and not value.endswith((" ", "."))
+        and stem not in _WINDOWS_RESERVED_PATH_NAMES
     )
 
 
@@ -519,12 +572,10 @@ def _read_bounded_file(path: Path, maximum: int) -> bytes:
 @contextmanager
 def _open_regular_file(path: Path) -> Iterator[BinaryIO]:
     try:
-        descriptor = os.open(path, os.O_RDONLY | _NO_FOLLOW)
+        descriptor = open_regular_file_descriptor(path, os.O_RDONLY)
     except OSError as error:
         raise BackupError(f"cannot safely read regular file: {path}") from error
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise BackupError(f"path is not a regular file: {path}")
         with os.fdopen(descriptor, "rb") as stream:
             descriptor = -1
             yield stream
@@ -534,6 +585,12 @@ def _open_regular_file(path: Path) -> Iterator[BinaryIO]:
 
 
 def _fsync_directory(path: Path) -> None:
+    if not DIRECTORY_DESCRIPTORS_SUPPORTED:
+        try:
+            sync_directory(path)
+        except OSError as error:
+            raise BackupError(f"cannot safely sync directory: {path}") from error
+        return
     try:
         descriptor = os.open(path, os.O_RDONLY | _DIRECTORY | _NO_FOLLOW)
     except OSError as error:
@@ -545,6 +602,9 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _fsync_directory_tree(root: Path) -> None:
+    if not DIRECTORY_DESCRIPTORS_SUPPORTED:
+        _fsync_directory_tree_path(root, depth=0)
+        return
     try:
         descriptor = os.open(root, os.O_RDONLY | _DIRECTORY | _NO_FOLLOW)
     except OSError as error:
@@ -567,7 +627,7 @@ def _fsync_directory_tree_descriptor(
         with os.scandir(descriptor) as entries:
             for entry in entries:
                 child = current / entry.name
-                if entry.is_symlink():
+                if is_link_or_reparse(entry.stat(follow_symlinks=False)):
                     raise BackupError(f"directory tree contains a symbolic link: {child}")
                 if entry.is_dir(follow_symlinks=False):
                     try:
@@ -600,3 +660,29 @@ def _fsync_directory_descriptor(descriptor: int, path: Path) -> None:
         os.fsync(descriptor)
     except OSError as error:
         raise BackupError(f"failed to sync directory: {path}") from error
+
+
+def _fsync_directory_tree_path(root: Path, *, depth: int) -> None:
+    if depth > _MAX_TREE_DEPTH:
+        raise BackupError(f"directory tree exceeds {_MAX_TREE_DEPTH} levels while syncing")
+    try:
+        verify_directory(root)
+        with os.scandir(root) as entries:
+            for entry in entries:
+                child = root / entry.name
+                status = entry.stat(follow_symlinks=False)
+                if is_link_or_reparse(status):
+                    raise BackupError(f"directory tree contains a symbolic link: {child}")
+                if stat.S_ISDIR(status.st_mode):
+                    _fsync_directory_tree_path(child, depth=depth + 1)
+                elif not stat.S_ISREG(status.st_mode):
+                    raise BackupError(f"directory tree contains a non-regular entry: {child}")
+        _fsync_directory(root)
+    except BackupError:
+        raise
+    except OSError as error:
+        raise BackupError(f"cannot safely sync directory tree: {root}") from error
+
+
+def _readonly_sqlite_uri(path: Path) -> str:
+    return f"{path.expanduser().resolve().as_uri()}?mode=ro"

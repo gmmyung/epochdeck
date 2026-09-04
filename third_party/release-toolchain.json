@@ -1,7 +1,10 @@
 {
   "schema": 1,
   "targets": [
+    "aarch64-apple-darwin",
     "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-musl"
   ],
   "pins": {
@@ -24,16 +27,6 @@
       "version": "9.2.0",
       "revision": "a0c06cc27d2146b7d86758ffa236516c6143d62c",
       "source": "https://github.com/gcc-mirror/gcc/tree/a0c06cc27d2146b7d86758ffa236516c6143d62c"
-    },
-    "zig": {
-      "version": "0.15.1",
-      "revision": "3db960767d12b6214bcf43f1966a037c7a586a12",
-      "source": "https://github.com/ziglang/zig/tree/3db960767d12b6214bcf43f1966a037c7a586a12"
-    },
-    "cargo-zigbuild": {
-      "version": "0.23.3",
-      "revision": "cd38ab2c56dfb70bc7459dd007d8cc5d8aec94ad",
-      "source": "https://github.com/rust-cross/cargo-zigbuild/tree/cd38ab2c56dfb70bc7459dd007d8cc5d8aec94ad"
     }
   },
   "components": [
@@ -44,7 +37,7 @@
       "version": "1.85.0 (4d91de4e48198da2e33413efdcd9cd2cc0c46688)",
       "license_expression": "MIT OR Apache-2.0, with bundled-component terms recorded in COPYRIGHT",
       "source": "https://github.com/rust-lang/rust/tree/4d91de4e48198da2e33413efdcd9cd2cc0c46688/library",
-      "coverage": "covers linked core, alloc, std, panic runtime, compiler-builtins, and the official Rust distribution's bundled third-party notices",
+      "coverage": "covers linked core, alloc, std, panic runtime, compiler-builtins, and the official Rust distribution's bundled third-party notices across the five native release targets",
       "documents": [
         {
           "path": "rust-1.85.0/COPYRIGHT",
@@ -73,7 +66,7 @@
       "version": "19.1.7 in Rust 1.85.0",
       "license_expression": "(Apache-2.0 WITH LLVM-exception) AND NCSA for legacy portions",
       "source": "https://github.com/rust-lang/llvm-project/tree/7e8c93c87c611f21d9bd95100563392f4c18bfe7/libunwind",
-      "coverage": "covers LLVM libunwind and compiler/runtime portions delivered in the self-contained Rust musl target; the official Rust notice includes the LLVM exception and legacy terms",
+      "coverage": "covers LLVM libunwind and compiler/runtime portions delivered by the native Rust toolchains; the official Rust notice includes the LLVM exception and legacy terms",
       "documents": [
         {
           "path": "llvm/LICENSE.TXT",
@@ -96,13 +89,13 @@
       "version": "1.2.3 in Rust 1.85.0 (with Rust release security patches)",
       "license_expression": "MIT and component-specific permissive notices",
       "source": "https://github.com/rust-lang/rust/blob/4d91de4e48198da2e33413efdcd9cd2cc0c46688/src/ci/docker/scripts/musl.sh",
-      "coverage": "covers libc.a plus the crt1 family (crt1, Scrt1, and rcrt1), crti, and crtn objects in Rust's self-contained musl sysroot; Zig 0.15.1 carries the same musl copyright notice for any linker fallback selection",
+      "coverage": "covers libc.a plus the crt1 family (crt1, Scrt1, and rcrt1), crti, and crtn objects in Rust's self-contained musl sysroot used by both native Linux builds",
       "documents": [
         {
           "path": "musl-1.2.3/COPYRIGHT",
           "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af",
           "source": "https://github.com/ifduyue/musl/blob/7a43f6fea9081bdd53d8a11cef9e9fab0348c53d/COPYRIGHT",
-          "provenance": "verbatim musl 1.2.3 copyright and component-specific permissive notices; identical to Zig 0.15.1's bundled musl COPYRIGHT"
+          "provenance": "verbatim musl 1.2.3 copyright and component-specific permissive notices from the Rust 1.85.0 self-contained musl runtime"
         }
       ]
     },
@@ -126,52 +119,6 @@
           "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
           "source": "https://github.com/gcc-mirror/gcc/blob/a0c06cc27d2146b7d86758ffa236516c6143d62c/COPYING3",
           "provenance": "verbatim GCC 9.2.0 GPLv3 terms referenced by the Runtime Library Exception"
-        }
-      ]
-    },
-    {
-      "id": "zig-runtime",
-      "pins": ["zig"],
-      "name": "Zig linker and compiler runtime",
-      "version": "0.15.1",
-      "license_expression": "MIT AND (Apache-2.0 WITH LLVM-exception) AND musl/component-specific permissive terms for ported portions",
-      "source": "https://github.com/ziglang/zig/tree/3db960767d12b6214bcf43f1966a037c7a586a12/lib/compiler_rt",
-      "coverage": "conservatively covers Zig-authored and LLVM- or musl-derived compiler-rt/linker runtime fragments if selected by zig cc; the Zig compiler and linker executables themselves are not redistributed",
-      "documents": [
-        {
-          "path": "zig-0.15.1/LICENSE",
-          "sha256": "5c537d6853e005298a285d508cff9ac7192cea23576c840d485b2b586a7ff177",
-          "source": "https://github.com/ziglang/zig/blob/3db960767d12b6214bcf43f1966a037c7a586a12/LICENSE",
-          "provenance": "verbatim Zig 0.15.1 project license covering Zig-authored compiler runtime code"
-        },
-        {
-          "path": "llvm/LICENSE.TXT",
-          "sha256": "b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d",
-          "source": "https://github.com/ziglang/zig/blob/3db960767d12b6214bcf43f1966a037c7a586a12/lib/libunwind/LICENSE.TXT",
-          "provenance": "verbatim LLVM license bundled by Zig 0.15.1, covering LLVM-derived compiler runtime portions"
-        },
-        {
-          "path": "musl-1.2.3/COPYRIGHT",
-          "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af",
-          "source": "https://github.com/ziglang/zig/blob/3db960767d12b6214bcf43f1966a037c7a586a12/lib/libc/musl/COPYRIGHT",
-          "provenance": "verbatim musl copyright and component notices bundled by Zig 0.15.1, covering musl-derived compiler runtime portions"
-        }
-      ]
-    },
-    {
-      "id": "cargo-zigbuild",
-      "pins": ["cargo-zigbuild"],
-      "name": "cargo-zigbuild release orchestrator",
-      "version": "0.23.3",
-      "license_expression": "MIT",
-      "source": "https://github.com/rust-cross/cargo-zigbuild/tree/cd38ab2c56dfb70bc7459dd007d8cc5d8aec94ad",
-      "coverage": "records the exact pinned cross-link orchestration path; cargo-zigbuild itself is a build tool and is not expected to contribute runtime bytes",
-      "documents": [
-        {
-          "path": "cargo-zigbuild-0.23.3/LICENSE",
-          "sha256": "74c4c1ce947760824daf396d972a613459c0a4e39d1e6b7c8768a5dc1ab860b8",
-          "source": "https://github.com/rust-cross/cargo-zigbuild/blob/cd38ab2c56dfb70bc7459dd007d8cc5d8aec94ad/LICENSE",
-          "provenance": "verbatim cargo-zigbuild 0.23.3 tag license"
         }
       ]
     }

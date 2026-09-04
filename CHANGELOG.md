@@ -3,6 +3,26 @@
 All notable changes to EpochDeck are recorded here. EpochDeck remains pre-alpha,
 so storage and APIs may change without migration or compatibility shims.
 
+## Unreleased
+
+### Added
+
+- Python clients can authenticate to an HTTPS reverse proxy with paired
+  `EPOCHDECK_HTTP_USERNAME` and `EPOCHDECK_HTTP_PASSWORD` environment variables;
+  credentials are rejected in server URLs and never enter the durable spool.
+- GitHub prereleases build and smoke-test server archives natively for Linux
+  x86_64/ARM64, macOS Intel/Apple Silicon, and Windows x86_64.
+
+### Changed
+
+- The supported remote-hosting topology now uses a standard authenticated HTTPS
+  reverse proxy in front of the loopback server, with no Tailscale dependency.
+- Deployment defaults keep all storage roots under `/var/lib/epochdeck` while
+  preserving independent root configuration for operators that need it.
+- Release builds use ordinary Cargo on matching native runners; Zig,
+  cargo-zigbuild, emulation, and cross-compilation are no longer in the release
+  toolchain.
+
 ## [0.1.0-alpha.1] - 2026-08-31
 
 ### Added

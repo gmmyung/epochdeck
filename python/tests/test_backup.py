@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import fcntl
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 import epochdeck.backup as backup_module
+from epochdeck._platform_fs import acquire_file_lock, release_file_lock
 from epochdeck.backup import BackupError, StorageRoots, backup_storage, restore_storage
 
 
@@ -47,15 +48,16 @@ def test_physical_backup_verifies_and_restores_split_storage(tmp_path) -> None:
     assert all(
         (root / "epochdeck.lock").is_file() for root in (source.data, source.metrics, source.blobs)
     )
-    assert bundle.stat().st_mode & 0o777 == 0o700
-    for path in [
-        bundle / "catalog.sqlite3",
-        bundle / "files.jsonl",
-        bundle / "manifest.json",
-        bundle / "metrics" / "segment.parquet",
-        bundle / "blobs" / "sha256" / "ab" / "abcdef",
-    ]:
-        assert path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert bundle.stat().st_mode & 0o777 == 0o700
+        for path in [
+            bundle / "catalog.sqlite3",
+            bundle / "files.jsonl",
+            bundle / "manifest.json",
+            bundle / "metrics" / "segment.parquet",
+            bundle / "blobs" / "sha256" / "ab" / "abcdef",
+        ]:
+            assert path.stat().st_mode & 0o777 == 0o600
 
     target = StorageRoots(
         data=tmp_path / "target-data",
@@ -68,9 +70,10 @@ def test_physical_backup_verifies_and_restores_split_storage(tmp_path) -> None:
         assert database.execute("SELECT id FROM runs").fetchone() == ("run-1",)
     assert (target.metrics / "segment.parquet").read_bytes() == b"parquet"
     assert (target.blobs / "sha256" / "ab" / "abcdef").read_bytes() == b"blob"
-    assert target.catalog.stat().st_mode & 0o777 == 0o600
-    assert target.metrics.stat().st_mode & 0o777 == 0o700
-    assert target.blobs.stat().st_mode & 0o777 == 0o700
+    if os.name != "nt":
+        assert target.catalog.stat().st_mode & 0o777 == 0o600
+        assert target.metrics.stat().st_mode & 0o777 == 0o700
+        assert target.blobs.stat().st_mode & 0o777 == 0o700
 
     with pytest.raises(BackupError, match="already exists"):
         restore_storage(bundle, target)
@@ -83,11 +86,14 @@ def test_directory_tree_sync_is_bottom_up_and_depth_bounded(monkeypatch, tmp_pat
     (leaf / "payload").write_bytes(b"payload")
     synced: list[Path] = []
 
-    monkeypatch.setattr(
-        backup_module,
-        "_fsync_directory_descriptor",
-        lambda descriptor, path: synced.append(path),
-    )
+    if backup_module.DIRECTORY_DESCRIPTORS_SUPPORTED:
+        monkeypatch.setattr(
+            backup_module,
+            "_fsync_directory_descriptor",
+            lambda descriptor, path: synced.append(path),
+        )
+    else:
+        monkeypatch.setattr(backup_module, "_fsync_directory", synced.append)
     backup_module._fsync_directory_tree(root)
 
     assert synced == [leaf, root / "branch", root]
@@ -101,6 +107,44 @@ def test_directory_tree_sync_is_bottom_up_and_depth_bounded(monkeypatch, tmp_pat
         current.mkdir()
     with pytest.raises(BackupError, match=r"exceeds .* levels while syncing"):
         backup_module._fsync_directory_tree(deep_root)
+
+
+def test_windows_directory_tree_fallback_is_bottom_up(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "tree"
+    leaf = root / "branch" / "leaf"
+    leaf.mkdir(parents=True)
+    (leaf / "payload").write_bytes(b"payload")
+    synced: list[Path] = []
+
+    monkeypatch.setattr(backup_module, "DIRECTORY_DESCRIPTORS_SUPPORTED", False)
+    monkeypatch.setattr(backup_module, "_fsync_directory", synced.append)
+    backup_module._fsync_directory_tree(root)
+
+    assert synced == [leaf, root / "branch", root]
+
+
+def test_windows_bundle_reader_fallback_verifies_each_path_component(monkeypatch, tmp_path) -> None:
+    bundle = tmp_path / "bundle"
+    nested = bundle / "metrics" / "nested"
+    nested.mkdir(parents=True)
+    payload = nested / "segment.parquet"
+    payload.write_bytes(b"metrics")
+    verified: list[Path] = []
+    verify_directory = backup_module.verify_directory
+
+    def record_verify(path):
+        verified.append(path)
+        verify_directory(path)
+
+    monkeypatch.setattr(backup_module, "DIRECTORY_DESCRIPTORS_SUPPORTED", False)
+    monkeypatch.setattr(backup_module, "verify_directory", record_verify)
+    with backup_module._open_bundle_regular_file(
+        bundle,
+        Path("metrics", "nested", "segment.parquet"),
+    ) as stream:
+        assert stream.read() == b"metrics"
+
+    assert verified == [bundle, bundle / "metrics", nested]
 
 
 def test_backup_syncs_the_generated_tree_before_atomic_publish(monkeypatch, tmp_path) -> None:
@@ -236,13 +280,16 @@ def test_backup_acquires_every_canonical_storage_root_lock(tmp_path) -> None:
         database.execute("CREATE TABLE health (ok INTEGER)")
 
     with (roots.metrics / "epochdeck.lock").open("a+b") as active_metric_lock:
-        fcntl.flock(active_metric_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with pytest.raises(BackupError, match="storage is active"):
-            backup_storage(roots, tmp_path / "blocked-backup")
+        acquire_file_lock(active_metric_lock.fileno())
+        try:
+            with pytest.raises(BackupError, match="storage is active"):
+                backup_storage(roots, tmp_path / "blocked-backup")
+        finally:
+            release_file_lock(active_metric_lock.fileno())
 
     with (roots.data / "epochdeck.lock").open("a+b") as released_data_lock:
-        fcntl.flock(released_data_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(released_data_lock.fileno(), fcntl.LOCK_UN)
+        acquire_file_lock(released_data_lock.fileno())
+        release_file_lock(released_data_lock.fileno())
 
     backup_storage(roots, tmp_path / "backup")
     assert all(
@@ -386,7 +433,10 @@ def test_restore_rejects_symbolic_link_bundle_sources(linked_source, tmp_path) -
         source_path = bundle / "metrics" / "segment.parquet"
     real_path = tmp_path / f"real-{source_path.name}"
     source_path.replace(real_path)
-    source_path.symlink_to(real_path)
+    try:
+        source_path.symlink_to(real_path)
+    except (NotImplementedError, OSError):
+        pytest.skip("symbolic links are not available on this Windows runner")
 
     target = StorageRoots(
         data=tmp_path / "target-data",
@@ -450,13 +500,8 @@ def test_restore_publishes_the_catalog_after_content_roots(monkeypatch, tmp_path
         blobs=tmp_path / "target-blobs",
     )
     original_replace = backup_module.os.replace
-    original_fsync_descriptor = backup_module._fsync_directory_descriptor
     published: list[Path] = []
     events: list[tuple[str, Path]] = []
-
-    def record_fsync_descriptor(descriptor, path):
-        events.append(("sync", Path(path)))
-        original_fsync_descriptor(descriptor, path)
 
     def record_replace(source_path, destination_path):
         destination = Path(destination_path)
@@ -469,11 +514,26 @@ def test_restore_publishes_the_catalog_after_content_roots(monkeypatch, tmp_path
             events.append(("publish", destination))
         original_replace(source_path, destination_path)
 
-    monkeypatch.setattr(
-        backup_module,
-        "_fsync_directory_descriptor",
-        record_fsync_descriptor,
-    )
+    if backup_module.DIRECTORY_DESCRIPTORS_SUPPORTED:
+        original_fsync_descriptor = backup_module._fsync_directory_descriptor
+
+        def record_fsync_descriptor(descriptor, path):
+            events.append(("sync", Path(path)))
+            original_fsync_descriptor(descriptor, path)
+
+        monkeypatch.setattr(
+            backup_module,
+            "_fsync_directory_descriptor",
+            record_fsync_descriptor,
+        )
+    else:
+        original_fsync_directory = backup_module._fsync_directory
+
+        def record_fsync_directory(path):
+            events.append(("sync", Path(path)))
+            original_fsync_directory(path)
+
+        monkeypatch.setattr(backup_module, "_fsync_directory", record_fsync_directory)
     monkeypatch.setattr(backup_module.os, "replace", record_replace)
     restore_storage(bundle, target)
 
@@ -522,7 +582,6 @@ def test_backup_metadata_reads_reject_oversized_manifest_inventory_and_paths(tmp
     )
     with pytest.raises(BackupError, match="invalid inventory entry"):
         list(backup_module._inventory(inventory))
-
     inventory.write_text(
         json.dumps(
             {
@@ -536,7 +595,6 @@ def test_backup_metadata_reads_reject_oversized_manifest_inventory_and_paths(tmp
     )
     with pytest.raises(BackupError, match="invalid inventory entry"):
         list(backup_module._inventory(inventory))
-
     inventory.write_text(
         json.dumps(
             {
@@ -565,3 +623,23 @@ def test_backup_metadata_reads_reject_oversized_manifest_inventory_and_paths(tmp
     )
     with pytest.raises(BackupError, match="invalid inventory entry"):
         list(backup_module._inventory(inventory))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../escape",
+        "nested\\escape",
+        "C:/escape",
+        "payload:stream",
+        "CON",
+        "nested/trailing.",
+        "nested//empty",
+    ],
+)
+def test_backup_inventory_paths_are_portable_across_release_targets(path) -> None:
+    assert backup_module._safe_relative(path) is False
+
+
+def test_backup_inventory_accepts_a_canonical_unicode_posix_path() -> None:
+    assert backup_module._safe_relative("sha256/ab/정상.bin") is True

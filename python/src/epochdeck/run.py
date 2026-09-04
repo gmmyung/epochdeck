@@ -19,7 +19,7 @@ from epochdeck._protocol import DeliveryError
 from epochdeck._spool import _Spool
 from epochdeck._summary import MAX_DERIVED_SUMMARY_KEYS, merge_metric_preview
 from epochdeck.artifact import Artifact
-from epochdeck.client import EpochDeckApiError, EpochDeckClient
+from epochdeck.client import EpochDeckApiError, EpochDeckClient, _normalize_server_url
 from epochdeck.rich import RichValue
 from epochdeck.system_metrics import SystemMonitor, SystemSampler
 from epochdeck.trace import Trace, TraceKind
@@ -310,6 +310,7 @@ class Run:
     ) -> None:
         run_id = _canonical_run_id(run_id)
         batch_size = _validate_batch_size(batch_size, "batch_size")
+        server_url = _normalize_server_url(server_url)
         if flush_interval < 0:
             raise ValueError("flush_interval cannot be negative")
         initial_config = _normalize_document(config, "config")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -222,6 +223,65 @@ def test_offline_run_keeps_a_durable_journal(tmp_path) -> None:
     )
 
 
+def test_proxy_credentials_are_not_written_to_the_run_spool(monkeypatch, tmp_path) -> None:
+    run_id = "019c1234-5678-7000-8000-000000000102"
+    monkeypatch.setenv("EPOCHDECK_HTTP_USERNAME", "proxy-user")
+    monkeypatch.setenv("EPOCHDECK_HTTP_PASSWORD", "proxy-password")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Basic cHJveHktdXNlcjpwcm94eS1wYXNzd29yZA=="
+        if request.url.path.endswith("/runs"):
+            return httpx.Response(
+                201,
+                json={
+                    "run": {"id": run_id, "name": "private", **_summary_fields()},
+                    "resumed": False,
+                    "next_sequence": 1,
+                    "next_step": 0,
+                },
+            )
+        if request.url.path.endswith("/finish"):
+            return httpx.Response(
+                200,
+                json={
+                    "run": {
+                        "id": run_id,
+                        "state": "finished",
+                        **_summary_fields(),
+                    }
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    run = create_run(
+        project="robotics",
+        run_id=run_id,
+        mode="online",
+        server_url="https://epochdeck.test",
+        spool_root=tmp_path,
+        system_monitor_interval=0,
+        transport=httpx.MockTransport(handler),
+    )
+    metadata_path = tmp_path / run_id / "run.json"
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["server_url"] == "https://epochdeck.test"
+    assert "proxy-user" not in metadata_path.read_text()
+    assert "proxy-password" not in metadata_path.read_text()
+    run.finish(timeout=2)
+
+
+def test_embedded_server_credentials_are_rejected_before_spooling(tmp_path) -> None:
+    with pytest.raises(ValueError, match="server_url must not contain credentials"):
+        create_run(
+            project="robotics",
+            mode="offline",
+            server_url="https://proxy-user:proxy-password@epochdeck.test",
+            spool_root=tmp_path,
+        )
+
+    assert not any(tmp_path.iterdir())
+
+
 def test_disabled_run_does_not_touch_the_spool(tmp_path) -> None:
     run = create_run(
         project="robotics",
@@ -277,7 +337,10 @@ def test_spool_rejects_a_symlinked_journal_without_touching_its_target(tmp_path)
     run_directory.mkdir()
     target = tmp_path / "outside.jsonl"
     target.write_bytes(b"outside\n")
-    (run_directory / "events.jsonl").symlink_to(target)
+    try:
+        (run_directory / "events.jsonl").symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("symbolic links are not available on this Windows runner")
 
     with pytest.raises(DeliveryError, match="regular non-symbolic file"):
         spool_module._Spool(tmp_path, run_id)
@@ -692,8 +755,9 @@ def test_online_finish_reclaims_acknowledged_payloads_and_keeps_private_metadata
     run.finish(timeout=2)
 
     spool = tmp_path / run_id
-    assert spool.stat().st_mode & 0o777 == 0o700
-    assert (spool / "run.json").stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert spool.stat().st_mode & 0o777 == 0o700
+        assert (spool / "run.json").stat().st_mode & 0o777 == 0o600
     assert (spool / "events.jsonl").read_bytes() == b""
     assert (spool / "rich-values.jsonl").read_bytes() == b""
     assert list((spool / "blobs").iterdir()) == []

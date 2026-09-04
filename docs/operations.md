@@ -1,5 +1,13 @@
 # Production operations
 
+## Network boundary
+
+EpochDeck has no native application authentication or multi-user authorization.
+Bind its HTTP listener to loopback and make an authenticated HTTPS reverse proxy
+the only externally reachable service. The proxy must terminate TLS and enforce
+access control before forwarding to EpochDeck. Never expose the EpochDeck HTTP
+port directly on a public or private network interface.
+
 ## Physical backup and restore
 
 Portable project export is useful for migration. Disaster recovery needs the
@@ -16,27 +24,37 @@ and restore take the same complete lock set and refuse to run while any root is
 active. Root-level lock files and incomplete metric/blob staging files are
 coordination state and are excluded from backup payloads. A backup uses SQLite's
 backup API, streams files through 1 MiB buffers, records a SHA-256 inventory,
-syncs every generated directory bottom-up, and publishes its directory
-atomically. The destination parent is synced after the rename, so a successful
-return includes the complete published tree in the durability boundary.
-New bundle roots are mode `0700` and their files are mode `0600`, independent
-of the invoking shell's umask.
+flushes every generated file, and publishes its directory atomically. On Unix,
+every generated directory is fsynced bottom-up and the destination parent is
+fsynced after the rename, so a successful return includes the complete tree in
+the durability boundary. CPython exposes no equivalent directory fsync on
+Windows; there EpochDeck validates every traversed directory and flushes file
+contents, but cannot promise identical power-loss durability for directory
+entries. New bundle roots are mode `0700` and their files are mode `0600` on
+POSIX filesystems, independent of the invoking shell's umask.
+
+Metric and blob roots must support same-filesystem hard links. The server probes
+that exact publication primitive during startup and refuses an unsupported
+filesystem instead of falling back to a non-atomic copy or replacement. The
+staging and final directories are always inside the same configured root, so no
+hard link is required between independently configured roots.
 
 ```bash
 sudo systemctl stop epochdeck
 sudo -u epochdeck env \
   EPOCHDECK_DATA_DIR=/var/lib/epochdeck/data \
   EPOCHDECK_METRICS_DIR=/var/lib/epochdeck/metrics \
-  EPOCHDECK_BLOBS_DIR=/srv/epochdeck/blobs \
+  EPOCHDECK_BLOBS_DIR=/var/lib/epochdeck/blobs \
   epochdeck backup /backups/epochdeck-$(date +%Y%m%d-%H%M%S)
 sudo systemctl start epochdeck
 ```
 
-For multi-terabyte blob stores, keep downtime short with filesystem snapshots.
-Stop EpochDeck, snapshot every dataset that contains a configured root, then start
-EpochDeck immediately. Replicate or run `epochdeck backup` against read-only mounts
-of those snapshots while the live service continues. The stop/snapshot/start
-window is what coordinates snapshots across the SSD and HDD/ZFS roots.
+For large blob roots, keep downtime short with filesystem snapshots. Stop
+EpochDeck, snapshot every filesystem volume that contains a configured root,
+then start EpochDeck immediately. Replicate or run `epochdeck backup` against
+read-only mounts of those snapshots while the live service continues. The
+stop/snapshot/start window coordinates one consistent point across all
+configured roots.
 
 Restore only into empty roots:
 
@@ -45,18 +63,19 @@ sudo systemctl stop epochdeck
 sudo -u epochdeck env \
   EPOCHDECK_DATA_DIR=/var/lib/epochdeck/data \
   EPOCHDECK_METRICS_DIR=/var/lib/epochdeck/metrics \
-  EPOCHDECK_BLOBS_DIR=/srv/epochdeck/blobs \
+  EPOCHDECK_BLOBS_DIR=/var/lib/epochdeck/blobs \
   epochdeck restore /backups/epochdeck-20260828-220000
 sudo systemctl start epochdeck
 ```
 
 Restore streams each regular bundle file once into exclusive staging while
 verifying every inventory digest, then runs `PRAGMA integrity_check`. Metric and
-blob staging trees are synced bottom-up before their top-level entries are
-installed and their destination roots are synced. The catalog is published and
-its parent synced last, so a failed restore cannot expose manifests before their
-durable files. It rejects symbolic-link
-sources, duplicate inventory destinations, any bundle/storage-root overlap in
+blob staging files are flushed before their top-level entries are installed.
+Unix additionally fsyncs the staging trees and destination roots bottom-up, then
+publishes the catalog and fsyncs its parent last, so a failed restore cannot
+expose manifests before their durable files. Windows retains the file-flush and
+publication ordering with the directory-fsync limitation above. Restore rejects
+symbolic-link sources, duplicate inventory destinations, any bundle/storage-root overlap in
 either ancestor direction, an existing catalog, and non-empty metric/blob
 roots other than their acquired `epochdeck.lock` files. Metric and blob roots must
 be disjoint; the data root may contain them but cannot equal or sit inside

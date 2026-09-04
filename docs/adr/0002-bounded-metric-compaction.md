@@ -27,7 +27,8 @@ Each default pass:
 - selects at most 16 adjacent segments with the same metric-schema signature;
 - caps the replacement at 16,384 rows;
 - streams 1,024-row Arrow batches into Parquet row groups capped at 8,192 rows;
-- installs the replacement with an atomic rename and filesystem sync;
+- installs the replacement with an atomic no-replace hard link and filesystem
+  sync;
 - atomically records old paths for retirement, replaces their manifests, and
   leaves the logical metric revision unchanged; and
 - deletes retired files only while holding the same snapshot barrier used by

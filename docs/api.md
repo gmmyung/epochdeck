@@ -412,8 +412,11 @@ filesystem path. Logo responses use the validated `image/png`, `image/jpeg`,
 SVG responses carry a route-specific sandboxed `default-src 'none'` content
 security policy in addition to startup validation.
 
-Authentication and stable external deployment guarantees are not implemented
-yet. Keep the current server on a trusted interface or Tailnet.
+Native application authentication, multi-user authorization, and stable
+external deployment guarantees are not implemented. Bind the EpochDeck HTTP
+server to loopback and expose it only through an authenticated HTTPS reverse
+proxy that terminates TLS and enforces access control. Never expose the
+EpochDeck HTTP port directly.
 
 Diagnostics retain only the most recent 64 slow requests in memory. They also
 report the catalog, metric, and blob roots with string device IDs and total,

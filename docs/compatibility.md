@@ -28,14 +28,17 @@ usable and tested, not that the entire feature group is complete.
 | Artifacts | manifests, versions, aliases, input/output links | Compatible |
 | Traces | structured spans, messages, search metadata | Compatible |
 | Python API | synchronous public API and background delivery | Partial |
-| Remote server | authenticated ingestion and read APIs | Partial |
+| Remote server | loopback HTTP behind an authenticated HTTPS reverse proxy | Partial |
 | CLI | list, get, query, sync, W&B import, EpochDeck export | Partial |
 | Dashboard | projects, runs, metrics, media, artifacts, traces, reports, server branding | Partial |
 | Import/export | lossless local export and resumable import | Partial |
 
 Features tied specifically to third-party hosting platforms are deliberately
 excluded. EpochDeck provides its own server, storage roots, and deployment model;
-the documented pre-alpha deployment uses Tailnet policy as its access boundary.
+the documented pre-alpha deployment binds that server to loopback and uses an
+authenticated HTTPS reverse proxy as its external boundary. The server has no
+native application authentication or multi-user authorization and must not be
+exposed directly.
 
 ## W&B parity roadmap
 

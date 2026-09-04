@@ -1,19 +1,22 @@
 # ADR 0011: Single-binary production operations
 
-- Status: Accepted
+- Status: Accepted; deployment boundary superseded by ADR 0016
 - Date: 2026-08-28
 
 ## Context
 
-The target installation is one Tailnet-only machine with metadata and metrics
-on SSD and large content on a separate ZFS pool. Deployment must not reintroduce
-a web process, reverse proxy, external database, or an unsafe backup race.
+The original target installation was one Tailnet-only machine with independently
+configured storage roots. Deployment must not reintroduce a separate dashboard
+process, external database, or an unsafe backup race. ADR 0016 replaces the
+Tailnet-specific TLS and access-control decision with a standard reverse-proxy
+boundary.
 
 ## Decision
 
 The production Cargo feature embeds the Vite output into `epochdeck-server`.
-Tailscale Serve terminates Tailnet-only HTTPS and proxies to a loopback-only
-listener. A hardened systemd unit owns the process and configured storage roots.
+The original deployment used Tailscale Serve to terminate HTTPS and proxy to a
+loopback-only listener. A hardened systemd unit owns the process and configured
+storage roots.
 
 The server canonicalizes the configured data, metric, and blob roots, sorts and
 deduplicates them, then holds an advisory `<canonical-root>/epochdeck.lock` for
@@ -51,9 +54,9 @@ general API capacity. Embedded static dashboard assets bypass API admission.
 
 ## Consequences
 
-One executable serves both API and dashboard, and Tailscale remains the only TLS
-and access-control layer. Backups cannot unknowingly race a live server, and an
-independently configured storage root cannot be shared by two live servers.
+One executable serves both API and dashboard. The current TLS and access-control
+boundary is defined by ADR 0016. Backups cannot unknowingly race a live server,
+and an independently configured storage root cannot be shared by two live servers.
 Multi-terabyte installations can minimize downtime by stopping only long enough
 to take coordinated filesystem snapshots, then copying snapshots asynchronously.
 
@@ -67,8 +70,9 @@ downloads to accumulate without a limit.
 
 ### Run Vite or nginx in production
 
-It adds a second service and a second asset-version lifecycle without improving
-the Tailnet-only single-node design.
+It adds a second asset-version lifecycle without improving the single-node
+design. A reverse proxy remains necessary for the TLS and authentication
+boundary described by ADR 0016, but it does not serve EpochDeck's static assets.
 
 ### Copy live storage roots directly
 

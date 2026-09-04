@@ -26,9 +26,19 @@ CARGO_MANIFEST = ROOT / "crates" / "epochdeck-server" / "Cargo.toml"
 PNPM_LOCK = ROOT / "web" / "pnpm-lock.yaml"
 INSTALLED_PNPM_LOCK = ROOT / "web" / "node_modules" / ".pnpm" / "lock.yaml"
 RUST_TARGETS = (
+    "aarch64-apple-darwin",
     "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-musl",
 )
+EXPECTED_WORKFLOW_RUNNERS = {
+    "aarch64-apple-darwin": "macos-15",
+    "aarch64-unknown-linux-musl": "ubuntu-24.04-arm",
+    "x86_64-apple-darwin": "macos-15-intel",
+    "x86_64-pc-windows-msvc": "windows-2022",
+    "x86_64-unknown-linux-musl": "ubuntu-24.04",
+}
 DASHBOARD_CODE_EMITTERS = {
     "esbuild": (
         "covers esbuild's production minification/transformation output and any "
@@ -50,10 +60,6 @@ DASHBOARD_RUNTIME_COMPILERS = {
     )
 }
 EXPECTED_TOOLCHAIN_PIN_VALUES = {
-    "cargo-zigbuild": (
-        "0.23.3",
-        "cd38ab2c56dfb70bc7459dd007d8cc5d8aec94ad",
-    ),
     "gcc-runtime": (
         "9.2.0",
         "a0c06cc27d2146b7d86758ffa236516c6143d62c",
@@ -70,22 +76,15 @@ EXPECTED_TOOLCHAIN_PIN_VALUES = {
         "1.85.0",
         "4d91de4e48198da2e33413efdcd9cd2cc0c46688",
     ),
-    "zig": (
-        "0.15.1",
-        "3db960767d12b6214bcf43f1966a037c7a586a12",
-    ),
 }
 EXPECTED_TOOLCHAIN_PINS = frozenset(EXPECTED_TOOLCHAIN_PIN_VALUES)
 EXPECTED_TOOLCHAIN_COMPONENT_PINS = {
-    "cargo-zigbuild": ("cargo-zigbuild",),
     "gcc-runtime": ("gcc-runtime", "rust"),
     "musl-libc": ("musl", "rust"),
     "rust-llvm-runtime": ("llvm", "rust"),
     "rust-standard-library": ("rust",),
-    "zig-runtime": ("zig",),
 }
 EXPECTED_TOOLCHAIN_COMPONENT_DOCUMENTS = {
-    "cargo-zigbuild": frozenset({"cargo-zigbuild-0.23.3/LICENSE"}),
     "gcc-runtime": frozenset({"gcc-9.2.0/COPYING.RUNTIME", "gcc-9.2.0/COPYING3"}),
     "musl-libc": frozenset({"musl-1.2.3/COPYRIGHT"}),
     "rust-llvm-runtime": frozenset({"llvm/LICENSE.TXT", "rust-1.85.0/COPYRIGHT"}),
@@ -94,13 +93,6 @@ EXPECTED_TOOLCHAIN_COMPONENT_DOCUMENTS = {
             "rust-1.85.0/COPYRIGHT",
             "rust-1.85.0/LICENSE-APACHE",
             "rust-1.85.0/LICENSE-MIT",
-        }
-    ),
-    "zig-runtime": frozenset(
-        {
-            "llvm/LICENSE.TXT",
-            "musl-1.2.3/COPYRIGHT",
-            "zig-0.15.1/LICENSE",
         }
     ),
 }
@@ -814,46 +806,48 @@ def _toolchain_dependencies() -> list[Dependency]:
     targets = manifest.get("targets")
     if targets != list(RUST_TARGETS):
         raise NoticeError(
-            "release toolchain targets must exactly match the notice generator's musl targets"
+            "release toolchain targets must exactly match the notice generator's targets"
         )
 
     workflow = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
     rust_version = normalized_pins["rust"]["version"]
-    zig_version = normalized_pins["zig"]["version"]
-    zigbuild_version = normalized_pins["cargo-zigbuild"]["version"]
     actual_rust = _single_workflow_value(
         r"^\s*toolchain:\s*([^\s#]+)",
         _workflow_step(workflow, "Install Rust 1.85"),
         "Rust toolchain version",
     )
-    actual_zig = _single_workflow_value(
-        r"^\s*version:\s*([^\s#]+)",
-        _workflow_step(workflow, "Install Zig"),
-        "Zig version",
-    )
-    actual_zigbuild = _single_workflow_value(
-        r"^\s*tool:\s*cargo-zigbuild@([^\s#]+)",
-        _workflow_step(workflow, "Install cargo-zigbuild"),
-        "cargo-zigbuild version",
-    )
     linked_rust = _single_workflow_value(
-        r"cargo \+([^\s]+) zigbuild",
-        _workflow_step(workflow, "Build static server"),
-        "Rust version in the cargo zigbuild command",
+        r"cargo \+([^\s]+) build",
+        _workflow_step(workflow, "Build release server"),
+        "Rust version in the cargo build command",
     )
-    actual = (actual_rust, actual_zig, actual_zigbuild, linked_rust)
-    expected = (rust_version, zig_version, zigbuild_version, rust_version)
+    actual = (actual_rust, linked_rust)
+    expected = (rust_version, rust_version)
     if actual != expected:
         raise NoticeError(
             "release workflow toolchain pins disagree with third_party/release-toolchain.json: "
             f"found {actual!r}, expected {expected!r}"
         )
-    workflow_targets = set(
-        re.findall(r"^\s*- ([a-z0-9_]+-unknown-linux-musl)\s*$", workflow, re.MULTILINE)
+    if re.search(r"(?:cargo-zigbuild|setup-zig|\bzigbuild\b)", workflow, re.IGNORECASE):
+        raise NoticeError(
+            "release workflow must use ordinary Cargo without Zig tooling"
+        )
+    workflow_matrix = dict(
+        re.findall(
+            r"^\s*- runner:\s*([^\s#]+)\s*\n\s+target:\s*([^\s#]+)\s*$",
+            workflow,
+            re.MULTILINE,
+        )
     )
+    workflow_targets = set(workflow_matrix.values())
     if workflow_targets != set(RUST_TARGETS):
         raise NoticeError(
-            f"release workflow musl targets drifted: found {sorted(workflow_targets)!r}"
+            f"release workflow targets drifted: found {sorted(workflow_targets)!r}"
+        )
+    actual_runners = {target: runner for runner, target in workflow_matrix.items()}
+    if actual_runners != EXPECTED_WORKFLOW_RUNNERS:
+        raise NoticeError(
+            f"release workflow native runners drifted: found {actual_runners!r}"
         )
 
     components = manifest.get("components")
@@ -1018,7 +1012,8 @@ def _render(dependencies: Iterable[Dependency]) -> str:
         "-----",
         "",
         "- The non-development Cargo dependency closure of epochdeck-server with the",
-        "  embedded-dashboard feature for the x86_64 and aarch64 Linux musl targets.",
+        "  embedded-dashboard feature for the five native release targets:",
+        "  Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64.",
         "  Build dependencies are included conservatively.",
         "- Production dependencies reported by pnpm for the embedded dashboard.",
         "- Vite, Rollup, and esbuild as an explicit bounded set of production",
@@ -1026,7 +1021,7 @@ def _render(dependencies: Iterable[Dependency]) -> str:
         "  polyfill, Rollup generates chunk/interoperability helpers, and esbuild",
         "  performs production transformation and minification.",
         "- Pinned Rust standard-library, panic, compiler-builtins, musl, GCC runtime,",
-        "  LLVM runtime, Zig runtime, and cargo-zigbuild release-toolchain coverage.",
+        "  and LLVM runtime coverage for the native Cargo release toolchains.",
         "  The Svelte compiler is covered by the inventoried svelte package itself;",
         "  vite-plugin-svelte only orchestrates the production transform and contributes",
         "  no separately shipped runtime bytes.",

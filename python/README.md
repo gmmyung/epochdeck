@@ -12,8 +12,13 @@ imports the SDK; the distribution is not published to PyPI:
 
 ```bash
 uv add ./epochdeck-*.whl
-export EPOCHDECK_SERVER_URL=https://epochdeck.<tailnet>.ts.net
+export EPOCHDECK_SERVER_URL=https://epochdeck.example.com
 ```
+
+For an HTTPS reverse proxy protected by HTTP Basic authentication, set
+`EPOCHDECK_HTTP_USERNAME` and `EPOCHDECK_HTTP_PASSWORD` together. Keep
+credentials out of `EPOCHDECK_SERVER_URL`; the SDK sends them as an
+`Authorization` header and does not persist them in the durable spool.
 
 Use the conventional `import epochdeck as ed` alias in Python; the CLI command is
 `epochdeck`. Install the administrative CLI in an isolated tool environment when

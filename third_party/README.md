@@ -13,13 +13,13 @@ unused, modified, or no longer matches dependency metadata. Prefer upstream
 release/tag content. A synthesized text is allowed only when upstream publishes
 the license declaration but no license file; record that fact in `provenance`.
 
-Static Linux releases also link code that is not represented by Cargo metadata.
-`release-toolchain.json` pins the Rust, LLVM, musl, GCC runtime, Zig, and
-cargo-zigbuild inputs used by the release workflow. Its components explain
-which runtime bytes may be linked and map each component to immutable,
-hash-checked license documents under `toolchain-runtime/`. The generator checks
-the manifest against the exact workflow versions and musl targets, and fails on
-missing pins, components, metadata, text, or a changed document hash.
+Native server releases also link code that is not represented by Cargo metadata.
+`release-toolchain.json` pins the Rust, LLVM, musl, and GCC runtime inputs used
+by the ordinary Cargo release workflow. Its components explain which runtime
+bytes may be linked and map each component to immutable, hash-checked license
+documents under `toolchain-runtime/`. The generator checks the manifest against
+the exact workflow version, native runners, and five release targets, and fails
+on missing pins, components, metadata, text, or a changed document hash.
 
 The dashboard inventory includes locked production packages plus an explicit
 bounded set of build tools that can emit production bytes: Vite, Rollup, and

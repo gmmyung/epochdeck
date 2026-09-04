@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import stat
 import threading
 import uuid
 from collections.abc import Mapping
@@ -13,6 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from epochdeck._metrics import normalize_metrics
+from epochdeck._platform_fs import (
+    ACCESS_MODE,
+    open_regular_file_descriptor,
+    sync_directory,
+    verify_directory,
+)
 from epochdeck._protocol import DeliveryError, encode_json_request
 from epochdeck._summary import MAX_DERIVED_SUMMARY_KEYS, merge_metric_preview
 
@@ -585,9 +590,13 @@ def _atomic_text_write(path: Path, value: str, maximum: int) -> None:
         raise DeliveryError(f"spool file exceeds {maximum} bytes: {path}")
     _verify_directory(path.parent)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NO_FOLLOW
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     try:
-        descriptor = os.open(temporary, flags, 0o600)
+        descriptor = open_regular_file_descriptor(
+            temporary,
+            flags,
+            private_mode=0o600,
+        )
     except OSError as error:
         raise DeliveryError(f"cannot create private spool file: {temporary}") from error
     try:
@@ -601,10 +610,6 @@ def _atomic_text_write(path: Path, value: str, maximum: int) -> None:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
-
-
-_NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
 def _path_exists(path: Path) -> bool:
@@ -632,61 +637,43 @@ def _ensure_private_directory(path: Path, *, parents: bool) -> None:
 
 def _verify_directory(path: Path, *, private: bool = False) -> None:
     try:
-        descriptor = os.open(path, os.O_RDONLY | _DIRECTORY | _NO_FOLLOW)
+        verify_directory(path, private_mode=0o700 if private else None)
     except OSError as error:
         raise DeliveryError(f"spool path must be a non-symbolic directory: {path}") from error
-    try:
-        status = os.fstat(descriptor)
-        if not stat.S_ISDIR(status.st_mode):
-            raise DeliveryError(f"spool path must be a non-symbolic directory: {path}")
-        if private:
-            os.fchmod(descriptor, 0o700)
-    finally:
-        os.close(descriptor)
 
 
 def _ensure_private_file(path: Path) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | _NO_FOLLOW
+    flags = os.O_WRONLY | os.O_CREAT
     try:
-        descriptor = os.open(path, flags, 0o600)
+        descriptor = open_regular_file_descriptor(path, flags, private_mode=0o600)
     except OSError as error:
         raise DeliveryError(f"spool path must be a regular non-symbolic file: {path}") from error
-    try:
-        status = os.fstat(descriptor)
-        if not stat.S_ISREG(status.st_mode):
-            raise DeliveryError(f"spool path must be a regular non-symbolic file: {path}")
-        os.fchmod(descriptor, 0o600)
-    finally:
-        os.close(descriptor)
+    os.close(descriptor)
 
 
 def _verify_regular_file(path: Path, *, private: bool = False) -> None:
     try:
-        descriptor = os.open(path, os.O_RDONLY | _NO_FOLLOW)
+        descriptor = open_regular_file_descriptor(
+            path,
+            os.O_RDONLY,
+            private_mode=0o600 if private else None,
+        )
     except OSError as error:
         raise DeliveryError(f"spool path must be a regular non-symbolic file: {path}") from error
-    try:
-        status = os.fstat(descriptor)
-        if not stat.S_ISREG(status.st_mode):
-            raise DeliveryError(f"spool path must be a regular non-symbolic file: {path}")
-        if private:
-            os.fchmod(descriptor, 0o600)
-    finally:
-        os.close(descriptor)
+    os.close(descriptor)
 
 
 def _open_regular_file(path: Path, flags: int) -> Any:
     try:
-        descriptor = os.open(path, flags | _NO_FOLLOW)
+        access = flags & ACCESS_MODE
+        descriptor = open_regular_file_descriptor(
+            path,
+            flags,
+            private_mode=0o600 if access != os.O_RDONLY else None,
+        )
     except OSError as error:
         raise DeliveryError(f"spool path must be a regular non-symbolic file: {path}") from error
     try:
-        status = os.fstat(descriptor)
-        if not stat.S_ISREG(status.st_mode):
-            raise DeliveryError(f"spool path must be a regular non-symbolic file: {path}")
-        access = flags & os.O_ACCMODE
-        if access != os.O_RDONLY:
-            os.fchmod(descriptor, 0o600)
         if access == os.O_RDONLY:
             mode = "rb"
         elif flags & os.O_APPEND:
@@ -701,14 +688,11 @@ def _open_regular_file(path: Path, flags: int) -> Any:
 
 def _regular_file_size(path: Path) -> int:
     try:
-        descriptor = os.open(path, os.O_RDONLY | _NO_FOLLOW)
+        descriptor = open_regular_file_descriptor(path, os.O_RDONLY)
     except OSError as error:
         raise DeliveryError(f"spool path must be a regular non-symbolic file: {path}") from error
     try:
-        status = os.fstat(descriptor)
-        if not stat.S_ISREG(status.st_mode):
-            raise DeliveryError(f"spool path must be a regular non-symbolic file: {path}")
-        return status.st_size
+        return os.fstat(descriptor).st_size
     finally:
         os.close(descriptor)
 
@@ -734,10 +718,6 @@ def _read_journal_line(stream: Any, path: Path) -> bytes:
 
 def _fsync_directory(path: Path) -> None:
     try:
-        descriptor = os.open(path, os.O_RDONLY | _DIRECTORY | _NO_FOLLOW)
+        sync_directory(path)
     except OSError as error:
         raise DeliveryError(f"spool path must be a non-symbolic directory: {path}") from error
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)

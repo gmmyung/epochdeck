@@ -19,6 +19,7 @@ from epochdeck._json_normalization import (
     normalize_json_value_with_stats,
 )
 from epochdeck._limits import MAX_SAFE_INTEGER
+from epochdeck._platform_fs import open_regular_file_descriptor, sync_directory, verify_directory
 from epochdeck._sweep_context import SweepRunContext, current_sweep_context
 from epochdeck.api import current_run
 from epochdeck.client import EpochDeckApiError, EpochDeckClient
@@ -258,7 +259,7 @@ class _AgentState:
 
     def write(self, value: Mapping[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.path.parent.chmod(0o700)
+        verify_directory(self.path.parent, private_mode=0o700)
         payload = {
             "sweep_id": self._sweep_id,
             "agent_id": self._agent_id,
@@ -275,7 +276,11 @@ class _AgentState:
                 f"sweep agent state exceeds {_MAX_AGENT_STATE_BYTES} bytes: {self.path}"
             )
         temporary = self.path.with_name(f".{self.path.name}.{uuid7()}.tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = open_regular_file_descriptor(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            private_mode=0o600,
+        )
         try:
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(encoded)
@@ -335,11 +340,7 @@ def _complete_pending_trial(client: EpochDeckClient, pending: Mapping[str, Any])
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(path)
 
 
 def _normalize_sweep(configuration: Mapping[str, Any]) -> dict[str, Any]:

@@ -177,7 +177,28 @@ async fn shutdown_signal() {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::ctrl_break;
+
+        match ctrl_break() {
+            Ok(mut break_signal) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(error) = result {
+                            tracing::error!(%error, "failed to receive interrupt signal");
+                        }
+                    }
+                    _ = break_signal.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to install CTRL-BREAK signal handler");
+                wait_for_interrupt().await;
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     wait_for_interrupt().await;
 }
 

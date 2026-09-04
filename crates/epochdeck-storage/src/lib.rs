@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod filesystem;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -54,6 +56,14 @@ pub enum StorageError {
     InvalidBlob(String),
     #[error("invalid storage layout: {0}")]
     InvalidLayout(String),
+    #[error(
+        "failed to atomically publish {staging_path} as {final_path} with the required same-filesystem no-replace hard link: {source}"
+    )]
+    AtomicPublicationFailed {
+        staging_path: PathBuf,
+        final_path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("storage operation was cancelled")]
     Cancelled,
 }
@@ -68,6 +78,7 @@ pub struct StorageLayout {
 #[derive(Debug, Clone)]
 pub struct BlobStore {
     root: Arc<PathBuf>,
+    publication_verified: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -137,6 +148,7 @@ impl BlobStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Arc::new(root.into()),
+            publication_verified: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -147,7 +159,11 @@ impl BlobStore {
                 source,
             })?;
         }
-        Ok(())
+        filesystem::ensure_publication_capability(
+            self.root(),
+            &self.staging_dir(),
+            &self.publication_verified,
+        )
     }
 
     pub fn health_check(&self) -> Result<(), StorageError> {
@@ -166,6 +182,7 @@ impl BlobStore {
     }
 
     pub fn cleanup_staging(&self) -> Result<(), StorageError> {
+        self.publication_verified.store(false, Ordering::Release);
         let staging_dir = self.staging_dir();
         match std::fs::remove_dir_all(&staging_dir) {
             Ok(()) => {}
@@ -177,10 +194,7 @@ impl BlobStore {
                 });
             }
         }
-        std::fs::create_dir_all(&staging_dir).map_err(|source| StorageError::CreateDirectory {
-            path: staging_dir,
-            source,
-        })
+        self.ensure()
     }
 
     pub fn install(
@@ -197,24 +211,15 @@ impl BlobStore {
             path: parent.to_path_buf(),
             source,
         })?;
-        let installation = match std::fs::hard_link(staging_path, &final_path) {
-            Ok(()) => BlobInstallation::InstalledNew,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                BlobInstallation::AlreadyPresent
-            }
-            Err(source) => {
-                return Err(StorageError::Io {
-                    path: final_path,
-                    source,
-                });
-            }
+        let installation = match filesystem::install_no_replace(staging_path, &final_path)? {
+            filesystem::FileInstallation::InstalledNew => BlobInstallation::InstalledNew,
+            filesystem::FileInstallation::AlreadyPresent => BlobInstallation::AlreadyPresent,
         };
         std::fs::remove_file(staging_path).map_err(|source| StorageError::Io {
             path: staging_path.to_path_buf(),
             source,
         })?;
-        sync_path(&final_path)?;
-        sync_path(parent)?;
+        filesystem::sync_publication(&final_path, parent)?;
         Ok(InstalledBlob {
             path: final_path,
             installation,
@@ -1110,18 +1115,22 @@ impl ChartHistorySampler {
 
 #[derive(Debug, Clone)]
 pub struct MetricStore {
-    root: PathBuf,
+    root: Arc<PathBuf>,
+    publication_verified: Arc<AtomicBool>,
 }
 
 impl MetricStore {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: Arc::new(root.into()),
+            publication_verified: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.root
+        self.root.as_path()
     }
 
     pub fn ensure(&self) -> Result<(), StorageError> {
@@ -1131,10 +1140,15 @@ impl MetricStore {
                 source,
             })?;
         }
-        Ok(())
+        filesystem::ensure_publication_capability(
+            self.root(),
+            &self.staging_dir(),
+            &self.publication_verified,
+        )
     }
 
     pub fn cleanup_staging(&self) -> Result<(), StorageError> {
+        self.publication_verified.store(false, Ordering::Release);
         let staging_dir = self.staging_dir();
         match std::fs::remove_dir_all(&staging_dir) {
             Ok(()) => {}
@@ -1146,10 +1160,7 @@ impl MetricStore {
                 });
             }
         }
-        std::fs::create_dir_all(&staging_dir).map_err(|source| StorageError::CreateDirectory {
-            path: staging_dir,
-            source,
-        })
+        self.ensure()
     }
 
     pub fn health_check(&self) -> Result<(), StorageError> {
@@ -1209,8 +1220,7 @@ impl MetricStore {
             installation
         };
 
-        sync_path(&final_path)?;
-        sync_path(parent)?;
+        filesystem::sync_publication(&final_path, parent)?;
 
         let byte_size = std::fs::metadata(&final_path)
             .map_err(|source| StorageError::Io {
@@ -1419,8 +1429,7 @@ impl MetricStore {
             staging.disarm();
             installation
         };
-        sync_path(&final_path)?;
-        sync_path(parent)?;
+        filesystem::sync_publication(&final_path, parent)?;
         let byte_size = std::fs::metadata(&final_path)
             .map_err(|source| StorageError::Io {
                 path: final_path.clone(),
@@ -1528,12 +1537,7 @@ fn write_parquet(
     let mut writer = ArrowWriter::try_new(file, schema, Some(properties))?;
     writer.write(&batch)?;
     writer.close()?;
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|source| StorageError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+    filesystem::sync_file(path)
 }
 
 fn write_compacted_parquet(
@@ -1661,15 +1665,9 @@ fn install_file(
     temporary_path: &Path,
     final_path: &Path,
 ) -> Result<SegmentInstallation, StorageError> {
-    match std::fs::hard_link(temporary_path, final_path) {
-        Ok(()) => Ok(SegmentInstallation::InstalledNew),
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(SegmentInstallation::AlreadyPresent)
-        }
-        Err(source) => Err(StorageError::Io {
-            path: final_path.to_path_buf(),
-            source,
-        }),
+    match filesystem::install_no_replace(temporary_path, final_path)? {
+        filesystem::FileInstallation::InstalledNew => Ok(SegmentInstallation::InstalledNew),
+        filesystem::FileInstallation::AlreadyPresent => Ok(SegmentInstallation::AlreadyPresent),
     }
 }
 
@@ -1678,15 +1676,6 @@ fn remove_staging_file(path: &Path) -> Result<(), StorageError> {
         path: path.to_path_buf(),
         source,
     })
-}
-
-fn sync_path(path: &Path) -> Result<(), StorageError> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|source| StorageError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
 }
 
 fn check_writable_directory(path: &Path) -> Result<(), StorageError> {

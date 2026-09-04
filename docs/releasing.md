@@ -1,8 +1,24 @@
 # Releasing EpochDeck
 
-EpochDeck releases are explicit GitHub prereleases. The workflow attaches static
-Linux server archives, a Python wheel and source distribution, and
-`SHA256SUMS`. It does not publish to PyPI, crates.io, or npm.
+EpochDeck releases are explicit GitHub prereleases. The workflow attaches
+native server archives for Linux, macOS, and Windows, a Python wheel and source
+distribution, and `SHA256SUMS`. It does not publish to PyPI, crates.io, or npm.
+
+The five server builds use ordinary Cargo on matching GitHub-hosted runners:
+
+- `x86_64-unknown-linux-musl` on `ubuntu-24.04`
+- `aarch64-unknown-linux-musl` on `ubuntu-24.04-arm`
+- `x86_64-apple-darwin` on `macos-15-intel`
+- `aarch64-apple-darwin` on `macos-15`
+- `x86_64-pc-windows-msvc` on `windows-2022`
+
+Linux archives are static `.tar.gz` files. macOS and Windows archives are
+`.zip` files; only Linux archives contain the systemd unit and environment-file
+template. macOS binaries target macOS 13 or newer, and Windows binaries link
+the MSVC C runtime statically. Every native job runs the storage and server
+tests on its release target, inspects the resulting binary, then extracts and
+exercises the finished archive. The dashboard bundle tested by the
+source-verification job is reused by every server build.
 
 ## Third-party notices
 
@@ -20,15 +36,15 @@ Packages that omit license files need an exact version, license expression,
 source provenance, and SHA-256 entry under `third_party/`. The bounded dashboard
 build-emitter audit covers Vite, Rollup, esbuild, and compiler output from the
 production `svelte` package. The separately pinned `release-toolchain.json`
-covers the Rust sysroot/runtime and the musl, GCC, LLVM, Zig, and cargo-zigbuild
-inputs used for static archives. Re-audit those classifications and components
-when the corresponding build path changes; Vite and Svelte configuration files
-are notice fingerprints for that reason.
+covers the Rust sysroot/runtime and the musl, GCC, and LLVM inputs used for the
+native archives. Re-audit those classifications and components when the
+corresponding build path changes; Vite and Svelte configuration files are
+notice fingerprints for that reason.
 
 `just check` rebuilds the inventory offline and rejects stale notices, unused
 overrides, workflow/toolchain version drift, missing components, changed
-document hashes, missing license metadata, or missing text. Each static server
-archive includes the checked `THIRD_PARTY_NOTICES.txt` beside the binary.
+document hashes, missing license metadata, or missing text. Each server archive
+includes the checked `THIRD_PARTY_NOTICES.txt` beside the binary.
 
 ## Prerelease checklist
 
@@ -50,9 +66,11 @@ archive includes the checked `THIRD_PARTY_NOTICES.txt` beside the binary.
 9. Confirm `git status --short` is empty and CI on `main` is green.
 10. Merge the release pull request.
 11. Run the `GitHub prerelease` workflow manually against the exact `main`
-    commit. Download its candidate artifacts and checksums, extract and run the
-    x86_64 archive in a clean Debian LXC, and install the wheel in a clean
-    Python 3.11 environment. A manual run never creates a GitHub release.
+    commit. Confirm all five native build/test/archive jobs and the Python 3.11
+    and 3.13 wheel-smoke matrix pass. Download the candidate, verify its exact
+    seven-payload manifest and checksums, extract and run the x86_64 Linux
+    archive in a clean Debian LXC, and install the wheel in a clean Python 3.11
+    environment. A manual run never creates a GitHub release.
 12. Create and push a GitHub-verifiable signed annotated tag without moving any
     existing tag:
 

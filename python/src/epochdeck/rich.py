@@ -16,6 +16,7 @@ from typing import Any, BinaryIO
 
 from epochdeck._json_normalization import normalize_json_value
 from epochdeck._limits import MAX_SAFE_INTEGER
+from epochdeck._platform_fs import sync_directory, verify_directory
 from epochdeck._protocol import validate_blob_file_name
 
 _COPY_CHUNK_BYTES = 1024 * 1024
@@ -369,15 +370,11 @@ def _install_temporary(blob_root: Path, temporary_path: Path, digest: str) -> No
 
 def _ensure_private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.chmod(0o700)
+    verify_directory(path, private_mode=0o700)
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(path)
 
 
 def _json_bytes(value: Any) -> bytes:

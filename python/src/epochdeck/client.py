@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -48,11 +49,12 @@ class EpochDeckClient:
         timeout: float = 10.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self.server_url = server_url.rstrip("/")
+        self.server_url = _normalize_server_url(server_url)
         self._client = httpx.Client(
             base_url=self.server_url,
             timeout=timeout,
             transport=transport,
+            auth=_http_basic_auth_from_environment(),
         )
 
     def __enter__(self) -> EpochDeckClient:
@@ -691,6 +693,27 @@ class EpochDeckClient:
                 str(payload.get("code", "http_error")),
                 str(payload.get("message", response.reason_phrase)),
             )
+
+
+def _normalize_server_url(server_url: str) -> str:
+    normalized = server_url.rstrip("/")
+    if httpx.URL(normalized).userinfo:
+        raise ValueError(
+            "server_url must not contain credentials; use EPOCHDECK_HTTP_USERNAME and "
+            "EPOCHDECK_HTTP_PASSWORD"
+        )
+    return normalized
+
+
+def _http_basic_auth_from_environment() -> httpx.BasicAuth | None:
+    username = os.environ.get("EPOCHDECK_HTTP_USERNAME")
+    password = os.environ.get("EPOCHDECK_HTTP_PASSWORD")
+    if (username is None) != (password is None):
+        raise ValueError("EPOCHDECK_HTTP_USERNAME and EPOCHDECK_HTTP_PASSWORD must be set together")
+    if username is None:
+        return None
+    assert password is not None
+    return httpx.BasicAuth(username, password)
 
 
 def _cursor_params(before: str | None, limit: int) -> dict[str, str | int]:

@@ -54,8 +54,10 @@ new, unregistered output.
 The hard-link installation requires temporary and final segment files to live
 on the same filesystem, which the dedicated staging directory guarantees
 without scattering hidden temporary files through final segment trees. Bounded
-striped locking can reduce ingestion parallelism for colliding run IDs, but
-avoids an unbounded per-run lock map.
+startup probes reject a metric or blob filesystem that cannot provide this
+no-replace primitive; EpochDeck does not silently weaken publication to a copy
+or overwriting rename. Striped locking can reduce ingestion parallelism for
+colliding run IDs, but avoids an unbounded per-run lock map.
 
 ## Rejected alternatives
 

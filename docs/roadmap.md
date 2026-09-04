@@ -61,6 +61,8 @@ or operational acceptance criteria for that contract.
 ## Milestone 5: production operations
 
 - [x] Single-binary build with embedded dashboard.
-- [x] Tailnet-only deployment and systemd documentation.
+- [x] Native Linux, macOS, and Windows release builds and smoke tests.
+- [x] Loopback deployment behind an authenticated HTTPS reverse proxy and
+      systemd documentation.
 - [x] Coordinated catalog, segments, and blob backup/restore.
 - [x] Slow-query diagnostics, bounded telemetry, and disposable pre-alpha storage operations.

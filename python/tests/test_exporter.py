@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import httpx
@@ -171,9 +172,10 @@ def test_export_project_streams_all_current_resources_and_deduplicates_blobs(
     with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
         manifest = export_project(client, "demo", destination)
 
-    assert destination.stat().st_mode & 0o777 == 0o700
-    for path in destination.rglob("*"):
-        assert path.stat().st_mode & 0o777 == (0o700 if path.is_dir() else 0o600)
+    if os.name != "nt":
+        assert destination.stat().st_mode & 0o777 == 0o700
+        for path in destination.rglob("*"):
+            assert path.stat().st_mode & 0o777 == (0o700 if path.is_dir() else 0o600)
     assert publish_events == ["sync-tree", "rename", "fsync-parent"]
     assert manifest["counts"] == {
         "alerts": 0,

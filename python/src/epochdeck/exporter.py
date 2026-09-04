@@ -12,6 +12,11 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from epochdeck._pagination import next_paired_cursor, next_text_cursor
+from epochdeck._platform_fs import (
+    is_link_or_reparse,
+    open_regular_file_descriptor,
+    sync_directory,
+)
 from epochdeck.client import EpochDeckClient
 
 _PAGE_SIZE = 200
@@ -19,8 +24,6 @@ _HISTORY_PAGE_SIZE = 5_000
 _METRIC_COLUMNS_PER_FILE = 32
 _COPY_CHUNK_BYTES = 1024 * 1024
 _MAX_EXPORT_TREE_DEPTH = 128
-_NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
 class ExportConsistencyError(RuntimeError):
@@ -483,18 +486,17 @@ def _sync_private_tree(root: Path, *, depth: int = 0) -> None:
     with os.scandir(root) as entries:
         for entry in entries:
             path = Path(entry.path)
-            if entry.is_symlink():
+            status = entry.stat(follow_symlinks=False)
+            if is_link_or_reparse(status):
                 raise RuntimeError(f"export tree contains a symbolic link: {path}")
-            if entry.is_dir(follow_symlinks=False):
+            if stat.S_ISDIR(status.st_mode):
                 _sync_private_tree(path, depth=depth + 1)
                 continue
-            if not entry.is_file(follow_symlinks=False):
+            if not stat.S_ISREG(status.st_mode):
                 raise RuntimeError(f"export tree contains a non-regular file: {path}")
             path.chmod(0o600)
-            descriptor = os.open(path, os.O_RDONLY | _NO_FOLLOW)
+            descriptor = open_regular_file_descriptor(path, os.O_RDONLY)
             try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    raise RuntimeError(f"export tree contains a non-regular file: {path}")
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
@@ -506,8 +508,4 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _fsync_directory_descriptor(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | _DIRECTORY | _NO_FOLLOW)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(path)

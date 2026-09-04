@@ -23,6 +23,50 @@ def test_health_decodes_protocol_response() -> None:
     assert health.status == "healthy"
 
 
+def test_http_basic_auth_from_environment_works_with_mock_transport(monkeypatch) -> None:
+    monkeypatch.setenv("EPOCHDECK_HTTP_USERNAME", "proxy-user")
+    monkeypatch.setenv("EPOCHDECK_HTTP_PASSWORD", "proxy-password")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Basic cHJveHktdXNlcjpwcm94eS1wYXNzd29yZA=="
+        return httpx.Response(
+            200,
+            json={"service": "epochdeck", "version": "0.1.0", "status": "healthy"},
+        )
+
+    with EpochDeckClient(
+        "https://epochdeck.test",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        assert client.server_url == "https://epochdeck.test"
+        client.health()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("EPOCHDECK_HTTP_USERNAME", "proxy-user"),
+        ("EPOCHDECK_HTTP_PASSWORD", "proxy-password"),
+    ],
+)
+def test_http_basic_auth_rejects_partial_environment(
+    monkeypatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.delenv("EPOCHDECK_HTTP_USERNAME", raising=False)
+    monkeypatch.delenv("EPOCHDECK_HTTP_PASSWORD", raising=False)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match="must be set together"):
+        EpochDeckClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+
+
+def test_server_url_rejects_embedded_credentials() -> None:
+    with pytest.raises(ValueError, match="server_url must not contain credentials"):
+        EpochDeckClient("https://proxy-user:proxy-password@epochdeck.test")
+
+
 def test_project_detail_validates_identity_and_opaque_mutation_token() -> None:
     responses = iter(
         [

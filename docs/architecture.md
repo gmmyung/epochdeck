@@ -12,8 +12,8 @@ the internal storage model.
 
 ## Goals
 
-EpochDeck targets a single self-hosted machine with a fast SSD and a large HDD or
-ZFS pool. It must:
+EpochDeck targets one self-hosted machine with independently configurable data,
+metric, and blob filesystem roots. It must:
 
 - retain complete histories without a storage quota;
 - keep query memory bounded independently of run length;
@@ -30,9 +30,10 @@ ZFS pool. It must:
 The server owns ingestion, query scheduling, catalog transactions, storage
 manifests, and HTTP delivery. Tokio and Axum provide the runtime and HTTP
 boundary. CPU-heavy encoding and query work runs in bounded worker pools rather
-than on async executor threads. Application-level multi-user authentication is
-not implemented yet; current deployment relies on its trusted-interface or
-Tailnet boundary.
+than on async executor threads. Native application authentication and multi-user
+authorization are not implemented. The EpochDeck HTTP server binds to loopback;
+an authenticated HTTPS reverse proxy terminates TLS and enforces access control
+at the external boundary. The server port must never be exposed directly.
 
 The `embedded-dashboard` production feature packages the built dashboard into
 the server binary. Single-node operation requires no external database, queue,
@@ -88,10 +89,18 @@ server writes each batch to an owned temporary Parquet file under
 `EPOCHDECK_METRICS_DIR/staging`, syncs it, installs it with an atomic no-replace
 operation, and then commits its SQLite manifest. The staging directory is on
 the same filesystem as final segments, so hard-link installation remains
-atomic. RAII removes temporary files on ordinary errors and cancellation; the
-exclusive server startup path removes crash leftovers before accepting work. A
-client retry after a crash therefore either installs the missing batch or
-receives the same duplicate acknowledgement.
+atomic. Startup proves that both the metric and blob roots support this
+same-filesystem, no-replace hard-link operation and fails explicitly when the
+filesystem cannot provide it. RAII removes temporary files on ordinary errors
+and cancellation; the exclusive server startup path removes crash leftovers
+before accepting work. A client retry after a crash therefore either installs
+the missing batch or receives the same duplicate acknowledgement.
+
+Published files are flushed after installation. Unix hosts then fsync the
+parent directory. Windows reopens the file with write access before
+`FlushFileBuffers`; because Windows has no portable directory-fsync equivalent,
+the parent is validated as a directory and the flushed file and its metadata
+form that platform's publication boundary.
 
 Parquet provides typed values, compression, column projection, row-group
 statistics, immutable snapshot-friendly files, and one metric name per column
@@ -279,15 +288,19 @@ EPOCHDECK_BLOBS_DIR/
   staging/
 ```
 
-The data and metric roots belong on SSD. The blob root can be a bind-mounted ZFS
-dataset on high-capacity disks.
+The data, metric, and blob roots are independently configurable and may share a
+parent or use separate filesystems, subject to the path constraints below.
+The metric and blob filesystems must support hard links within each root; they
+do not need to support links between roots.
 
 The SQLite catalog has one current disposable pre-alpha definition. It carries
 no internal generation marker or upgrade logic; a storage-definition change is
 deployed by archiving the complete old root set and starting with empty roots.
 
 After creating the directories, startup resolves symlinks and validates their
-canonical paths. Metric and blob roots must be disjoint: neither may equal or
+canonical paths. It also creates, links, flushes, and removes a bounded probe in
+each immutable-file root before accepting requests. Metric and blob roots must
+be disjoint: neither may equal or
 contain the other. The data root may be a strict ancestor of either root (the
 default layout), but it may not equal or live inside the metric or blob root.
 This prevents staging, segment, CAS, lock, and catalog namespaces from mixing.

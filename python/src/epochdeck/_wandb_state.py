@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import threading
@@ -10,6 +9,14 @@ from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+
+from epochdeck._platform_fs import (
+    FileLockUnavailable,
+    acquire_file_lock,
+    open_regular_file_descriptor,
+    release_file_lock,
+    sync_directory,
+)
 
 _MAX_IMPORT_RUNS = 100_000
 _MAX_CHECKPOINT_BYTES = 64 * 1024 * 1024
@@ -51,21 +58,24 @@ def checkpoint_process_lock(path: Path) -> Iterator[None]:
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     lock_path = checkpoint.with_name(f"{checkpoint.name}.lock")
     try:
-        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(descriptor, 0o600)
+        descriptor = open_regular_file_descriptor(
+            lock_path,
+            os.O_RDWR | os.O_CREAT,
+            private_mode=0o600,
+        )
     except OSError as error:
         raise WandbImportError(f"cannot open W&B import checkpoint lock: {lock_path}") from error
     try:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
+            acquire_file_lock(descriptor)
+        except FileLockUnavailable as error:
             raise WandbImportError(
                 f"another W&B import is using checkpoint {checkpoint}"
             ) from error
         try:
             yield
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            release_file_lock(descriptor)
     finally:
         os.close(descriptor)
 
@@ -220,7 +230,11 @@ class Checkpoint:
         if len(header) + len(snapshot) > _MAX_CHECKPOINT_BYTES:
             raise WandbImportError("checkpoint exceeds the 64 MiB safety limit")
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4()}.tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = open_regular_file_descriptor(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            private_mode=0o600,
+        )
         try:
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(header)
@@ -245,8 +259,4 @@ def _checkpoint_line(value: dict[str, Any]) -> bytes:
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(path)

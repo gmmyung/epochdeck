@@ -1,14 +1,15 @@
 # ADR 0001: Independent single-node columnar architecture
 
-- Status: Accepted
+- Status: Accepted; deployment boundary superseded by ADR 0016
 - Date: 2026-08-28
 
 ## Context
 
 EpochDeck needs W&B-compatible behavior without inheriting a row-oriented storage
-model or third-party hosting integrations. The target deployment is a trusted,
-Tailnet-only server with local SSD and ZFS storage. A distributed control plane
-would add operational cost without solving the primary query problem.
+model or third-party hosting integrations. The original target deployment was a
+trusted, Tailnet-only server with independently configured local storage roots.
+A distributed control plane would add operational cost without solving the
+primary query problem. ADR 0016 replaces the Tailnet-specific access boundary.
 
 ## Decision
 
@@ -34,8 +35,8 @@ authentication, storage, protocol, and dashboard.
 ## Consequences
 
 The system can retain raw data while bounding dashboard work. Immutable
-segments make backup and recovery straightforward, and independent roots support
-SSD metrics plus HDD blobs.
+segments make backup and recovery straightforward, and independent roots let an
+operator choose storage appropriate to each workload.
 
 Parquet is not appendable, so EpochDeck needs a journal, atomic segment manifests,
 and background compaction. Dynamic metric schemas require signature-aware
@@ -56,7 +57,7 @@ automatically provide efficient wide time-series projection.
 ### ClickHouse
 
 ClickHouse is capable but operationally disproportionate for the initial
-single-user Tailnet deployment.
+single-user deployment.
 
 ### Python server
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import threading
 import time
 from collections.abc import Iterator, Mapping
@@ -1369,7 +1370,8 @@ def test_wandb_history_page_and_checkpoint_writes_are_bounded(tmp_path) -> None:
     checkpoint.update("run-1", rows_committed=20)
 
     assert initial_size < first_update_size < path.stat().st_size
-    assert path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
     assert checkpoint.state("run-1")["rows_committed"] == 20
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert [record["type"] for record in records] == [
