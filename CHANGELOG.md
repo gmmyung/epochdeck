@@ -11,7 +11,7 @@ so storage and APIs may change without migration or compatibility shims.
   `EPOCHDECK_HTTP_USERNAME` and `EPOCHDECK_HTTP_PASSWORD` environment variables;
   credentials are rejected in server URLs and never enter the durable spool.
 - GitHub prereleases build and smoke-test server archives natively for Linux
-  x86_64/ARM64, macOS Intel/Apple Silicon, and Windows x86_64.
+  x86_64/ARM64, Apple Silicon macOS, and Windows x86_64.
 
 ### Changed
 

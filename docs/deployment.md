@@ -28,7 +28,6 @@ the matching operating system and architecture.
 | --- | --- |
 | Linux x86_64 | `x86_64-unknown-linux-musl.tar.gz` |
 | Linux ARM64 | `aarch64-unknown-linux-musl.tar.gz` |
-| Intel macOS | `x86_64-apple-darwin.zip` |
 | Apple Silicon macOS | `aarch64-apple-darwin.zip` |
 | Windows x86_64 | `x86_64-pc-windows-msvc.zip` |
 

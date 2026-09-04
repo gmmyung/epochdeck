@@ -4,11 +4,10 @@ EpochDeck releases are explicit GitHub prereleases. The workflow attaches
 native server archives for Linux, macOS, and Windows, a Python wheel and source
 distribution, and `SHA256SUMS`. It does not publish to PyPI, crates.io, or npm.
 
-The five server builds use ordinary Cargo on matching GitHub-hosted runners:
+The four server builds use ordinary Cargo on matching GitHub-hosted runners:
 
 - `x86_64-unknown-linux-musl` on `ubuntu-24.04`
 - `aarch64-unknown-linux-musl` on `ubuntu-24.04-arm`
-- `x86_64-apple-darwin` on `macos-15-intel`
 - `aarch64-apple-darwin` on `macos-15`
 - `x86_64-pc-windows-msvc` on `windows-2022`
 
@@ -66,9 +65,9 @@ includes the checked `THIRD_PARTY_NOTICES.txt` beside the binary.
 9. Confirm `git status --short` is empty and CI on `main` is green.
 10. Merge the release pull request.
 11. Run the `GitHub prerelease` workflow manually against the exact `main`
-    commit. Confirm all five native build/test/archive jobs and the Python 3.11
+    commit. Confirm all four native build/test/archive jobs and the Python 3.11
     and 3.13 wheel-smoke matrix pass. Download the candidate, verify its exact
-    seven-payload manifest and checksums, extract and run the x86_64 Linux
+    six-payload manifest and checksums, extract and run the x86_64 Linux
     archive in a clean Debian LXC, and install the wheel in a clean Python 3.11
     environment. A manual run never creates a GitHub release.
 12. Create and push a GitHub-verifiable signed annotated tag without moving any

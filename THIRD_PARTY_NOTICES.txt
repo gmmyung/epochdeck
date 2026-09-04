@@ -8,8 +8,8 @@ Scope
 -----
 
 - The non-development Cargo dependency closure of epochdeck-server with the
-  embedded-dashboard feature for the five native release targets:
-  Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64.
+  embedded-dashboard feature for the four native release targets:
+  Linux x86_64/aarch64, macOS aarch64, and Windows x86_64.
   Build dependencies are included conservatively.
 - Production dependencies reported by pnpm for the embedded dashboard.
 - Vite, Rollup, and esbuild as an explicit bounded set of production
@@ -37,9 +37,9 @@ Locked input fingerprints:
 - web/pnpm-lock.yaml: f0232a7042ffb7d4df4a154de497bd23717bf7b4a1f4355663bde60e4e6e9c38
 - web/svelte.config.js: 26cd0f1e700b93a5a07bb8a6e61da361ac8a3b19eb34a8e4eafbd9f8fcf9a2f6
 - web/vite.config.ts: 60cd1c65988dc6621f265b9d04c71e504228ccdfbea415dcd6f1689286e93f27
-- .github/workflows/prerelease.yml: 781b9605b7c8f72553fe8e916c0d6a52d195591dcd85ca06e12591f6059b40f5
+- .github/workflows/prerelease.yml: f38fa759d8e6caee537c862f549ebc230647159e74950e59aaabf1e744c568e4
 - third_party/license-overrides.json: b541d5747f63855112c788b5bdb6564d273f7b780ab78f476727f06c55c28eee
-- third_party/release-toolchain.json: a921ea72927c1c743a9e6713ca3302362d2ffce432dabe09f836893b3ea49d5c
+- third_party/release-toolchain.json: e8c9b4722cc49df6bf803b3493e03ec6a2596769d748f61ea38c799c42ebfb04
 
 DEPENDENCY INDEX
 ================
@@ -1957,7 +1957,7 @@ Pinned release toolchain and runtime (4)
 - Rust standard library and runtime 1.85.0 (4d91de4e48198da2e33413efdcd9cd2cc0c46688)
   License expression: MIT OR Apache-2.0, with bundled-component terms recorded in COPYRIGHT
   Source: https://github.com/rust-lang/rust/tree/4d91de4e48198da2e33413efdcd9cd2cc0c46688/library
-  Coverage rationale: covers linked core, alloc, std, panic runtime, compiler-builtins, and the official Rust distribution's bundled third-party notices across the five native release targets
+  Coverage rationale: covers linked core, alloc, std, panic runtime, compiler-builtins, and the official Rust distribution's bundled third-party notices across the four native release targets
   License documents:
     - rust-1.85.0/COPYRIGHT (SHA-256: 252b04f034f7383e09401dc700c8b933e3e38818eaa8b2f09dd247542be92292)
     - rust-1.85.0/LICENSE-APACHE (SHA-256: 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a)

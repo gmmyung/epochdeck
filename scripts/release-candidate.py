@@ -14,7 +14,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER_ARTIFACTS = (
     ("x86_64-unknown-linux-musl", "tar.gz"),
     ("aarch64-unknown-linux-musl", "tar.gz"),
-    ("x86_64-apple-darwin", "zip"),
     ("aarch64-apple-darwin", "zip"),
     ("x86_64-pc-windows-msvc", "zip"),
 )

@@ -22,7 +22,6 @@ matching GitHub-hosted runner for each supported target:
 
 - `x86_64-unknown-linux-musl` on x86_64 Linux;
 - `aarch64-unknown-linux-musl` on ARM64 Linux;
-- `x86_64-apple-darwin` on Intel macOS;
 - `aarch64-apple-darwin` on Apple Silicon macOS; and
 - `x86_64-pc-windows-msvc` on x86_64 Windows.
 
@@ -47,7 +46,7 @@ authority.
 
 ## Consequences
 
-The release takes more runner time and has five independently failing build
+The release takes more runner time and has four independently failing build
 jobs. In return, architecture, dynamic-link, filesystem, process, dashboard,
 and packaging mistakes fail on their native platform before publication.
 

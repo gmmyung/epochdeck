@@ -13,7 +13,6 @@ EXPECTED_FORMATS = {
     "aarch64-unknown-linux-musl": ("ELF", 183),
     "x86_64-unknown-linux-musl": ("ELF", 62),
     "aarch64-apple-darwin": ("Mach-O", 0x0100000C),
-    "x86_64-apple-darwin": ("Mach-O", 0x01000007),
     "x86_64-pc-windows-msvc": ("PE", 0x8664),
 }
 

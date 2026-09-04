@@ -28,14 +28,12 @@ INSTALLED_PNPM_LOCK = ROOT / "web" / "node_modules" / ".pnpm" / "lock.yaml"
 RUST_TARGETS = (
     "aarch64-apple-darwin",
     "aarch64-unknown-linux-musl",
-    "x86_64-apple-darwin",
     "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-musl",
 )
 EXPECTED_WORKFLOW_RUNNERS = {
     "aarch64-apple-darwin": "macos-15",
     "aarch64-unknown-linux-musl": "ubuntu-24.04-arm",
-    "x86_64-apple-darwin": "macos-15-intel",
     "x86_64-pc-windows-msvc": "windows-2022",
     "x86_64-unknown-linux-musl": "ubuntu-24.04",
 }
@@ -1012,8 +1010,8 @@ def _render(dependencies: Iterable[Dependency]) -> str:
         "-----",
         "",
         "- The non-development Cargo dependency closure of epochdeck-server with the",
-        "  embedded-dashboard feature for the five native release targets:",
-        "  Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64.",
+        "  embedded-dashboard feature for the four native release targets:",
+        "  Linux x86_64/aarch64, macOS aarch64, and Windows x86_64.",
         "  Build dependencies are included conservatively.",
         "- Production dependencies reported by pnpm for the embedded dashboard.",
         "- Vite, Rollup, and esbuild as an explicit bounded set of production",

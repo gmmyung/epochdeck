@@ -57,7 +57,7 @@ can replay unacknowledged work.
 ## Install a prerelease
 
 GitHub prereleases include native server archives for Linux x86_64/ARM64,
-macOS Intel/Apple Silicon, and Windows x86_64, plus a Python wheel, source
+Apple Silicon macOS, and Windows x86_64, plus a Python wheel, source
 distribution, and `SHA256SUMS`. Linux archives are static musl builds; every
 server is built and smoke-tested with ordinary Cargo on its target platform.
 

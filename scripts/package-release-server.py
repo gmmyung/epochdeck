@@ -26,10 +26,7 @@ LINUX_TARGETS = {
     "aarch64-unknown-linux-musl",
     "x86_64-unknown-linux-musl",
 }
-MACOS_TARGETS = {
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-}
+MACOS_TARGETS = {"aarch64-apple-darwin"}
 WINDOWS_TARGETS = {"x86_64-pc-windows-msvc"}
 SUPPORTED_TARGETS = LINUX_TARGETS | MACOS_TARGETS | WINDOWS_TARGETS
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+-(?:alpha|beta|rc)\.[0-9]+$")

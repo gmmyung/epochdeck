@@ -3,7 +3,6 @@
   "targets": [
     "aarch64-apple-darwin",
     "aarch64-unknown-linux-musl",
-    "x86_64-apple-darwin",
     "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-musl"
   ],
@@ -37,7 +36,7 @@
       "version": "1.85.0 (4d91de4e48198da2e33413efdcd9cd2cc0c46688)",
       "license_expression": "MIT OR Apache-2.0, with bundled-component terms recorded in COPYRIGHT",
       "source": "https://github.com/rust-lang/rust/tree/4d91de4e48198da2e33413efdcd9cd2cc0c46688/library",
-      "coverage": "covers linked core, alloc, std, panic runtime, compiler-builtins, and the official Rust distribution's bundled third-party notices across the five native release targets",
+      "coverage": "covers linked core, alloc, std, panic runtime, compiler-builtins, and the official Rust distribution's bundled third-party notices across the four native release targets",
       "documents": [
         {
           "path": "rust-1.85.0/COPYRIGHT",

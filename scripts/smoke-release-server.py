@@ -29,7 +29,6 @@ COMMAND_TIMEOUT_SECONDS = 15
 TARGET_ARCHIVES = {
     "aarch64-apple-darwin": ("zip", "epochdeck-server"),
     "aarch64-unknown-linux-musl": ("tar.gz", "epochdeck-server"),
-    "x86_64-apple-darwin": ("zip", "epochdeck-server"),
     "x86_64-pc-windows-msvc": ("zip", "epochdeck-server.exe"),
     "x86_64-unknown-linux-musl": ("tar.gz", "epochdeck-server"),
 }

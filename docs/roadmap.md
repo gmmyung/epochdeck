@@ -61,7 +61,8 @@ or operational acceptance criteria for that contract.
 ## Milestone 5: production operations
 
 - [x] Single-binary build with embedded dashboard.
-- [x] Native Linux, macOS, and Windows release builds and smoke tests.
+- [x] Native Linux x86_64/ARM64, Apple Silicon macOS, and Windows x86_64
+      release builds and smoke tests.
 - [x] Loopback deployment behind an authenticated HTTPS reverse proxy and
       systemd documentation.
 - [x] Coordinated catalog, segments, and blob backup/restore.
