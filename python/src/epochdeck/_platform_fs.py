@@ -125,6 +125,10 @@ def open_regular_file_descriptor(
     if before is not None and is_link_or_reparse(before):
         raise OSError(errno.ELOOP, "file is a symbolic link or reparse point", path)
 
+    # Windows fchmod (available since Python 3.13) needs a writable handle even
+    # when the caller only reads the contents after applying the private mode.
+    if IS_WINDOWS and private_mode is not None and flags & ACCESS_MODE == os.O_RDONLY:
+        flags = (flags & ~ACCESS_MODE) | os.O_RDWR
     descriptor = os.open(path, flags | NO_FOLLOW | _BINARY, create_mode)
     try:
         opened = os.fstat(descriptor)

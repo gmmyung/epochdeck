@@ -91,13 +91,14 @@ jobs:
           --package epochdeck-storage --package epochdeck-server
 
   native-python-portability:
-    name: Native Python on ${{ matrix.runner }}
+    name: Native Python ${{ matrix.python }} on ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         runner: [macos-15, windows-2022]
+        python: ["3.11", "3.13"]
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -110,4 +111,4 @@ jobs:
           cache-dependency-glob: python/uv.lock
 
       - name: Test the locked Python SDK
-        run: uv run --project python --python 3.11 --locked pytest
+        run: uv run --project python --python "${{ matrix.python }}" --locked pytest
