@@ -39,3 +39,24 @@ resume_tail_seconds=0.000 sequence=200000 step=199999
 This is a development measurement, not a cross-machine performance guarantee.
 Future benchmark gates will cover concurrent ingestion/query load, resident
 memory, cold-cache reads, and the 2-core/2-GiB deployment target.
+
+## SDK journal recovery
+
+```bash
+just benchmark-spool 200000 180
+```
+
+This prepares a long, wide metric journal one record at a time and appends an
+incomplete 64 KiB tail. It measures exclusive reopen, tail repair, and retrieval
+of the last complete record, reporting elapsed time and peak traced Python
+allocations. Setup is excluded from the measurement and temporary data stays
+under `target/` until cleanup. Compare multiple row counts to detect recovery
+memory growing with history length. The result is not a resident-memory or
+network-delivery benchmark.
+
+Local alpha 2 smoke measurements (180 metrics per row):
+
+| Rows | Journal size | Recovery | Peak traced Python allocations |
+| ---- | ------------ | -------- | ------------------------------ |
+| 1,000 | 4.16 MiB | 16.8 ms | 2.02 MiB |
+| 200,000 | 833.19 MiB | 17.8 ms | 2.02 MiB |

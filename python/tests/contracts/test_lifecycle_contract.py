@@ -149,7 +149,6 @@ class ContractServer:
                 "accepted_points": len(body["points"]),
                 "duplicate": duplicate,
                 "metric_revision": len(run["batches"]),
-                "stop_requested": False,
             },
         )
 
@@ -256,7 +255,7 @@ def test_offline_restart_restores_spool_state_and_policies(tmp_path) -> None:
     )
     first.summary["status"] = "recovered"
     first.log({"loss": 2.0}, step=5)
-    del first
+    first.close()
 
     with pytest.raises(DeliveryError, match="spool already exists"):
         create_run(
@@ -394,6 +393,7 @@ def test_restart_recovers_a_lost_finish_response(tmp_path) -> None:
     assert interrupted_metadata["finishing"] is True
     assert interrupted_metadata["finished"] is False
 
+    run.close()
     recovered = create_run(
         project="contract",
         run_id=run_id,

@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 from platformdirs import user_data_path
 
+from epochdeck._delivery import _DeliveryWorker
 from epochdeck._ids import uuid7
 from epochdeck._json_normalization import normalize_json_object
 from epochdeck._limits import MAX_SAFE_INTEGER
@@ -40,14 +41,9 @@ _MAX_RICH_VALUES_PER_LOG = 256
 _DEFAULT_SYSTEM_METRIC_INTERVAL = 15.0
 _MAX_ALERT_TITLE_BYTES = 256
 _MAX_ALERT_TEXT_BYTES = 4_096
-_MAX_METRIC_REQUEST_BYTES = 1_750_000
 _SUMMARY_CHECKPOINT_RECORD_INTERVAL = 128
 _SUMMARY_CHECKPOINT_BYTE_INTERVAL = 512 * 1024
 _SUMMARY_RECOVERY_MAX_TAIL_BYTES = _SUMMARY_CHECKPOINT_BYTE_INTERVAL + 2 * 1024 * 1024 + 1
-
-
-class SweepEarlyStop(RuntimeError):
-    pass
 
 
 class _RunDocument(Mapping[str, Any]):
@@ -151,136 +147,6 @@ class RunSummary(_RunDocument):
                     self._data[key] = value
 
 
-class _DeliveryWorker(threading.Thread):
-    def __init__(
-        self,
-        *,
-        client: EpochDeckClient,
-        run_id: str,
-        spool: _Spool,
-        batch_size: int,
-        flush_interval: float,
-        stop_requested: Callable[[], None],
-    ) -> None:
-        super().__init__(name=f"epochdeck-{run_id[:8]}", daemon=True)
-        self._client = client
-        self._run_id = run_id
-        self._spool = spool
-        self._batch_size = batch_size
-        self._flush_interval = flush_interval
-        self._stop_requested = stop_requested
-        self._wake = threading.Event()
-        self._stopping = threading.Event()
-        self._cancelled = threading.Event()
-        self._delivery_cursor = 0
-        self.last_error: Exception | None = None
-
-    def notify(self) -> None:
-        self._wake.set()
-
-    def stop(self) -> None:
-        self._stopping.set()
-        self._wake.set()
-
-    def cancel(self) -> None:
-        self._cancelled.set()
-        self._wake.set()
-
-    def run(self) -> None:
-        retry_delay = 0.25
-        while True:
-            if self._cancelled.is_set():
-                return
-            if not self._spool.pending():
-                if self._stopping.is_set():
-                    return
-                self._wake.wait()
-                self._wake.clear()
-                if not self._stopping.is_set():
-                    time.sleep(self._flush_interval)
-            try:
-                delivery = self._next_delivery()
-                if delivery is None:
-                    continue
-                delivery()
-            except Exception as error:  # The durable journal remains authoritative.
-                self.last_error = error
-                self._wake.wait(retry_delay)
-                self._wake.clear()
-                if self._cancelled.is_set():
-                    return
-                retry_delay = min(retry_delay * 2, 5.0)
-            else:
-                self.last_error = None
-                retry_delay = 0.25
-
-    def _deliver_alert(self) -> None:
-        alert, next_offset = self._spool.read_alert()
-        if alert is None:
-            return
-        self._client.create_alert(self._run_id, alert)
-        self._spool.acknowledge_alert(next_offset)
-
-    def _deliver_rich_value(self) -> None:
-        value, next_offset = self._spool.read_rich_value()
-        if value is None:
-            return
-        blob = value.get("blob")
-        if blob is not None:
-            self._upload_blob(blob)
-        self._client.create_rich_value(self._run_id, value)
-        self._spool.acknowledge_rich_value(next_offset)
-
-    def _deliver_artifact(self) -> None:
-        artifact, next_offset = self._spool.read_artifact()
-        if artifact is None:
-            return
-        operation = artifact.pop("operation", None)
-        if operation == "create":
-            for entry in artifact["entries"]:
-                self._upload_blob(entry["blob"])
-            self._client.create_artifact(self._run_id, artifact)
-        elif operation == "use":
-            self._client.use_artifact(self._run_id, str(artifact["artifact_id"]))
-        else:
-            raise DeliveryError("artifact journal has an unknown operation")
-        self._spool.acknowledge_artifact(next_offset)
-
-    def _deliver_metrics(self) -> None:
-        points, next_offset = self._spool.read_batch(
-            self._batch_size,
-            request_byte_budget=_MAX_METRIC_REQUEST_BYTES,
-        )
-        if not points:
-            return
-        request = {"batch_sequence": points[0]["sequence"], "points": points}
-        response = self._client.ingest_batch(self._run_id, request)
-        if response.get("stop_requested") is True:
-            self._stop_requested()
-        self._spool.acknowledge(next_offset)
-
-    def _upload_blob(self, blob: dict[str, Any]) -> None:
-        self._client.upload_blob(
-            self._spool.blob_path(str(blob["digest"])),
-            blob,
-        )
-
-    def _next_delivery(self) -> Callable[[], None] | None:
-        deliveries = (
-            (self._spool.pending_metrics, self._deliver_metrics),
-            (self._spool.pending_rich_values, self._deliver_rich_value),
-            (self._spool.pending_artifacts, self._deliver_artifact),
-            (self._spool.pending_alerts, self._deliver_alert),
-        )
-        for offset in range(len(deliveries)):
-            index = (self._delivery_cursor + offset) % len(deliveries)
-            pending, deliver = deliveries[index]
-            if pending():
-                self._delivery_cursor = (index + 1) % len(deliveries)
-                return deliver
-        return None
-
-
 class Run:
     def __init__(
         self,
@@ -298,13 +164,12 @@ class Run:
         system_monitor_interval: float | None = _DEFAULT_SYSTEM_METRIC_INTERVAL,
         system_sampler: Callable[[], Mapping[str, float]] | None = None,
         transport: Any = None,
-        sweep_trial_id: str | None = None,
     ) -> None:
         run_id = _canonical_run_id(run_id)
         batch_size = _validate_batch_size(batch_size, "batch_size")
         server_url = _normalize_server_url(server_url)
-        if flush_interval < 0:
-            raise ValueError("flush_interval cannot be negative")
+        if not math.isfinite(flush_interval) or flush_interval < 0:
+            raise ValueError("flush_interval must be finite and nonnegative")
         initial_config = _normalize_document(config, "config")
         self.project = project
         self.id = run_id
@@ -314,6 +179,7 @@ class Run:
         self.server_url = server_url
         self._batch_size = batch_size
         self._flush_interval = flush_interval
+        self._closed = False
         self._finished = False
         self._finishing = False
         self._log_lock = threading.Lock()
@@ -325,8 +191,6 @@ class Run:
         self._system_monitor: SystemMonitor | None = None
         self._system_monitor_interval = system_monitor_interval
         self._system_sampler = system_sampler
-        self._sweep_trial_id = sweep_trial_id
-        self._stop_requested = threading.Event()
         self._summary_event_offset = 0
         self._latest_event_offset = 0
         self._summary_tail_records = 0
@@ -350,7 +214,19 @@ class Run:
             self._last_user_step: int | None = None
             return
 
-        self._spool = _Spool(spool_root, run_id)
+        try:
+            self._initialize_spool(spool_root, initial_config, transport)
+        except BaseException as error:
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                error.add_note(f"EpochDeck initialization cleanup failed: {cleanup_error}")
+            raise
+
+    def _initialize_spool(
+        self, spool_root: Path, initial_config: dict[str, Any], transport: Any
+    ) -> None:
+        self._spool = _Spool(spool_root, self.id)
         stored_metadata = self._spool.read_metadata()
         stored_finishing = False
         stored_explicit_summary: dict[str, Any] = {}
@@ -358,7 +234,7 @@ class Run:
         stored_summary_truncated = False
         stored_summary_event_offset = 0
         if stored_metadata is not None:
-            _validate_spool_identity(stored_metadata, project, run_id)
+            _validate_spool_identity(stored_metadata, self.project, self.id)
             (
                 stored_explicit_summary,
                 stored_metric_summary,
@@ -367,7 +243,7 @@ class Run:
             ) = _stored_summary_snapshot(stored_metadata)
             stored_finished = _metadata_flag(stored_metadata, "finished")
             stored_finishing = _metadata_flag(stored_metadata, "finishing")
-            if resume == "never":
+            if self.resume == "never":
                 raise DeliveryError(
                     "run spool already exists; use resume='allow' or 'must': "
                     f"{self._spool.directory}"
@@ -386,12 +262,12 @@ class Run:
             stored_name = stored_metadata.get("name")
             if stored_name is not None and not isinstance(stored_name, str):
                 raise DeliveryError("stored run name must be a string or null")
-            self.name = stored_name if stored_name is not None else name
+            self.name = stored_name if stored_name is not None else self.name
             self._batch_size = _validate_batch_size(
-                stored_metadata.get("batch_size", batch_size),
+                stored_metadata.get("batch_size", self._batch_size),
                 "stored batch_size",
             )
-        elif mode == "offline" and resume == "must":
+        elif self.mode == "offline" and self.resume == "must":
             raise DeliveryError(
                 f"resume='must' requires an existing spool: {self._spool.directory}"
             )
@@ -422,36 +298,34 @@ class Run:
         self._summary_event_offset = recovered_event_offset
         self._latest_event_offset = recovered_event_offset
         metadata = {
-            "project": project,
-            "id": run_id,
+            "project": self.project,
+            "id": self.id,
             "name": self.name,
             "config": self.config.to_dict(),
             "explicit_summary": deepcopy(self._explicit_summary),
             "metric_summary": deepcopy(self._metric_summary),
             "summary_truncated": self._summary_truncated,
             "summary_event_offset": self._summary_event_offset,
-            "resume": resume,
-            "server_url": server_url,
+            "resume": self.resume,
+            "server_url": self.server_url,
             "batch_size": self._batch_size,
-            "sweep_trial_id": sweep_trial_id,
             "finished": False,
             "finishing": stored_finishing,
         }
         self._spool.write_metadata(metadata)
 
-        if mode == "offline":
+        if self.mode == "offline":
             self._start_system_monitor()
             return
 
-        self._client = EpochDeckClient(server_url, transport=transport)
+        self._client = EpochDeckClient(self.server_url, transport=transport)
         try:
             response = self._client.create_run(
-                project=project,
-                run_id=run_id,
+                project=self.project,
+                run_id=self.id,
                 name=self.name,
                 config=self.config.to_dict(),
-                resume=resume,
-                sweep_trial_id=sweep_trial_id,
+                resume=self.resume,
             )
         except EpochDeckApiError as error:
             try:
@@ -461,7 +335,7 @@ class Run:
                     and error.status_code == 409
                     and not self._spool.pending()
                 ):
-                    existing = self._client.get_run(run_id)
+                    existing = self._client.get_run(self.id)
                     (
                         actual_explicit,
                         actual_metric,
@@ -492,7 +366,7 @@ class Run:
                                 "finishing": False,
                             }
                         )
-                        self._finished = True
+                        self._complete()
                         return
             finally:
                 self._client.close()
@@ -540,11 +414,10 @@ class Run:
             )
             self._worker = _DeliveryWorker(
                 client=self._client,
-                run_id=run_id,
+                run_id=self.id,
                 spool=self._spool,
                 batch_size=self._batch_size,
-                flush_interval=flush_interval,
-                stop_requested=self._stop_requested.set,
+                flush_interval=self._flush_interval,
             )
             self._worker.start()
             if self._spool.pending():
@@ -583,10 +456,6 @@ class Run:
         return self._system_monitor.last_error if self._system_monitor is not None else None
 
     @property
-    def should_stop(self) -> bool:
-        return self._stop_requested.is_set()
-
-    @property
     def summary_truncated(self) -> bool:
         return self._summary_truncated
 
@@ -596,10 +465,7 @@ class Run:
     def _complete(self) -> None:
         self._finished = True
         self._finishing = False
-        callback = self._finish_callback
-        self._finish_callback = None
-        if callback is not None:
-            callback(self)
+        self.close()
 
     def _update_config(self, updates: dict[str, Any], allow_val_change: bool) -> None:
         with self._log_lock:
@@ -658,17 +524,15 @@ class Run:
             self._checkpoint_summary()
 
     def _ensure_documents_mutable(self) -> None:
-        if self._finished or self._finishing:
+        if self._closed or self._finished or self._finishing:
             raise RuntimeError(
-                "cannot update config or summary while a run is finishing or finished"
+                "cannot update config or summary while a run is closed, finishing, or finished"
             )
 
     def log(self, data: Mapping[str, Any], *, step: int | None = None) -> None:
         with self._log_lock:
-            if self._finished or self._finishing:
-                raise RuntimeError("cannot log while a run is finishing or finished")
-            if self._stop_requested.is_set():
-                raise SweepEarlyStop("the sweep scheduler requested early termination")
+            if self._closed or self._finished or self._finishing:
+                raise RuntimeError("cannot log while a run is closed, finishing, or finished")
             metrics, rich_values = _flatten_log_values(data)
             if not metrics and not rich_values:
                 raise ValueError("log data contains no supported values")
@@ -717,8 +581,8 @@ class Run:
         level: str = "info",
     ) -> None:
         with self._log_lock:
-            if self._finished or self._finishing:
-                raise RuntimeError("cannot alert while a run is finishing or finished")
+            if self._closed or self._finished or self._finishing:
+                raise RuntimeError("cannot alert while a run is closed, finishing, or finished")
             if self.mode == "disabled":
                 return
             normalized_title, normalized_text, normalized_level = _validate_alert(
@@ -751,8 +615,10 @@ class Run:
         if aliases is not None and not isinstance(aliases, (list, tuple)):
             raise TypeError("artifact aliases must be a list or tuple of strings")
         with self._log_lock:
-            if self._finished or self._finishing:
-                raise RuntimeError("cannot log an artifact while a run is finishing or finished")
+            if self._closed or self._finished or self._finishing:
+                raise RuntimeError(
+                    "cannot log an artifact while a run is closed, finishing, or finished"
+                )
             if self.mode == "disabled":
                 return artifact
             assert self._spool is not None
@@ -765,8 +631,10 @@ class Run:
 
     def use_artifact(self, artifact: Artifact | str) -> str:
         with self._log_lock:
-            if self._finished or self._finishing:
-                raise RuntimeError("cannot use an artifact while a run is finishing or finished")
+            if self._closed or self._finished or self._finishing:
+                raise RuntimeError(
+                    "cannot use an artifact while a run is closed, finishing, or finished"
+                )
             if isinstance(artifact, Artifact):
                 artifact_id = artifact.id
             elif isinstance(artifact, str):
@@ -804,7 +672,7 @@ class Run:
         if not metrics:
             return
         with self._log_lock:
-            if self._finished or self._finishing:
+            if self._closed or self._finished or self._finishing:
                 return
             if self._last_user_step is None:
                 return
@@ -886,7 +754,9 @@ class Run:
         with self._log_lock:
             if self._finished:
                 return
-            if timeout <= 0:
+            if self._closed:
+                raise RuntimeError("cannot finish a closed run; resume it first")
+            if not math.isfinite(timeout) or timeout <= 0:
                 raise ValueError("finish timeout must be positive")
             finish_summary = _normalize_document(summary or {}, "explicit summary")
             self._explicit_summary = _normalize_document(
@@ -940,6 +810,28 @@ class Run:
             )
         self._complete()
 
+    def close(self, *, timeout: float = _DEFAULT_FINISH_TIMEOUT) -> None:
+        """Stop local delivery without finishing the run; durable records can be resumed."""
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("close timeout must be finite and positive")
+        with self._log_lock:
+            self._closed = True
+        deadline = time.monotonic() + timeout
+        self._stop_system_monitor(timeout)
+        if self._worker is not None and self._worker.ident is not None:
+            self._worker.cancel()
+            self._worker.join(max(deadline - time.monotonic(), 0))
+            if self._worker.is_alive():
+                raise DeliveryError("timed out stopping delivery; the spool remains locked")
+        if self._client is not None:
+            self._client.close()
+        if self._spool is not None:
+            self._spool.close()
+        callback = self._finish_callback
+        self._finish_callback = None
+        if callback is not None:
+            callback(self)
+
     def _checkpoint_summary(self, updates: Mapping[str, Any] | None = None) -> None:
         if self._spool is None:
             return
@@ -981,7 +873,6 @@ def create_run(
     system_monitor_interval: float | None = None,
     system_sampler: Callable[[], Mapping[str, float]] | None = None,
     transport: Any = None,
-    sweep_trial_id: str | None = None,
 ) -> Run:
     if mode not in {"online", "offline", "disabled"}:
         raise ValueError("mode must be 'online', 'offline', or 'disabled'")
@@ -1008,7 +899,6 @@ def create_run(
         system_monitor_interval=selected_monitor_interval,
         system_sampler=system_sampler,
         transport=transport,
-        sweep_trial_id=sweep_trial_id,
     )
 
 
@@ -1029,7 +919,7 @@ def sync_spool(
     transport: Any = None,
 ) -> str:
     spool_directory = Path(directory).expanduser().resolve()
-    if timeout <= 0:
+    if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("sync timeout must be positive")
     raw_run_id = spool_directory.name
     try:
@@ -1042,83 +932,88 @@ def sync_spool(
     if not metadata_path.is_file():
         raise DeliveryError(f"offline run metadata was not found: {metadata_path}")
     spool = _Spool(spool_directory.parent, spool_directory.name)
-    metadata = spool.read_metadata()
-    if metadata is None:
-        raise DeliveryError(f"offline run metadata was not found: {spool.metadata_path}")
-    project = metadata.get("project")
-    if not isinstance(project, str) or not project:
-        raise DeliveryError("run spool metadata has no valid project")
-    _validate_spool_identity(metadata, project, run_id)
-    (
-        explicit_summary,
-        metric_summary,
-        summary_truncated,
-        summary_event_offset,
-    ) = _stored_summary_snapshot(metadata)
-    metric_summary, summary_truncated, _ = spool.recover_summary(
-        metric_summary,
-        summary_truncated,
-        summary_event_offset,
-        max_tail_records=_SUMMARY_CHECKPOINT_RECORD_INTERVAL,
-        max_tail_bytes=_SUMMARY_RECOVERY_MAX_TAIL_BYTES,
-    )
-    expected_summary = _summary_view(metric_summary, explicit_summary)
-    finished = _metadata_flag(metadata, "finished")
-    if not finished:
-        raise DeliveryError("sync requires an offline run that has been finished")
-    selected_server = server_url if server_url is not None else metadata.get("server_url")
-    if not isinstance(selected_server, str) or not selected_server:
-        raise DeliveryError("run spool metadata has no valid server URL")
-    client = EpochDeckClient(selected_server, transport=transport)
+    worker: _DeliveryWorker | None = None
     try:
-        try:
-            client.create_run(
-                project=project,
-                run_id=run_id,
-                name=metadata.get("name"),
-                config=_normalize_document(metadata.get("config", {}), "config"),
-                resume="allow",
-                sweep_trial_id=metadata.get("sweep_trial_id"),
-            )
-        except EpochDeckApiError as error:
-            if error.status_code != 409 or not finished:
-                raise
-            existing = client.get_run(run_id)
-            actual_explicit, actual_metric, _ = _server_summary_components(existing)
-            actual_summary = _summary_view(actual_metric, actual_explicit)
-            if existing.get("state") != "finished" or any(
-                actual_summary.get(key) != value for key, value in expected_summary.items()
-            ):
-                raise
-            return run_id
-        worker = _DeliveryWorker(
-            client=client,
-            run_id=run_id,
-            spool=spool,
-            batch_size=_validate_batch_size(
-                metadata.get("batch_size", _DEFAULT_BATCH_SIZE),
-                "stored batch_size",
-            ),
-            flush_interval=0,
-            stop_requested=lambda: None,
-        )
-        worker.start()
-        worker.stop()
-        worker.join(timeout)
-        if worker.is_alive() or spool.pending():
-            worker.cancel()
-            worker.join(1)
-            message = f"timed out syncing undelivered data in {spool_directory}"
-            if worker.last_error is not None:
-                message = f"{message}: {worker.last_error}"
-            raise DeliveryError(message)
-        client.finish_run(
-            run_id,
+        metadata = spool.read_metadata()
+        if metadata is None:
+            raise DeliveryError(f"offline run metadata was not found: {spool.metadata_path}")
+        project = metadata.get("project")
+        if not isinstance(project, str) or not project:
+            raise DeliveryError("run spool metadata has no valid project")
+        _validate_spool_identity(metadata, project, run_id)
+        (
             explicit_summary,
+            metric_summary,
+            summary_truncated,
+            summary_event_offset,
+        ) = _stored_summary_snapshot(metadata)
+        metric_summary, summary_truncated, _ = spool.recover_summary(
+            metric_summary,
+            summary_truncated,
+            summary_event_offset,
+            max_tail_records=_SUMMARY_CHECKPOINT_RECORD_INTERVAL,
+            max_tail_bytes=_SUMMARY_RECOVERY_MAX_TAIL_BYTES,
         )
+        expected_summary = _summary_view(metric_summary, explicit_summary)
+        finished = _metadata_flag(metadata, "finished")
+        if not finished:
+            raise DeliveryError("sync requires an offline run that has been finished")
+        selected_server = server_url if server_url is not None else metadata.get("server_url")
+        if not isinstance(selected_server, str) or not selected_server:
+            raise DeliveryError("run spool metadata has no valid server URL")
+        client = EpochDeckClient(selected_server, transport=transport)
+        try:
+            try:
+                client.create_run(
+                    project=project,
+                    run_id=run_id,
+                    name=metadata.get("name"),
+                    config=_normalize_document(metadata.get("config", {}), "config"),
+                    resume="allow",
+                )
+            except EpochDeckApiError as error:
+                if error.status_code != 409 or not finished:
+                    raise
+                existing = client.get_run(run_id)
+                actual_explicit, actual_metric, _ = _server_summary_components(existing)
+                actual_summary = _summary_view(actual_metric, actual_explicit)
+                if existing.get("state") != "finished" or any(
+                    actual_summary.get(key) != value for key, value in expected_summary.items()
+                ):
+                    raise
+                return run_id
+            worker = _DeliveryWorker(
+                client=client,
+                run_id=run_id,
+                spool=spool,
+                batch_size=_validate_batch_size(
+                    metadata.get("batch_size", _DEFAULT_BATCH_SIZE),
+                    "stored batch_size",
+                ),
+                flush_interval=0,
+            )
+            worker.start()
+            worker.stop()
+            worker.join(timeout)
+            if worker.is_alive() or spool.pending():
+                worker.cancel()
+                worker.join(1)
+                message = f"timed out syncing undelivered data in {spool_directory}"
+                if worker.last_error is not None:
+                    message = f"{message}: {worker.last_error}"
+                raise DeliveryError(message)
+            client.finish_run(
+                run_id,
+                explicit_summary,
+            )
+        finally:
+            client.close()
+        return run_id
     finally:
-        client.close()
-    return run_id
+        if worker is not None and worker.ident is not None:
+            worker.cancel()
+        else:
+            spool.close()
 
 
 def _validate_spool_identity(metadata: Mapping[str, Any], project: str, run_id: str) -> None:

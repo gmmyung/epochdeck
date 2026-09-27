@@ -30,14 +30,14 @@ Inventory: 222 Cargo packages,
            184 unique license documents.
 
 Locked input fingerprints:
-- Cargo.toml: 0a5bae09d47fb4ca378ee87419dee968e3f3c1a7fef40f1e3ebf18b874ac7065
-- Cargo.lock: db6c799f7ada69edc01619d7d718925e5e87abf38711e7541e2899b89105194b
+- Cargo.toml: f6843a8cb77f92b63e07e24e997dfb89b23aca0e98149019bb6a9f14d1b36daa
+- Cargo.lock: 51e4c7dede716b1a22daa58cfaaecfa9ac7edadd41470d5078058c05c07ce0bd
 - crates/epochdeck-server/Cargo.toml: 18b1ac5f662da9d40ca564561901ff9ab44090df3d032731f199f1370a6c502b
-- web/package.json: 8095de19a701e503754ba772204405bb4490ece7c78df08306380072aae6110f
-- web/pnpm-lock.yaml: 7a9a5f7601fc4cbd880a8ad457664b856c4f93759f514b1377ef56a16910d9e8
+- web/package.json: 81725f87fe7267b6c08cd7c673888bfee4d5ebb9b94ad52fb3ccb3a960c4cdef
+- web/pnpm-lock.yaml: ffad8da01512eb4e596a6956d5ff045d74dc18c6e070372f45d93119f27b3e42
 - web/svelte.config.js: 26cd0f1e700b93a5a07bb8a6e61da361ac8a3b19eb34a8e4eafbd9f8fcf9a2f6
 - web/vite.config.ts: 60cd1c65988dc6621f265b9d04c71e504228ccdfbea415dcd6f1689286e93f27
-- .github/workflows/prerelease.yml: f38fa759d8e6caee537c862f549ebc230647159e74950e59aaabf1e744c568e4
+- .github/workflows/prerelease.yml: d72ab8fe4c503a58bb4ef2c8288a26811083ad108dd88275a68a4d03f8488d9a
 - third_party/license-overrides.json: b541d5747f63855112c788b5bdb6564d273f7b780ab78f476727f06c55c28eee
 - third_party/release-toolchain.json: e8c9b4722cc49df6bf803b3493e03ec6a2596769d748f61ea38c799c42ebfb04
 

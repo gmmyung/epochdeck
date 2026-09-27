@@ -11,6 +11,30 @@ function deferred<T>() {
 }
 
 describe("BoundedRequestScheduler", () => {
+  it("queues a fresh request for an identity whose previous request was aborted", async () => {
+    const scheduler = new BoundedRequestScheduler(2, 2);
+    const stale = deferred<string>();
+    const parent = new AbortController();
+    const staleResult = scheduler.run({
+      identity: "same-run",
+      parentSignal: parent.signal,
+      request: () => stale.promise,
+    });
+    await Promise.resolve();
+    parent.abort();
+    const freshRequest = vi.fn(async () => "fresh");
+    const freshResult = scheduler.run({
+      identity: "same-run",
+      parentSignal: new AbortController().signal,
+      request: freshRequest,
+    });
+    expect(freshRequest).not.toHaveBeenCalled();
+    stale.resolve("stale");
+    await expect(staleResult).resolves.toBeUndefined();
+    await expect(freshResult).resolves.toBe("fresh");
+    expect(freshRequest).toHaveBeenCalledOnce();
+  });
+
   it("bounds physical concurrency and the pending queue", async () => {
     const scheduler = new BoundedRequestScheduler(2, 2);
     const gates = Array.from({ length: 5 }, () => deferred<number>());

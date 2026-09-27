@@ -6,10 +6,9 @@
 ## Context
 
 Dashboard navigation previously reused complete resource records for lists. A
-project page could therefore repeat run configuration and summary documents,
-artifact manifests and report layouts before the user
-selected any of them. Sweep lists similarly repeated parameter definitions and
-trial configurations. Metric discovery compounded that cost by draining every
+project page could therefore repeat run configuration, summary documents, and
+artifact manifests before the user selected any of them. Metric discovery
+compounded that cost by draining every
 selected run's complete key catalog into the browser. These costs grew with
 stored metadata and metric cardinality even though the visible page was bounded.
 
@@ -21,10 +20,7 @@ already-open media, artifact, and alert tabs stale.
 ## Decision
 
 List APIs return lightweight summaries and expose a separate detail endpoint
-for the selected resource. Sweep summaries retain scheduler progress but omit
-the parameter document; trial summaries retain lease and result state but omit
-the configuration. Their existing sweep detail route and dedicated trial detail
-route return the complete records. All newest-first lists use keyset order
+for the selected resource. All newest-first lists use keyset order
 `(created_at DESC, id DESC)` (or the resource's explicit event time plus ID).
 The public cursor remains the record ID; the catalog resolves it to the complete
 ordering tuple, rejects foreign or missing cursors, requests `limit + 1` rows,
@@ -101,7 +97,7 @@ ordering is deterministic but is not a valid newest-first chronology.
 ### Return complete records in bounded lists
 
 A row count limit does not bound bytes when each row embeds configuration,
-summary, sweep parameters, trial configurations, layouts, or manifests.
+summary or manifests.
 Summary/detail separation is the explicit payload bound.
 
 ### Keep one revision per rich resource type

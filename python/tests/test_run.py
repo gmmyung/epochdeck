@@ -12,12 +12,12 @@ import pytest
 from epochdeck import Artifact, Audio, Histogram, Image, Table
 from epochdeck import _run as run_module
 from epochdeck import _spool as spool_module
+from epochdeck._delivery import _DeliveryWorker
 from epochdeck._protocol import encode_json_request
 from epochdeck._run import (
     _SUMMARY_CHECKPOINT_BYTE_INTERVAL,
     _SUMMARY_CHECKPOINT_RECORD_INTERVAL,
     DeliveryError,
-    _DeliveryWorker,
     create_run,
     sync_spool,
 )
@@ -97,7 +97,6 @@ def test_online_run_batches_nested_metrics_without_blocking_on_upload(tmp_path) 
                     "accepted_points": len(batch["points"]),
                     "duplicate": False,
                     "metric_revision": 1,
-                    "stop_requested": False,
                 },
             )
         if request.url.path.endswith("/finish"):
@@ -184,7 +183,6 @@ def test_offline_run_keeps_a_durable_journal(tmp_path) -> None:
         "server_url",
         "summary_event_offset",
         "summary_truncated",
-        "sweep_trial_id",
     }
     assert metadata["finished"] is True
     assert metadata["config"] == {"optimizer": "adam", "seed": 8}
@@ -219,7 +217,6 @@ def test_offline_run_keeps_a_durable_journal(tmp_path) -> None:
                     "accepted_points": len(batch["points"]),
                     "duplicate": False,
                     "metric_revision": 1,
-                    "stop_requested": False,
                 },
             )
         if request.url.path.endswith("/finish"):
@@ -473,6 +470,7 @@ def test_metric_delivery_splits_on_the_exact_encoded_request_budget(tmp_path) ->
     budget = len(encode_json_request(two_point_request))
 
     first, first_offset = spool.read_batch(1_024, request_byte_budget=budget)
+    spool.close()
     reopened = spool_module._Spool(
         tmp_path,
         "019c1234-5678-7000-8000-000000000033",
@@ -550,7 +548,7 @@ def test_delivery_worker_retries_the_identical_durable_metric_request(tmp_path) 
             attempts.append(encode_json_request(request))
             if len(attempts) == 1:
                 raise RuntimeError("response lost after commit")
-            return {"stop_requested": False}
+            return {}
 
     worker = _DeliveryWorker(
         client=RetryClient(),  # type: ignore[arg-type]
@@ -558,7 +556,6 @@ def test_delivery_worker_retries_the_identical_durable_metric_request(tmp_path) 
         spool=spool,
         batch_size=3,
         flush_interval=0,
-        stop_requested=lambda: None,
     )
     worker.start()
     worker.stop()
@@ -586,7 +583,7 @@ def test_summary_resume_replays_a_bounded_tail_without_consulting_ack(tmp_path) 
     first.log({"loss": 2.0, "reward": 2.0})
     journal_size = (tmp_path / run_id / "events.jsonl").stat().st_size
     (tmp_path / run_id / "ack").write_text(str(journal_size))
-    del first
+    first.close()
 
     resumed = create_run(
         project="robotics",
@@ -666,7 +663,7 @@ def test_resume_rejects_a_malformed_summary_event_offset(tmp_path, offset) -> No
     metadata = json.loads(metadata_path.read_text())
     metadata["summary_event_offset"] = offset
     metadata_path.write_text(json.dumps(metadata))
-    del run
+    run.close()
 
     with pytest.raises(DeliveryError, match="summary event offset"):
         create_run(
@@ -732,7 +729,6 @@ def test_online_finish_reclaims_acknowledged_payloads_and_keeps_private_metadata
                     "accepted_points": len(body["points"]),
                     "duplicate": False,
                     "metric_revision": 1,
-                    "stop_requested": False,
                 },
             )
         if "/blobs/" in request.url.path:
@@ -986,7 +982,6 @@ def test_alert_delivery_replays_the_same_durable_record(tmp_path) -> None:
                     "accepted_points": len(body["points"]),
                     "duplicate": False,
                     "metric_revision": 1,
-                    "stop_requested": False,
                 },
             )
         if request.url.path.endswith("/finish"):
@@ -1048,7 +1043,7 @@ def test_rich_only_runs_resume_at_the_next_user_step(tmp_path) -> None:
         system_monitor_interval=0,
     )
     first.log({"media": {"frame": Image(b"png-bytes")}})
-    del first
+    first.close()
 
     resumed = create_run(
         project="robotics",

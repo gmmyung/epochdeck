@@ -12,7 +12,6 @@ import {
 
 const RUN_A = "00000000-0000-7000-8000-000000000001";
 const RUN_B = "00000000-0000-7000-8000-000000000002";
-const REPORT = "00000000-0000-7000-8000-000000000003";
 
 describe("comparison state", () => {
   it("keeps an ordered, valid, bounded run selection and repairs its primary run", () => {
@@ -74,7 +73,6 @@ describe("comparison state", () => {
     const tabs = new Set(["summary", "metrics"] as const);
     const written = writeComparisonUrl(new URL("https://epochdeck.test/?unrelated=kept"), {
       project: "robot learning",
-      reportId: REPORT,
       runIds: [RUN_B, RUN_A],
       runSelectionSpecified: true,
       primaryRunId: RUN_A,
@@ -90,7 +88,6 @@ describe("comparison state", () => {
 
     expect(restored).toEqual({
       project: "robot learning",
-      reportId: REPORT,
       runIds: [RUN_B, RUN_A],
       runSelectionSpecified: true,
       primaryRunId: RUN_A,
@@ -114,7 +111,6 @@ describe("comparison state", () => {
     expect(invalid.tab).toBe("summary");
     expect(invalid.metricMode).toBe("union");
     expect(invalid.alignment).toBe("step");
-    expect(invalid.reportId).toBeNull();
     expect(invalid.metricAfter).toBeNull();
     expect(invalid.chartMetric).toBeNull();
     expect(invalid.chartViewport).toBeNull();
@@ -137,7 +133,6 @@ describe("comparison state", () => {
       new URL("https://epochdeck.test/?chart=loss&xmin=1&xmax=2"),
       {
         project: "p",
-        reportId: null,
         runIds: [],
         runSelectionSpecified: true,
         primaryRunId: null,
@@ -162,7 +157,6 @@ describe("comparison state", () => {
     }
     url.searchParams.append("run", RUN_A);
     url.searchParams.set("project", "p".repeat(129));
-    url.searchParams.set("report", "not-a-uuid");
     url.searchParams.set("search", "s".repeat(257));
     url.searchParams.set("metric_after", `loss\u0085hidden`);
 
@@ -171,7 +165,6 @@ describe("comparison state", () => {
     expect(state.runIds).toHaveLength(MAX_SELECTED_RUNS);
     expect(new Set(state.runIds).size).toBe(MAX_SELECTED_RUNS);
     expect(state.project).toBeNull();
-    expect(state.reportId).toBeNull();
     expect(state.search).toBe("");
     expect(state.metricAfter).toBeNull();
   });
@@ -180,7 +173,6 @@ describe("comparison state", () => {
     const tabs = new Set(["metrics"] as const);
     const state = {
       project: "p",
-      reportId: null,
       runIds: [RUN_A],
       runSelectionSpecified: true,
       primaryRunId: RUN_A,

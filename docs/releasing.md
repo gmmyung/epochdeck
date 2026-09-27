@@ -56,15 +56,16 @@ includes the checked `THIRD_PARTY_NOTICES.txt` beside the binary.
 11. Run the `GitHub prerelease` workflow manually against the exact `main`
     commit. Confirm all four native build/test/archive jobs and the Python 3.11
     and 3.13 wheel-smoke matrix pass. Download the candidate, verify its exact
-    six-payload manifest and checksums, extract and run the x86_64 Linux
-    archive in a clean Debian LXC, and install the wheel in a clean Python 3.11
-    environment. A manual run never creates a GitHub release.
+    six-payload manifest and checksums. The assembly job also tests the x86_64
+    Linux archive and installed wheel together in a clean Debian/Python 3.11
+    container, including SDK logging, server restart, and backup/restore. Confirm
+    that gate passes. A manual run never creates a GitHub release.
 12. Create and push a GitHub-verifiable signed annotated tag without moving any
     existing tag:
 
 ```bash
-git tag -s v0.1.0-alpha.1 -m "EpochDeck 0.1.0-alpha.1"
-git push origin v0.1.0-alpha.1
+git tag -s v0.1.0-alpha.2 -m "EpochDeck 0.1.0-alpha.2"
+git push origin v0.1.0-alpha.2
 ```
 
 13. Wait for the tag-triggered GitHub prerelease workflow to finish.

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping
 
 import httpx
 import pytest
 
 from epochdeck import Api
-from epochdeck.public_api import _compile_filters, _normalize_report_layout
+from epochdeck.public_api import _compile_filters
 
 
 def test_public_api_pages_filtered_runs_and_scans_history(monkeypatch) -> None:
@@ -131,26 +130,7 @@ def test_public_api_rejects_inert_filter_and_order_options(monkeypatch) -> None:
         api.close()
 
 
-def test_public_api_bounds_report_layout_and_filter_construction() -> None:
-    class LargeMapping(Mapping[str, str]):
-        def __init__(self) -> None:
-            self.reads = 0
-
-        def __len__(self) -> int:
-            return 100_000
-
-        def __iter__(self) -> Iterator[str]:
-            return (f"key-{index}" for index in range(len(self)))
-
-        def __getitem__(self, key: str) -> str:
-            self.reads += 1
-            return "x" * 32
-
-    layout = LargeMapping()
-    with pytest.raises(ValueError, match="serialized report layout exceeds"):
-        _normalize_report_layout(layout)
-    assert layout.reads < 20_000
-
+def test_public_api_bounds_filter_construction() -> None:
     with pytest.raises(ValueError, match="more than 32 config fields"):
         _compile_filters({f"config.key-{index}": index for index in range(33)})
     with pytest.raises(ValueError, match="JSON-safe range"):
@@ -236,85 +216,6 @@ def test_public_run_samples_full_history_and_pages_every_artifact(monkeypatch) -
 
     history_request = next(request for request in requests if request.url.path.endswith("/history"))
     assert dict(history_request.url.params) == {"key": "loss", "max_points": "25"}
-
-
-def test_public_api_manages_persisted_reports(monkeypatch) -> None:
-    requests: list[httpx.Request] = []
-    layout = {
-        "columns": 2,
-        "panels": [
-            {
-                "id": "loss",
-                "title": "Loss",
-                "kind": "metric",
-                "run_id": "run-1",
-                "metric_keys": ["train/loss"],
-                "markdown": None,
-                "width": 1,
-                "height": 360,
-            }
-        ],
-    }
-
-    def report_record(name: str) -> dict:
-        return {
-            "id": "report-1",
-            "project": "robotics",
-            "name": name,
-            "description": None,
-            "layout": layout,
-        }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if request.method == "POST":
-            return httpx.Response(
-                201, json={"report": report_record("Overview"), "duplicate": False}
-            )
-        if request.method == "GET" and request.url.path.endswith("/reports"):
-            return httpx.Response(
-                200,
-                json={
-                    "reports": [{"id": "report-1", "name": "Overview"}],
-                    "next_before": None,
-                },
-            )
-        if request.method == "PUT":
-            return httpx.Response(200, json=report_record("Updated"))
-        if request.method == "DELETE":
-            return httpx.Response(200, json=report_record("Updated"))
-        return httpx.Response(200, json=report_record("Overview"))
-
-    original_client = httpx.Client
-
-    def client_with_mock_transport(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(handler)
-        return original_client(*args, **kwargs)
-
-    monkeypatch.setattr(httpx, "Client", client_with_mock_transport)
-
-    with Api(server_url="http://epochdeck.test") as api:
-        created = api.create_report("robotics", name="Overview", layout=layout, id="report-1")
-        listed = list(api.reports("robotics", per_page=20))
-        loaded = api.report("report-1")
-        updated = api.update_report("report-1", name="Updated", layout=layout)
-        deleted = api.delete_report("report-1")
-
-    assert created["id"] == "report-1"
-    assert listed[0]["name"] == "Overview"
-    assert loaded["project"] == "robotics"
-    assert updated["name"] == "Updated"
-    assert deleted["id"] == "report-1"
-    assert json.loads(requests[0].content)["id"] == "report-1"
-    assert dict(requests[1].url.params) == {"limit": "20"}
-    assert [request.method for request in requests] == [
-        "POST",
-        "GET",
-        "GET",
-        "GET",
-        "PUT",
-        "DELETE",
-    ]
 
 
 def test_public_collections_are_lazy_and_reject_bad_or_repeated_cursors(monkeypatch) -> None:

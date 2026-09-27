@@ -8,7 +8,7 @@ bootstrap:
   uv sync --project python --all-groups --locked
   pnpm --dir web install --frozen-lockfile
 
-check: dependency-guard flake-check third-party-notices-check release-version-check workflow-check rust-check python-check web-check
+check: dependency-guard flake-check third-party-notices-check release-version-check workflow-check rust-check python-check web-check server-contract-check
 
 dependency-guard:
   ./scripts/check-forbidden-dependencies.sh
@@ -49,6 +49,13 @@ web-check: dashboard-build
 dashboard-build:
   pnpm --dir web build
 
+brand-assets:
+  uv run --script scripts/generate-brand-assets.py
+
+server-contract-check: dashboard-build
+  cargo build --locked -p epochdeck-server --features embedded-dashboard
+  EPOCHDECK_TEST_SERVER="$PWD/target/debug/epochdeck-server" uv run --project python --locked pytest python/tests/contracts/test_server_contract.py
+
 single-binary: dashboard-build
   cargo build --release --locked -p epochdeck-server --features embedded-dashboard
 
@@ -63,3 +70,6 @@ dev:
 
 benchmark-metrics rows="200000" metrics="180":
   cargo run --release -p epochdeck-storage --example metric_workload -- {{ rows }} {{ metrics }}
+
+benchmark-spool rows="200000" metrics="180":
+  uv run --project python --locked python scripts/benchmark-spool-recovery.py {{ rows }} {{ metrics }}

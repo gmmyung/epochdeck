@@ -69,8 +69,8 @@ explicit layer taking precedence and also expose both source layers. A distinct
 mutations observable without relying on SQLite timestamp precision.
 
 SQLite does not store complete metric histories as JSON. Before an HTTP request,
-the Python SDK writes each outgoing batch to its bounded, crash-recoverable local
-journal. An acknowledgement advances that journal only after the server confirms
+the Python SDK writes each outgoing batch to its crash-recoverable local journal
+with bounded records and reads. An acknowledgement advances that journal only after the server confirms
 the exact request identity, so ambiguous requests can be replayed after a process
 or machine restart.
 
@@ -88,6 +88,10 @@ catalog transaction makes each segment visible atomically.
 
 The Python journal is append-only and fsynced before `log` returns. Its byte
 offset advances only after an idempotent server acknowledgement.
+One process owns each spool through an OS file lock. Startup recovery reads at
+most one record budget from a torn tail, preserves acknowledged and in-flight
+delivery boundaries, and reports discarded incomplete bytes. See
+[ADR 0018](adr/0018-exclusive-spool-recovery.md).
 
 Server publication follows a fixed sequence:
 
@@ -142,7 +146,7 @@ bucket lattice. Sparse series are never interpolated.
 
 Two bounded caches avoid repeated storage scans:
 
-- a 2,048-entry, 2 MiB per-key cache for exact axis extents; and
+- a 2,048-entry, 2 MiB cache for exact per-key axis extents; and
 - a 512-entry, 250,000-cell, 32 MiB cache for aggregate series.
 
 These are eviction bounds, not history-retention limits.
@@ -207,31 +211,10 @@ referenced CAS bytes to a temporary directory, then atomically publishes a
 portable current-format bundle. The exporter never requests dashboard samples
 or buffers complete histories and files.
 
-### Sweep scheduler
-
-Sweep definitions, monotonic scheduler indexes, leased trials, and run bindings
-live in SQLite. Grid scheduling uses mixed-radix selection and random scheduling
-uses deterministic hashes, so neither path expands parameter combinations in
-memory. A short transaction serializes claims. Metric batch acknowledgements
-carry median-rule stop decisions back through the existing durable delivery
-worker; no polling thread or scheduler queue enters training code.
-
-### Reports
-
-Reports are small project-scoped SQLite documents containing a bounded grid of
-typed metric and Markdown panels. Metric panels hold run IDs and requested
-column names, not materialized history. The catalog transaction validates that
-every referenced run belongs to the report project.
-
-The dashboard renders the grid directly from that definition. Metric histories
-remain lazy, aggregated, cancellable, and capped at four concurrent requests,
-so a large report cannot turn into an unbounded fan-out or duplicate source
-data.
-
 ### Dashboard
 
 The Svelte dashboard initially loads the server's immutable branding contract
-alongside project, run, report, and metric metadata. Branding is validated and
+alongside project, run, and metric metadata. Branding is validated and
 loaded once at server startup; optional logo and favicon files are served only
 through same-origin bounded image endpoints.
 

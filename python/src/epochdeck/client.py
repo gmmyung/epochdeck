@@ -85,7 +85,6 @@ class EpochDeckClient:
         name: str | None,
         config: dict[str, Any],
         resume: str,
-        sweep_trial_id: str | None = None,
     ) -> dict[str, Any]:
         response = self._request(
             "POST",
@@ -95,134 +94,11 @@ class EpochDeckClient:
                 "name": name,
                 "config": config,
                 "resume": resume,
-                "sweep_trial_id": sweep_trial_id,
             },
         )
         validate_run_identity(response, run_id)
         require_bool(response, "resumed")
         return response
-
-    def create_sweep(self, project: str, sweep: dict[str, Any]) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"/api/v1/projects/{quote(project, safe='')}/sweeps",
-            json=sweep,
-        )
-
-    def sweeps(
-        self,
-        project: str,
-        *,
-        before: str | None = None,
-        limit: int = 100,
-    ) -> dict[str, Any]:
-        return self._request(
-            "GET",
-            f"/api/v1/projects/{quote(project, safe='')}/sweeps",
-            params=_cursor_params(before, limit),
-        )
-
-    def get_sweep(self, sweep_id: str) -> dict[str, Any]:
-        response = self._request("GET", f"/api/v1/sweeps/{quote(sweep_id, safe='')}")
-        if require_text(response, "id") != sweep_id:
-            raise DeliveryProtocolError("sweep detail has the wrong sweep ID")
-        return response
-
-    def claim_sweep_trial(self, sweep_id: str, agent_id: str) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"/api/v1/sweeps/{quote(sweep_id, safe='')}/claim",
-            json={"agent_id": agent_id},
-        )
-
-    def complete_sweep_trial(
-        self,
-        trial_id: str,
-        *,
-        agent_id: str,
-        state: str,
-        metric: float | None,
-    ) -> dict[str, Any]:
-        response = self._request(
-            "POST",
-            f"/api/v1/sweep-trials/{quote(trial_id, safe='')}/complete",
-            json={"agent_id": agent_id, "state": state, "metric": metric},
-        )
-        if require_text(response, "id") != trial_id:
-            raise DeliveryProtocolError("sweep completion has the wrong trial ID")
-        if require_text(response, "agent_id") != agent_id:
-            raise DeliveryProtocolError("sweep completion has the wrong agent ID")
-        if require_text(response, "state") != state:
-            raise DeliveryProtocolError("sweep completion has the wrong terminal state")
-        return response
-
-    def heartbeat_sweep_trial(self, trial_id: str, agent_id: str) -> dict[str, Any]:
-        response = self._request(
-            "POST",
-            f"/api/v1/sweep-trials/{quote(trial_id, safe='')}/heartbeat",
-            json={"agent_id": agent_id},
-        )
-        if require_text(response, "id") != trial_id:
-            raise DeliveryProtocolError("sweep heartbeat has the wrong trial ID")
-        if require_text(response, "agent_id") != agent_id:
-            raise DeliveryProtocolError("sweep heartbeat has the wrong agent ID")
-        return response
-
-    def sweep_trials(
-        self,
-        sweep_id: str,
-        *,
-        before: str | None = None,
-        limit: int = 100,
-    ) -> dict[str, Any]:
-        return self._request(
-            "GET",
-            f"/api/v1/sweeps/{quote(sweep_id, safe='')}/trials",
-            params=_cursor_params(before, limit),
-        )
-
-    def get_sweep_trial(self, trial_id: str) -> dict[str, Any]:
-        response = self._request(
-            "GET",
-            f"/api/v1/sweep-trials/{quote(trial_id, safe='')}",
-        )
-        if require_text(response, "id") != trial_id:
-            raise DeliveryProtocolError("sweep-trial detail has the wrong trial ID")
-        require_text(response, "sweep_id")
-        return response
-
-    def create_report(self, project: str, report: dict[str, Any]) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"/api/v1/projects/{quote(project, safe='')}/reports",
-            json=report,
-        )
-
-    def reports(
-        self,
-        project: str,
-        *,
-        before: str | None = None,
-        limit: int = 100,
-    ) -> dict[str, Any]:
-        return self._request(
-            "GET",
-            f"/api/v1/projects/{quote(project, safe='')}/reports",
-            params=_cursor_params(before, limit),
-        )
-
-    def get_report(self, report_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/api/v1/reports/{quote(report_id, safe='')}")
-
-    def update_report(self, report_id: str, report: dict[str, Any]) -> dict[str, Any]:
-        return self._request(
-            "PUT",
-            f"/api/v1/reports/{quote(report_id, safe='')}",
-            json=report,
-        )
-
-    def delete_report(self, report_id: str) -> dict[str, Any]:
-        return self._request("DELETE", f"/api/v1/reports/{quote(report_id, safe='')}")
 
     def ingest_batch(self, run_id: str, batch: dict[str, Any]) -> dict[str, Any]:
         encoded = encode_json_request(batch)

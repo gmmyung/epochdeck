@@ -11,6 +11,30 @@ function deferred<T>() {
 }
 
 describe("QueryScheduler", () => {
+  it("releases its slot when starting a request throws synchronously", async () => {
+    const scheduler = new QueryScheduler(1, 2);
+    const reject = vi.fn();
+    const publish = vi.fn();
+    const error = new Error("request construction failed");
+    scheduler.schedule({
+      identity: "broken",
+      requestKey: "r1",
+      request: () => {
+        throw error;
+      },
+      publish,
+      reject,
+    });
+    scheduler.schedule({
+      identity: "healthy",
+      requestKey: "r1",
+      request: async () => "result",
+      publish,
+    });
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledWith("result", "r1"));
+    expect(reject).toHaveBeenCalledWith(error);
+  });
+
   it("bounds global concurrency and starts queued work as slots open", async () => {
     const scheduler = new QueryScheduler(2, 4);
     const gates = [deferred<number>(), deferred<number>(), deferred<number>()];

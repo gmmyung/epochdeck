@@ -71,19 +71,26 @@ export class QueryScheduler {
       const controller = new AbortController();
       const active = { requestKey: query.requestKey, controller };
       this.active.set(identity, active);
-      void query
-        .request(controller.signal)
-        .then((result) => {
-          if (this.active.get(identity) !== active || controller.signal.aborted) return;
-          query.publish(result, query.requestKey);
-        })
-        .catch((reason) => {
-          if (!controller.signal.aborted) query.reject?.(reason);
-        })
-        .finally(() => {
-          if (this.active.get(identity) === active) this.active.delete(identity);
-          this.drain();
-        });
+      void this.execute(identity, query, active);
+    }
+  }
+
+  private async execute(
+    identity: string,
+    query: ScheduledQuery<unknown>,
+    active: ActiveQuery,
+  ): Promise<void> {
+    const { signal } = active.controller;
+    try {
+      const result = await query.request(signal);
+      if (this.active.get(identity) === active && !signal.aborted) {
+        query.publish(result, query.requestKey);
+      }
+    } catch (reason) {
+      if (!signal.aborted) query.reject?.(reason);
+    } finally {
+      if (this.active.get(identity) === active) this.active.delete(identity);
+      this.drain();
     }
   }
 }
