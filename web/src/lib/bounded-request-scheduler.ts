@@ -38,9 +38,10 @@ export class BoundedRequestScheduler {
 
   run<T>(request: BoundedRequest<T>): Promise<T | undefined> {
     if (request.parentSignal.aborted) return Promise.resolve(undefined);
+    const active = this.active.get(request.identity);
     const existing =
       this.pending.get(request.identity)?.promise ??
-      this.active.get(request.identity)?.task.promise;
+      (active && !active.controller.signal.aborted ? active.task.promise : undefined);
     if (existing) return existing as Promise<T | undefined>;
 
     let resolve!: (value: unknown | undefined) => void;
@@ -98,7 +99,7 @@ export class BoundedRequestScheduler {
 
   private drain(): void {
     while (this.active.size < this.concurrency && this.pending.size > 0) {
-      const next = this.pending.entries().next().value as [string, PendingRequest] | undefined;
+      const next = this.nextReadyRequest();
       if (!next) return;
       const [identity, task] = next;
       this.pending.delete(identity);
@@ -124,5 +125,12 @@ export class BoundedRequestScheduler {
           this.drain();
         });
     }
+  }
+
+  private nextReadyRequest(): [string, PendingRequest] | undefined {
+    for (const entry of this.pending) {
+      if (!this.active.has(entry[0])) return entry;
+    }
+    return undefined;
   }
 }

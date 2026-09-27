@@ -57,6 +57,16 @@ Changing an existing config value requires
 
 Resume a known run with `resume="allow"` or `resume="must"`. The local spool
 recovers unacknowledged work after interruption and replays it idempotently.
+Only one process may own a local run spool at a time. An overlapping writer or
+sync fails explicitly. Restart recovery discards an incomplete final append
+with a warning; acknowledged records and completed malformed records are never
+silently discarded.
+
+Use `run.close()` to stop local delivery without finishing the run, then resume
+it later with the same ID and spool directory. Closing waits for an active
+request to settle. If its timeout expires, ownership remains locked until the
+worker stops. `run.finish()` still delivers pending data and marks the run
+finished; a closed run must be resumed before logging or finishing it.
 
 Upload an offline spool later:
 
@@ -116,24 +126,6 @@ with ed.Api() as api:
 
 Collections and histories are lazy. Consume them while the `Api` context is
 open.
-
-## Run a finite sweep
-
-```python
-sweep_id = ed.sweep(
-    {
-        "method": "random",
-        "metric": {"name": "loss", "goal": "minimize"},
-        "parameters": {"learning_rate": {"values": [1e-2, 1e-3, 1e-4]}},
-        "run_cap": 12,
-    },
-    project="demo",
-)
-ed.agent(sweep_id, train, count=12)
-```
-
-Grid and random sweeps currently accept finite typed value sets. Unsupported
-distributions fail explicitly.
 
 ## Administration and imports
 

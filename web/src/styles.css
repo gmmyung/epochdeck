@@ -758,96 +758,6 @@ aside .run-color-control {
   overflow-wrap: anywhere;
 }
 
-.report-description {
-  max-width: 720px;
-  margin: 7px 0 0;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.5;
-}
-
-.report-pagination {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 10px;
-  min-height: 32px;
-}
-
-.report-pagination button {
-  min-height: 32px;
-  padding: 0 10px;
-  border: 1px solid var(--line);
-  background: transparent;
-  color: var(--text);
-  font: inherit;
-  font-size: 11px;
-}
-
-.report-pagination button:hover:not(:disabled) {
-  background: var(--button-hover);
-}
-
-.report-pagination button:disabled {
-  color: var(--faint);
-  cursor: default;
-  opacity: 0.55;
-}
-
-.report-pagination-status {
-  min-width: 180px;
-  color: var(--muted);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  text-align: center;
-}
-
-.report-grid {
-  display: grid;
-  grid-template-columns: repeat(var(--report-columns), minmax(0, 1fr));
-  gap: 12px;
-}
-
-.report-markdown-panel,
-.report-metric-panel {
-  min-width: 0;
-}
-
-.report-metric-panel {
-  padding: 12px;
-  border: 1px solid var(--line);
-  background: var(--panel);
-}
-
-.report-panel-heading {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 10px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--line);
-}
-
-.report-panel-heading strong {
-  font-size: 13px;
-}
-
-.report-panel-heading small {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.report-metric-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
-  gap: 10px;
-}
-
-.report-metric-grid .metric-chart-card {
-  min-height: 320px;
-}
-
 .run-state {
   display: flex;
   align-items: center;
@@ -1939,14 +1849,6 @@ dd {
 
   .run-tabs button {
     padding-inline: 10px;
-  }
-
-  .report-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .report-grid > * {
-    grid-column: 1 / -1 !important;
   }
 
   .run-heading h1,

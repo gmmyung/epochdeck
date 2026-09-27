@@ -32,10 +32,10 @@ describe("LiveRefreshCoordinator", () => {
     const coordinator = new LiveRefreshCoordinator(10_000, 2);
     const calls: string[] = [];
 
-    coordinator.invalidate("report", () => calls.push("running"));
+    coordinator.invalidate("metrics", () => calls.push("running"));
     vi.setSystemTime(2_000);
-    coordinator.invalidate("report", () => calls.push("intermediate"));
-    coordinator.invalidate("report", () => calls.push("finished"), true);
+    coordinator.invalidate("metrics", () => calls.push("intermediate"));
+    coordinator.invalidate("metrics", () => calls.push("finished"), true);
 
     expect(calls).toEqual(["running", "finished"]);
   });
@@ -61,7 +61,7 @@ describe("LiveRefreshCoordinator", () => {
     const coordinator = new LiveRefreshCoordinator(10_000, 2);
 
     coordinator.invalidate("comparison", () => {});
-    coordinator.invalidate("report", () => {});
+    coordinator.invalidate("metrics", () => {});
 
     expect(() => coordinator.invalidate("third", () => {})).toThrow(
       "live refresh identity limit of 2 exceeded",

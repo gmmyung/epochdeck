@@ -63,7 +63,6 @@ def validate_ingest_ack(
         raise DeliveryProtocolError("metric acknowledgement has the wrong accepted-point count")
     require_bool(response, "duplicate")
     require_nonnegative_int(response, "metric_revision")
-    require_bool(response, "stop_requested")
 
 
 def validate_record_ack(

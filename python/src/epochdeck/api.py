@@ -8,7 +8,6 @@ from typing import Any
 
 from epochdeck._json_normalization import normalize_json_object
 from epochdeck._run import Mode, Resume, Run, create_run
-from epochdeck._sweep_context import current_sweep_context
 from epochdeck.artifact import Artifact
 
 _current_run: Run | None = None
@@ -35,28 +34,11 @@ def init(
             raise RuntimeError(
                 "an EpochDeck run is already active; finish it before calling init again"
             )
-        sweep_context = current_sweep_context.get()
         selected_config = normalize_json_object(
             config if config is not None else {},
             "config",
             _MAX_RUN_DOCUMENT_BYTES,
         )
-        if sweep_context is not None:
-            conflicts = {
-                key
-                for key, value in selected_config.items()
-                if key in sweep_context.config and sweep_context.config[key] != value
-            }
-            if conflicts:
-                raise ValueError(
-                    "run config conflicts with sweep parameters: " + ", ".join(sorted(conflicts))
-                )
-            selected_config = {**selected_config, **sweep_context.config}
-            if sweep_context.run_id is not None:
-                if id is not None and id != sweep_context.run_id:
-                    raise ValueError("run ID conflicts with the recovered sweep trial run")
-                id = sweep_context.run_id
-                resume = "allow"
         spool_root = Path(dir) / ".epochdeck" / "spool" if dir is not None else None
         new_run = create_run(
             project=project,
@@ -71,12 +53,7 @@ def init(
                 else os.environ.get("EPOCHDECK_SERVER_URL", "http://127.0.0.1:8787")
             ),
             spool_root=spool_root,
-            sweep_trial_id=sweep_context.trial_id if sweep_context is not None else None,
         )
-        if sweep_context is not None:
-            sweep_context.run_id = new_run.id
-            if sweep_context.run_id_callback is not None:
-                sweep_context.run_id_callback(new_run.id)
         new_run._set_finish_callback(_clear_current_run)
         _current_run = None if new_run.finished else new_run
         return new_run

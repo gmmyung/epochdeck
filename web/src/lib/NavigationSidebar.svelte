@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
 
-  import type { Project, ReportSummary, RunListItem } from "./api";
+  import type { Project, RunListItem } from "./api";
   import { MAX_SELECTED_RUNS, type RunStyle } from "./comparison-state";
   import Icon from "./Icon.svelte";
   import SelectControl from "./SelectControl.svelte";
@@ -24,14 +24,6 @@
   export let projectWindowTruncated: boolean;
   export let loadingMoreProjects: boolean;
   export let projectError: string | null;
-  export let reports: ReportSummary[];
-  export let visibleReports: ReportSummary[];
-  export let selectedReportId: string | null;
-  export let reportSearch: string;
-  export let reportCursor: string | null;
-  export let reportWindowTruncated: boolean;
-  export let loadingMoreReports: boolean;
-  export let reportError: string | null;
   export let runs: RunListItem[];
   export let selectedRunIds: string[];
   export let runStylePreferences: RunStylePreferences = {};
@@ -49,8 +41,6 @@
   export let onlogofailure: () => void = () => {};
   export let onchooseproject: (project: string) => void;
   export let onloadprojects: () => void;
-  export let onchoosereport: (report: ReportSummary) => void;
-  export let onloadreports: () => void;
   export let onsearchruns: () => void;
   export let onloadruns: () => void;
   export let ontogglerun: (run: RunListItem, selected: boolean) => void;
@@ -222,51 +212,6 @@
       <p class="window-notice" role="status">
         Bounded window · recent and oldest loaded projects kept
       </p>
-    {/if}
-
-    {#if reports.length > 0 || reportError || reportCursor}
-      <div class="nav-section-heading">
-        <p class="nav-label">Reports</p>
-        <label class="compact-search">
-          <Icon name="search" size={13} />
-          <input
-            type="search"
-            name="report-filter"
-            aria-label="Filter loaded reports"
-            maxlength="256"
-            bind:value={reportSearch}
-          />
-        </label>
-      </div>
-      {#if reportError}<p class="nav-error" role="alert">{reportError}</p>{/if}
-      <div class="run-list report-list" aria-label="Reports">
-        {#each visibleReports as report (report.id)}
-          <button
-            type="button"
-            class:active={selectedReportId === report.id}
-            aria-pressed={selectedReportId === report.id}
-            onclick={() => onchoosereport(report)}
-          >
-            <span>{report.name}</span>
-            <small>{new Date(report.updated_at).toLocaleDateString()}</small>
-          </button>
-        {/each}
-      </div>
-      {#if reportCursor}
-        <button
-          class="nav-load-more"
-          type="button"
-          disabled={loadingMoreReports}
-          onclick={onloadreports}
-        >
-          {loadingMoreReports ? "Loading…" : "Load more reports"}
-        </button>
-      {/if}
-      {#if reportWindowTruncated}
-        <p class="window-notice" role="status">
-          Bounded window · recent and oldest loaded reports kept
-        </p>
-      {/if}
     {/if}
 
     <form
@@ -577,27 +522,6 @@
 
   .nav-label {
     margin: 0;
-  }
-
-  .compact-search {
-    display: flex;
-    align-items: center;
-  }
-
-  .compact-search {
-    gap: 5px;
-    padding: 3px 6px;
-    border-bottom: 1px solid var(--line);
-    color: var(--muted);
-  }
-
-  .compact-search input {
-    width: 100%;
-    min-width: 0;
-    border: 0;
-    background: transparent;
-    color: var(--text);
-    outline: none;
   }
 
   .run-search-form {

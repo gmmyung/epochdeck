@@ -50,9 +50,7 @@ or dropped.
 The EpochDeck exporter follows every cursor and writes full-resolution history
 pages with at most 32 columns and 5,000 rows. CAS content streams in 1 MiB
 chunks, is deduplicated by destination path, and is verified before install.
-Lightweight sweep and trial pages are hydrated one record at a time so the
-portable files retain parameter definitions, early-termination settings, and
-trial configurations. The exporter reads the project's opaque catalog-backed
+The exporter reads the project's opaque catalog-backed
 mutation token before and after traversal; any intervening mutation, including a
 create-delete ABA, prevents publication. Every completed file and directory is
 fsynced before the final bundle is exposed by one atomic directory rename, then

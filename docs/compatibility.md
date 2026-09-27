@@ -15,6 +15,7 @@ tested.
 | Compatible | The stated behavior is implemented and covered by contract tests.   |
 | Partial    | A useful tested subset exists; missing behavior remains.            |
 | Planned    | The feature is part of the intended surface but is not implemented. |
+| Not planned | The feature is deliberately outside EpochDeck's intended surface.  |
 
 ## Trackio parity
 
@@ -29,7 +30,7 @@ tested.
 | Artifacts         | Manifests, versions, aliases, and lineage                       | Compatible |
 | Python API        | Synchronous logging, background delivery, and read APIs         | Partial    |
 | CLI               | Health, query, sync, W&B import, and EpochDeck export           | Partial    |
-| Dashboard         | Runs, comparison charts, media, artifacts, and reports          | Partial    |
+| Dashboard         | Runs, comparison charts, media, and artifacts                   | Partial    |
 | Import and export | Resumable W&B import and lossless EpochDeck export              | Partial    |
 
 ## W&B compatibility
@@ -38,18 +39,31 @@ tested.
 | ------------------------------------------------------ | ---------- |
 | `import epochdeck as ed` workflow                      | Partial    |
 | Online, offline, disabled, and resume modes            | Compatible |
+| Exclusive local spool ownership and interrupted-append recovery | Compatible |
 | Projects, runs, filters, history, files, and artifacts | Partial    |
 | Media sequences and native playback                    | Partial    |
 | Typed and incremental tables                           | Partial    |
 | Artifact versions, aliases, lineage, and downloads     | Compatible |
-| Finite sweeps, agents, and early termination           | Partial    |
-| Persisted reports                                      | Partial    |
+| Sweeps, agents, and early termination                  | Not planned |
+| Persisted reports                                      | Not planned |
+| Structured execution traces                           | Not planned |
 | Groups, jobs, tags, notes, and ownership metadata      | Planned    |
 | W&B import with resumable checkpoints                  | Partial    |
 
-Hosted-platform features are out of scope. EpochDeck owns its server, storage,
-dashboard, and deployment model. Structured execution traces are deliberately
-not supported.
+## Deliberate exclusions
+
+These are product decisions, not unfinished compatibility work.
+
+| Feature or integration | Status | Reason |
+| ---------------------- | ------ | ------ |
+| Structured execution traces | Not planned | EpochDeck tracks experiments, metrics, media, and artifacts. |
+| Sweeps, agents, and early termination | Not planned | Experiment scheduling remains outside EpochDeck. |
+| Persisted reports | Not planned | The dashboard provides run exploration and comparison. |
+| Gradio dashboard integration | Not planned | EpochDeck owns its dashboard and HTTP server. |
+| Hugging Face Hub, Datasets, Spaces, and Buckets integrations | Not planned | EpochDeck owns its storage and deployment model. |
+
+Native authentication and multi-user authorization remain planned work; they
+are not part of these exclusions. See the [roadmap](roadmap.md).
 
 ## Contract rules
 

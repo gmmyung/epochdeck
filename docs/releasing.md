@@ -63,8 +63,8 @@ includes the checked `THIRD_PARTY_NOTICES.txt` beside the binary.
     existing tag:
 
 ```bash
-git tag -s v0.1.0-alpha.1 -m "EpochDeck 0.1.0-alpha.1"
-git push origin v0.1.0-alpha.1
+git tag -s v0.1.0-alpha.2 -m "EpochDeck 0.1.0-alpha.2"
+git push origin v0.1.0-alpha.2
 ```
 
 13. Wait for the tag-triggered GitHub prerelease workflow to finish.

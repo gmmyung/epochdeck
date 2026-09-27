@@ -79,61 +79,6 @@ class Api:
         query["limit"] = per_page
         return RunCollection(self.client, query)
 
-    def reports(self, project: str, *, per_page: int = 100) -> Iterator[dict[str, Any]]:
-        _validate_page_size(per_page)
-        return (
-            deepcopy(self.client.get_report(_record_id(summary, "report")))
-            for summary in _cursor_objects(
-                lambda before: self.client.reports(project, before=before, limit=per_page),
-                "reports",
-            )
-        )
-
-    def report(self, report_id: str) -> dict[str, Any]:
-        return deepcopy(self.client.get_report(report_id))
-
-    def create_report(
-        self,
-        project: str,
-        *,
-        name: str,
-        layout: Mapping[str, Any],
-        description: str | None = None,
-        id: str | None = None,
-    ) -> dict[str, Any]:
-        response = self.client.create_report(
-            project,
-            {
-                "id": id,
-                "name": name,
-                "description": description,
-                "layout": _normalize_report_layout(layout),
-            },
-        )
-        return deepcopy(response["report"])
-
-    def update_report(
-        self,
-        report_id: str,
-        *,
-        name: str,
-        layout: Mapping[str, Any],
-        description: str | None = None,
-    ) -> dict[str, Any]:
-        return deepcopy(
-            self.client.update_report(
-                report_id,
-                {
-                    "name": name,
-                    "description": description,
-                    "layout": _normalize_report_layout(layout),
-                },
-            )
-        )
-
-    def delete_report(self, report_id: str) -> dict[str, Any]:
-        return deepcopy(self.client.delete_report(report_id))
-
 
 class RunCollection:
     def __init__(self, client: EpochDeckClient, query: dict[str, Any]) -> None:
@@ -302,10 +247,6 @@ def _compile_filters(filters: Mapping[str, Any]) -> dict[str, Any]:
         _MAX_DOCUMENT_BYTES,
     )
     return query
-
-
-def _normalize_report_layout(layout: Mapping[str, Any]) -> dict[str, Any]:
-    return normalize_json_object(layout, "report layout", _MAX_DOCUMENT_BYTES)
 
 
 def _validate_filter_document_key(value: str) -> None:

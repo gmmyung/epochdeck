@@ -56,24 +56,6 @@ const TABLES: &[MutationTable] = &[
         updated_project: "(SELECT project_id FROM artifact_versions WHERE id = NEW.artifact_id)",
         deleted_project: "(SELECT project_id FROM artifact_versions WHERE id = OLD.artifact_id)",
     },
-    MutationTable {
-        name: "sweeps",
-        inserted_project: "NEW.project_id",
-        updated_project: "NEW.project_id",
-        deleted_project: "OLD.project_id",
-    },
-    MutationTable {
-        name: "sweep_trials",
-        inserted_project: "(SELECT project_id FROM sweeps WHERE id = NEW.sweep_id)",
-        updated_project: "(SELECT project_id FROM sweeps WHERE id = NEW.sweep_id)",
-        deleted_project: "(SELECT project_id FROM sweeps WHERE id = OLD.sweep_id)",
-    },
-    MutationTable {
-        name: "reports",
-        inserted_project: "NEW.project_id",
-        updated_project: "NEW.project_id",
-        deleted_project: "OLD.project_id",
-    },
 ];
 
 pub(super) fn trigger_schema() -> String {
@@ -114,9 +96,6 @@ mod tests {
             "artifact_versions",
             "artifact_aliases",
             "artifact_lineage",
-            "sweeps",
-            "sweep_trials",
-            "reports",
         ] {
             assert!(schema.contains(&format!("AFTER insert ON {table}")));
             assert!(schema.contains(&format!("AFTER update ON {table}")));

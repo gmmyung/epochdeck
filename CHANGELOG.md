@@ -5,7 +5,14 @@ so storage and APIs may change without migration or compatibility shims.
 
 ## Unreleased
 
+## [0.1.0-alpha.2] - 2026-09-27
+
 ### Added
+
+- Exclusive SDK spool ownership, bounded recovery of interrupted journal appends,
+  and `Run.close()` for stopping local delivery before resuming.
+- A real SDK/server contract gate covering rich logging, abrupt server restart,
+  and physical backup/restore.
 
 - The metrics toolbar now has a persistent one-to-four-column density selector.
 - A minimal stacked-epoch logo now serves as the default dashboard mark and
@@ -23,10 +30,16 @@ so storage and APIs may change without migration or compatibility shims.
 
 ### Changed
 
+- Refined the logo contours and unified the gradient; browser icons are
+  supersampled from one SVG master using `just brand-assets`.
+- Separated chart caches, Rust test modules, catalog SQL, and SDK delivery
+  scheduling to make implementation boundaries easier to maintain.
+- The compatibility matrix explicitly distinguishes deliberate exclusions from
+  planned authentication, authorization, and other unfinished features.
+
 - The dashboard identity and server health now live in the navigation sidebar;
   light and dark themes use quieter chart dividers, transparent plot and legend
-  surfaces, omit empty report navigation, and use more consistent sidebar and
-  content alignment.
+  surfaces, and more consistent sidebar and content alignment.
 - Run visibility controls now include icon-labeled Hide all, Show all, and Show
   only actions. The desktop sidebar stays fixed while its bounded run list
   scrolls independently.
@@ -60,11 +73,17 @@ so storage and APIs may change without migration or compatibility shims.
 
 ### Removed
 
-- Structured execution traces, including the Python API, durable spool, HTTP
-  routes, catalog tables, export records, and dashboard tab. EpochDeck now
-  focuses on experiment metrics, media, artifacts, alerts, sweeps, and reports.
+- Sweeps, persisted reports, and structured execution traces across the Python
+  API, HTTP protocol, catalog, exports, dashboard, tests, and documentation.
+  These features are deliberately unsupported and not planned.
 
 ### Fixed
+
+- Overlapping SDK processes can no longer allocate duplicate sequence numbers
+  in one spool, and interrupted final appends no longer block recovery.
+- Cancelled run-detail requests no longer suppress fresh requests for the same
+  run, and synchronously failed chart requests release their scheduler slots.
+- Release smoke tests verify content-versioned logo and favicon URLs.
 
 - Metric pagination uses compact arrow controls beside the filters instead of a
   separate low-density row.
@@ -104,7 +123,7 @@ so storage and APIs may change without migration or compatibility shims.
 
 - Rust server with SQLite catalog, Arrow/Parquet histories, and split CAS storage.
 - Python SDK with durable online and offline delivery.
-- Native rich media, artifacts, sweeps, reports, alerts, and host telemetry.
+- Native rich media, artifacts, alerts, and host telemetry.
 - Lazy multi-run dashboard with bounded uPlot charts and searchable resources.
 - Standard reverse-proxy deployment, diagnostics, physical backup/restore, and
   project export.

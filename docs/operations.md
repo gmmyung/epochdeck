@@ -28,6 +28,11 @@ The command refuses active roots, verifies content, and publishes a complete
 backup atomically. Client delivery spools live on training machines and require
 separate backups.
 
+Monitor free space on training machines as well as the server. Active SDK runs
+retain their local journals and copied media until successful online finish;
+offline sync preserves the source spool. Bounded memory and request sizes do
+not impose a disk quota or a retention limit.
+
 For large installations, stop the server briefly and snapshot every filesystem
 containing a root at one coordinated point. Replicate the snapshots after the
 server restarts.

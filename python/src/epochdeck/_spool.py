@@ -5,6 +5,8 @@ import os
 import shutil
 import threading
 import uuid
+import warnings
+import weakref
 from collections.abc import Mapping
 from copy import deepcopy
 from hashlib import sha256
@@ -14,6 +16,8 @@ from typing import Any
 from epochdeck._metrics import normalize_metrics
 from epochdeck._platform_fs import (
     ACCESS_MODE,
+    FileLockUnavailable,
+    acquire_file_lock,
     open_regular_file_descriptor,
     sync_directory,
     verify_directory,
@@ -37,6 +41,18 @@ class _Spool:
             raise DeliveryError("spool run ID must be a canonical UUID")
         self.directory = root / run_id
         _ensure_private_directory(self.directory, parents=True)
+        lock_path = self.directory / "spool.lock"
+        _ensure_private_file(lock_path)
+        lock_file = _open_regular_file(lock_path, os.O_RDWR)
+        try:
+            acquire_file_lock(lock_file.fileno())
+        except BaseException as error:
+            lock_file.close()
+            if isinstance(error, FileLockUnavailable):
+                raise DeliveryError(f"run spool is already active: {self.directory}") from error
+            raise
+        # Closing the descriptor releases the OS lock, including after a process exits.
+        self._release_lock = weakref.finalize(self, lock_file.close)
         self.events_path = self.directory / "events.jsonl"
         self.ack_path = self.directory / "ack"
         self.metadata_path = self.directory / "run.json"
@@ -52,14 +68,65 @@ class _Spool:
         self.artifact_ack_path = self.directory / "artifact-ack"
         self.artifact_delivery_path = self.directory / "artifact-delivery.json"
         self._lock = threading.Lock()
-        for path in (
-            self.events_path,
-            self.alerts_path,
-            self.rich_values_path,
-            self.artifacts_path,
-        ):
-            _ensure_private_file(path)
-        _ensure_private_directory(self.blob_root, parents=False)
+        try:
+            for ack_path, journal_path, delivery_path in self._journals():
+                _ensure_private_file(journal_path)
+                self._recover_interrupted_append(journal_path, ack_path, delivery_path)
+            _ensure_private_directory(self.blob_root, parents=False)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Release exclusive ownership after all readers and writers have stopped."""
+        self._release_lock()
+
+    def _recover_interrupted_append(
+        self, journal_path: Path, ack_path: Path, delivery_path: Path
+    ) -> None:
+        with _open_regular_file(journal_path, os.O_RDWR) as stream:
+            size = stream.seek(0, os.SEEK_END)
+            if not size:
+                return
+            stream.seek(size - 1)
+            if stream.read(1) == b"\n":
+                return
+            # Only an uncommitted final append may be discarded. Never scan history.
+            start = max(0, size - _MAX_JOURNAL_RECORD_BYTES - 1)
+            stream.seek(start)
+            tail = stream.read(_MAX_JOURNAL_RECORD_BYTES + 1)
+            boundary = tail.rfind(b"\n") + 1
+            if not boundary and start:
+                raise DeliveryError(
+                    f"journal record exceeds {_MAX_JOURNAL_RECORD_BYTES} bytes: {journal_path}"
+                )
+            end = start + boundary
+            if size - end > _MAX_JOURNAL_RECORD_BYTES:
+                raise DeliveryError(
+                    f"journal record exceeds {_MAX_JOURNAL_RECORD_BYTES} bytes: {journal_path}"
+                )
+            offset = self._read_ack(ack_path, journal_path)
+            if offset > end:
+                raise DeliveryError(
+                    f"incomplete journal tail was already acknowledged: {journal_path}"
+                )
+            self._read_delivery(delivery_path, offset, end)
+            if journal_path == self.events_path:
+                metadata = self.read_metadata()
+                checkpoint = metadata.get("summary_event_offset", 0) if metadata else 0
+                if isinstance(checkpoint, int) and checkpoint > end:
+                    raise DeliveryError(
+                        f"incomplete journal tail was already checkpointed: {journal_path}"
+                    )
+            stream.truncate(end)
+            stream.flush()
+            os.fsync(stream.fileno())
+        warnings.warn(
+            f"EpochDeck recovered an interrupted journal append "
+            f"({size - end} bytes): {journal_path}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
     def read_metadata(self) -> dict[str, Any] | None:
         with self._lock:
@@ -112,10 +179,10 @@ class _Spool:
         with self._lock:
             if any(
                 self._read_ack(ack_path, journal_path) < _regular_file_size(journal_path)
-                for ack_path, journal_path in self._journal_pairs()
+                for ack_path, journal_path, _ in self._journals()
             ):
                 raise DeliveryError("cannot reclaim a spool with undelivered records")
-            for ack_path, journal_path in self._journal_pairs():
+            for ack_path, journal_path, _ in self._journals():
                 with _open_regular_file(
                     journal_path,
                     os.O_WRONLY | os.O_TRUNC,
@@ -135,12 +202,12 @@ class _Spool:
             _ensure_private_directory(self.blob_root, parents=False)
             _fsync_directory(self.directory)
 
-    def _journal_pairs(self) -> tuple[tuple[Path, Path], ...]:
+    def _journals(self) -> tuple[tuple[Path, Path, Path], ...]:
         return (
-            (self.ack_path, self.events_path),
-            (self.alert_ack_path, self.alerts_path),
-            (self.rich_ack_path, self.rich_values_path),
-            (self.artifact_ack_path, self.artifacts_path),
+            (self.ack_path, self.events_path, self.delivery_path),
+            (self.alert_ack_path, self.alerts_path, self.alert_delivery_path),
+            (self.rich_ack_path, self.rich_values_path, self.rich_delivery_path),
+            (self.artifact_ack_path, self.artifacts_path, self.artifact_delivery_path),
         )
 
     def read_batch(
@@ -651,6 +718,8 @@ def _open_regular_file(path: Path, flags: int) -> Any:
     try:
         if access == os.O_RDONLY:
             mode = "rb"
+        elif access == os.O_RDWR:
+            mode = "r+b"
         elif flags & os.O_APPEND:
             mode = "ab"
         else:

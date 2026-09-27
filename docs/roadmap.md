@@ -20,8 +20,9 @@ lists remaining priorities; it does not duplicate completed feature history.
 - Expand project, run, filter, and file APIs.
 - Complete table mutation and media-sequence semantics.
 - Add groups, jobs, tags, notes, and ownership metadata.
-- Expand sweeps beyond finite value sets and median stopping.
 - Broaden W&B import coverage without weakening bounded-memory behavior.
+
+Sweeps, persisted reports, and structured execution traces are deliberately not planned.
 
 ## Stable release gates
 

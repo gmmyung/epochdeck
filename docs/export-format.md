@@ -12,9 +12,6 @@ publishing a bundle.
 
 ```text
 manifest.json
-reports.jsonl
-sweeps.jsonl
-sweep-trials.jsonl
 artifacts.jsonl
 runs/<run-id>/
   run.json
@@ -29,11 +26,6 @@ Metric files each contain at most 32 columns. Every JSON line is one bounded
 full-resolution history response with sequence, step, timestamp, and aligned
 metric arrays. Following the pages in file order reconstructs every stored
 point without dashboard sampling.
-
-`sweeps.jsonl` contains complete sweep definitions, and each
-`sweep-trials.jsonl` record contains its sweep ID and complete trial record.
-The exporter hydrates these from their lightweight list summaries without
-holding the project-wide collections in memory.
 
 The top-level manifest is written last. It records the format, project, creation
 time, and resource counts.

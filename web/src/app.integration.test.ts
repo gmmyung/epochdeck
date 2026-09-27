@@ -10,8 +10,6 @@ const HIDDEN_RUN = "00000000-0000-7000-8000-000000000001";
 const LISTED_RUN_A = "00000000-0000-7000-8000-000000000002";
 const LISTED_RUN_B = "00000000-0000-7000-8000-000000000003";
 const MISSING_RUN = "00000000-0000-7000-8000-000000000004";
-const MISSING_REPORT = "00000000-0000-7000-8000-000000000099";
-const LIVE_REPORT = "00000000-0000-7000-8000-000000000098";
 
 beforeEach(() => {
   document.body.replaceChildren();
@@ -76,9 +74,6 @@ describe("dashboard orchestration", () => {
           runs: [runSummary(LISTED_RUN_A, "Listed A"), runSummary(LISTED_RUN_B, "Listed B")],
           next_before: "run-cursor",
         });
-      }
-      if (path === "/api/v1/projects/hidden-project/reports?limit=100") {
-        return json({ reports: [], next_before: null });
       }
       if (path === `/api/v1/runs/${HIDDEN_RUN}`) {
         return json({
@@ -237,7 +232,7 @@ describe("dashboard orchestration", () => {
     target.remove();
   });
 
-  it("recovers stale run, report, and project URLs and replaces them canonically", async () => {
+  it("recovers stale run and project URLs and replaces them canonically", async () => {
     window.history.replaceState(
       {},
       "",
@@ -266,12 +261,6 @@ describe("dashboard orchestration", () => {
           runs: [runSummary(LISTED_RUN_A, "Listed A"), runSummary(LISTED_RUN_B, "Listed B")],
           next_before: null,
         });
-      }
-      if (path === "/api/v1/projects/hidden-project/reports?limit=100") {
-        return json({ reports: [], next_before: null });
-      }
-      if (path === `/api/v1/reports/${MISSING_REPORT}`) {
-        return json({ code: "not_found", message: "report not found" }, 404);
       }
       if (path === "/api/v1/query/runs") {
         const body = JSON.parse(init?.body as string) as { run_ids: string[] };
@@ -341,17 +330,6 @@ describe("dashboard orchestration", () => {
     window.history.pushState(
       {},
       "",
-      `/?project=hidden-project&report=${MISSING_REPORT}&run=${LISTED_RUN_B}&primary=${LISTED_RUN_B}&tab=metrics`,
-    );
-    window.dispatchEvent(new PopStateEvent("popstate"));
-    await vi.waitFor(() => expect(target.textContent).toContain("requested report is unavailable"));
-    expect(new URL(window.location.href).searchParams.get("report")).toBeNull();
-    expect(new URL(window.location.href).searchParams.getAll("run")).toEqual([LISTED_RUN_B]);
-    expect(new URL(window.location.href).searchParams.get("primary")).toBe(LISTED_RUN_B);
-
-    window.history.pushState(
-      {},
-      "",
       `/?project=missing-project&run=${MISSING_RUN}&primary=${MISSING_RUN}&tab=configuration`,
     );
     window.dispatchEvent(new PopStateEvent("popstate"));
@@ -395,9 +373,6 @@ describe("dashboard orchestration", () => {
       }
       if (path === "/api/v1/projects/hidden-project/runs?limit=100") {
         return json({ runs: [], next_before: null });
-      }
-      if (path === "/api/v1/projects/hidden-project/reports?limit=100") {
-        return json({ reports: [], next_before: null });
       }
       if (path === "/api/v1/query/runs") {
         const body = JSON.parse(init?.body as string) as { run_ids: string[] };
@@ -473,9 +448,6 @@ describe("dashboard orchestration", () => {
           runs: [runSummary(HIDDEN_RUN, "Visible run"), runSummary(LISTED_RUN_A, "Comparison run")],
           next_before: null,
         });
-      }
-      if (path === "/api/v1/projects/hidden-project/reports?limit=100") {
-        return json({ reports: [], next_before: null });
       }
       if (path === `/api/v1/runs/${HIDDEN_RUN}`) {
         return json({
@@ -641,9 +613,6 @@ describe("dashboard orchestration", () => {
           next_before: null,
         });
       }
-      if (path === "/api/v1/projects/hidden-project/reports?limit=100") {
-        return json({ reports: [], next_before: null });
-      }
       if (path === `/api/v1/runs/${HIDDEN_RUN}`) {
         return json({
           ...runSummary(HIDDEN_RUN, "Live run", "running"),
@@ -724,109 +693,6 @@ describe("dashboard orchestration", () => {
         total_count: 1,
       }),
     );
-
-    await unmount(component);
-    target.remove();
-  });
-
-  it("coalesces report chart revisions and guarantees a finished-run refresh", async () => {
-    vi.useFakeTimers({ toFake: ["setInterval"] });
-    installVisibleChartObservers();
-    window.history.replaceState(
-      {},
-      "",
-      `/?project=hidden-project&report=${LIVE_REPORT}&run=${HIDDEN_RUN}&primary=${HIDDEN_RUN}&tab=metrics`,
-    );
-    let revision = 1;
-    let state: "running" | "finished" = "running";
-    let summaryQueries = 0;
-    let chartRequests = 0;
-    const activeRefresh = deferred<Response>();
-    const finalRefresh = deferred<Response>();
-    const chartSignals: AbortSignal[] = [];
-    const report = liveReport();
-    const fetchMock = vi.fn(async (request: RequestInfo | URL, init?: RequestInit) => {
-      const path = String(request);
-      if (path === "/api/v1/health") {
-        return json({ service: "epochdeck", version: "0.1.0", status: "healthy" });
-      }
-      if (path === "/api/v1/dashboard/config") {
-        return json({ logo_url: null, favicon_url: null, accent_color: "#2766ad" });
-      }
-      if (path === "/api/v1/projects?limit=100") {
-        return json({
-          projects: [project("hidden-project", "project-hidden", 1)],
-          next_before: null,
-        });
-      }
-      if (path === "/api/v1/projects/hidden-project/runs?limit=100") {
-        return json({
-          runs: [{ ...runSummary(HIDDEN_RUN, "Report run", "running"), metric_revision: 1 }],
-          next_before: null,
-        });
-      }
-      if (path === "/api/v1/projects/hidden-project/reports?limit=100") {
-        return json({ reports: [reportSummary(report)], next_before: null });
-      }
-      if (path === `/api/v1/reports/${LIVE_REPORT}`) return json(report);
-      if (path === "/api/v1/query/runs") {
-        summaryQueries += 1;
-        return json({
-          runs: [{ ...runSummary(HIDDEN_RUN, "Report run", state), metric_revision: revision }],
-          next_before: null,
-        });
-      }
-      if (path === "/api/v1/projects/hidden-project/metrics/query") {
-        return json({
-          keys: [{ key: "train/loss", run_ids: [HIDDEN_RUN] }],
-          next_after: null,
-          total_count: 1,
-        });
-      }
-      if (path.startsWith(`/api/v1/runs/${HIDDEN_RUN}/chart-history?`)) {
-        chartRequests += 1;
-        if (init?.signal) chartSignals.push(init.signal);
-        if (chartRequests === 1) return json(singleRunHistory(1, 1));
-        if (chartRequests === 2) return activeRefresh.promise;
-        if (chartRequests === 3) return finalRefresh.promise;
-      }
-      return json({ code: "unexpected_request", message: path }, 500);
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    const target = document.createElement("div");
-    document.body.append(target);
-    const component = mount(App, { target });
-    await vi.waitFor(() => expect(chartRequests).toBe(1));
-    await vi.waitFor(() => expect(target.querySelector("canvas")).not.toBeNull());
-    const lastGoodCanvas = target.querySelector("canvas");
-    expect(summaryQueries).toBe(1);
-
-    revision = 2;
-    await vi.advanceTimersByTimeAsync(2_000);
-    await vi.waitFor(() => expect(summaryQueries).toBe(2));
-    await vi.waitFor(() => expect(chartRequests).toBe(2));
-
-    revision = 3;
-    await vi.advanceTimersByTimeAsync(2_000);
-    await vi.waitFor(() => expect(summaryQueries).toBe(3));
-    expect(chartRequests).toBe(2);
-    expect(chartSignals[1]?.aborted).toBe(false);
-    expect(target.querySelector("canvas")).toBe(lastGoodCanvas);
-
-    revision = 4;
-    state = "finished";
-    await vi.advanceTimersByTimeAsync(2_000);
-    await vi.waitFor(() => expect(summaryQueries).toBe(4));
-    expect(chartRequests).toBe(2);
-    expect(chartSignals[1]?.aborted).toBe(false);
-
-    activeRefresh.resolve(json(singleRunHistory(2, 2)));
-    await vi.waitFor(() => expect(chartRequests).toBe(3));
-    expect(target.querySelector("canvas")).toBe(lastGoodCanvas);
-    finalRefresh.resolve(json(singleRunHistory(4, 4)));
-    await vi.waitFor(() => expect(chartSignals).toHaveLength(3));
-    expect(chartSignals.every((signal) => !signal.aborted)).toBe(true);
 
     await unmount(component);
     target.remove();
@@ -913,38 +779,6 @@ function singleRunHistory(value: number, sourceLastSequence: number) {
       },
     },
   };
-}
-
-function liveReport() {
-  return {
-    id: LIVE_REPORT,
-    project_id: "project-hidden",
-    project: "hidden-project",
-    name: "Live report",
-    description: null,
-    layout: {
-      columns: 1,
-      panels: [
-        {
-          id: "live-panel",
-          title: "Training loss",
-          kind: "metric" as const,
-          run_id: HIDDEN_RUN,
-          metric_keys: ["train/loss"],
-          markdown: null,
-          width: 1,
-          height: 320,
-        },
-      ],
-    },
-    created_at: "2026-08-30T00:00:00Z",
-    updated_at: "2026-08-30T00:01:00Z",
-  };
-}
-
-function reportSummary(report: ReturnType<typeof liveReport>) {
-  const { id, project_id, project, name, created_at, updated_at } = report;
-  return { id, project_id, project, name, created_at, updated_at };
 }
 
 function deferred<T>() {

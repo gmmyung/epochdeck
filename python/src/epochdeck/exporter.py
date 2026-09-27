@@ -47,9 +47,6 @@ def export_project(client: EpochDeckClient, project: str, destination: Path) -> 
         "rich_values": 0,
         "artifacts": 0,
         "artifact_links": 0,
-        "reports": 0,
-        "sweeps": 0,
-        "sweep_trials": 0,
         "blobs": 0,
     }
     try:
@@ -57,31 +54,6 @@ def export_project(client: EpochDeckClient, project: str, destination: Path) -> 
         runs_root = temporary / "runs"
         runs_root.mkdir()
         blob_root.mkdir(parents=True)
-
-        with (temporary / "reports.jsonl").open("w", encoding="utf-8") as stream:
-            for summary in _cursor_records(
-                lambda before: client.reports(project, before=before, limit=_PAGE_SIZE),
-                "reports",
-            ):
-                report = _detail_record(client.get_report, summary, "report")
-                _write_json_line(stream, report)
-                counts["reports"] += 1
-
-        with (
-            (temporary / "sweeps.jsonl").open("w", encoding="utf-8") as sweep_stream,
-            (temporary / "sweep-trials.jsonl").open("w", encoding="utf-8") as trial_stream,
-        ):
-            for summary in _cursor_records(
-                lambda before: client.sweeps(project, before=before, limit=_PAGE_SIZE),
-                "sweeps",
-            ):
-                sweep = _detail_record(client.get_sweep, summary, "sweep")
-                _write_json_line(sweep_stream, sweep)
-                counts["sweeps"] += 1
-                sweep_id = str(sweep["id"])
-                for trial in _sweep_trial_records(client, sweep_id):
-                    _write_json_line(trial_stream, {"sweep_id": sweep["id"], "trial": trial})
-                    counts["sweep_trials"] += 1
 
         with (temporary / "artifacts.jsonl").open("w", encoding="utf-8") as stream:
             for summary in _cursor_records(
@@ -286,20 +258,6 @@ def _write_run_records(
         for record in records:
             _write_json_line(stream, record)
             counts[count_key] += 1
-
-
-def _sweep_trial_records(
-    client: EpochDeckClient,
-    sweep_id: str,
-) -> Iterator[dict[str, Any]]:
-    for summary in _cursor_records(
-        lambda before: client.sweep_trials(sweep_id, before=before, limit=_PAGE_SIZE),
-        "trials",
-    ):
-        trial = _detail_record(client.get_sweep_trial, summary, "sweep trial")
-        if trial.get("sweep_id") != sweep_id:
-            raise TypeError("sweep trial detail has the wrong sweep ID")
-        yield trial
 
 
 def _run_summaries(client: EpochDeckClient, project: str) -> Iterator[dict[str, Any]]:

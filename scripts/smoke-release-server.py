@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -249,14 +250,24 @@ def _smoke_server(binary: Path, runtime: Path, version: str) -> None:
                     "embedded dashboard does not contain the EpochDeck title"
                 )
             config = json.loads(_request(f"{base_url}/api/v1/dashboard/config"))
+            logo_url = (
+                "/api/v1/dashboard/logo?v="
+                + hashlib.sha256(logo_bytes).hexdigest()[:16]
+            )
+            favicon_url = logo_url.replace("/logo?", "/favicon?")
             if (
                 config.get("accent_color") != "#8a3ffc"
-                or config.get("logo_url") != "/api/v1/dashboard/logo"
+                or config.get("logo_url") != logo_url
+                or config.get("favicon_url") != favicon_url
             ):
                 raise SmokeError(f"unexpected dashboard configuration: {config!r}")
-            if _request(f"{base_url}/api/v1/dashboard/logo") != logo_bytes:
+            if _request(f"{base_url}{logo_url}") != logo_bytes:
                 raise SmokeError(
                     "served dashboard logo differs from the configured logo"
+                )
+            if _request(f"{base_url}{favicon_url}") != logo_bytes:
+                raise SmokeError(
+                    "served favicon differs from the configured logo fallback"
                 )
         finally:
             _stop(process)

@@ -210,36 +210,6 @@ export class EpochDeckApiError extends Error {
   }
 }
 
-export type ReportPanel = {
-  id: string;
-  title: string;
-  kind: "metric" | "markdown";
-  run_id: string | null;
-  metric_keys: string[];
-  markdown: string | null;
-  width: number;
-  height: number;
-};
-
-export type Report = {
-  id: string;
-  project_id: string;
-  project: string;
-  name: string;
-  description: string | null;
-  layout: {
-    columns: number;
-    panels: ReportPanel[];
-  };
-  created_at: string;
-  updated_at: string;
-};
-
-export type ReportSummary = Pick<
-  Report,
-  "id" | "project_id" | "project" | "name" | "created_at" | "updated_at"
->;
-
 export function getHealth(signal?: AbortSignal): Promise<Health> {
   return getJson<Health>("/api/v1/health", signal);
 }
@@ -301,25 +271,8 @@ export async function getRunSummariesByIds(
   return result.runs;
 }
 
-export async function getReportPage(
-  project: string,
-  before?: string,
-  signal?: AbortSignal,
-): Promise<CursorPage<ReportSummary>> {
-  const query = cursorQuery(before);
-  const result = await getJson<{ reports: ReportSummary[]; next_before: string | null }>(
-    `/api/v1/projects/${encodeURIComponent(project)}/reports?${query}`,
-    signal,
-  );
-  return { items: result.reports, nextBefore: result.next_before };
-}
-
 export function getRun(runId: string, signal?: AbortSignal): Promise<Run> {
   return getJson<Run>(`/api/v1/runs/${encodeURIComponent(runId)}`, signal);
-}
-
-export function getReport(reportId: string, signal?: AbortSignal): Promise<Report> {
-  return getJson<Report>(`/api/v1/reports/${encodeURIComponent(reportId)}`, signal);
 }
 
 export async function getProjectMetricCatalogPage(

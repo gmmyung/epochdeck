@@ -14,8 +14,6 @@ import {
   getProjectMetricCatalogPage,
   getProject,
   getProjectPage,
-  getReport,
-  getReportPage,
   getRichValue,
   getRichValueKeyPage,
   getRichValuePage,
@@ -80,7 +78,7 @@ describe("getHealth", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/projects/robot%20learning/runs?limit=100");
   });
 
-  it("loads cursor pages for projects, searched runs, and report summaries", async () => {
+  it("loads cursor pages for projects and searched runs", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
@@ -100,16 +98,6 @@ describe("getHealth", () => {
       )
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ runs: [], next_before: "run-cursor" }), { status: 200 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ reports: [], next_before: "report-cursor" }), {
-          status: 200,
-        }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ id: "report/id", layout: { columns: 1, panels: [] } }), {
-          status: 200,
-        }),
       );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -126,17 +114,10 @@ describe("getHealth", () => {
       items: [],
       nextBefore: "run-cursor",
     });
-    await expect(getReportPage("robot learning", "report/id")).resolves.toEqual({
-      items: [],
-      nextBefore: "report-cursor",
-    });
-    await expect(getReport("report/id")).resolves.toMatchObject({ id: "report/id" });
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       "/api/v1/projects?limit=100&before=project%2Fid",
       "/api/v1/projects/robot%20learning",
       "/api/v1/projects/robot%20learning/runs?limit=100&before=run%2Fid&q=reward+%2B+bonus",
-      "/api/v1/projects/robot%20learning/reports?limit=100&before=report%2Fid",
-      "/api/v1/reports/report%2Fid",
     ]);
   });
 

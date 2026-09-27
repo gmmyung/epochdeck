@@ -30,7 +30,6 @@ type ComparisonCacheMetric = {
 
 export type ComparisonUrlState<TTab extends string> = {
   project: string | null;
-  reportId: string | null;
   runIds: string[];
   runSelectionSpecified: boolean;
   primaryRunId: string | null;
@@ -163,7 +162,6 @@ export function readComparisonUrl<TTab extends string>(
       : null;
   return {
     project: cleanBoundedValue(url.searchParams.get("project"), MAX_PROJECT_NAME_BYTES),
-    reportId: cleanIdentifier(url.searchParams.get("report")),
     runSelectionSpecified: url.searchParams.has("run"),
     runIds: boundedRunIds(url.searchParams.getAll("run")),
     primaryRunId: cleanIdentifier(url.searchParams.get("primary")),
@@ -187,7 +185,6 @@ export function writeComparisonUrl<TTab extends string>(
   const next = new URL(url);
   for (const key of [
     "project",
-    "report",
     "run",
     "primary",
     "tab",
@@ -202,7 +199,6 @@ export function writeComparisonUrl<TTab extends string>(
     next.searchParams.delete(key);
   }
   if (state.project) next.searchParams.set("project", state.project);
-  if (state.reportId) next.searchParams.set("report", state.reportId);
   if (state.runIds.length === 0) next.searchParams.append("run", "");
   else for (const runId of state.runIds) next.searchParams.append("run", runId);
   if (state.primaryRunId) next.searchParams.set("primary", state.primaryRunId);

@@ -1,12 +1,11 @@
 from typing import TYPE_CHECKING, Any
 
-from epochdeck._run import DeliveryError, Run, RunConfig, RunSummary, SweepEarlyStop, sync_spool
+from epochdeck._run import DeliveryError, Run, RunConfig, RunSummary, sync_spool
 from epochdeck.api import alert, current_run, finish, init, log, log_artifact, use_artifact
 from epochdeck.artifact import Artifact
 from epochdeck.client import EpochDeckApiError, EpochDeckClient, Health
 from epochdeck.public_api import Api
 from epochdeck.rich import Audio, Histogram, Image, Table, Video
-from epochdeck.sweep import agent, sweep
 
 if TYPE_CHECKING:
     run: Run | None
@@ -24,10 +23,8 @@ __all__ = [
     "Run",
     "RunConfig",
     "RunSummary",
-    "SweepEarlyStop",
     "Table",
     "Video",
-    "agent",
     "alert",
     "current_run",
     "finish",
@@ -35,11 +32,10 @@ __all__ = [
     "log",
     "log_artifact",
     "run",
-    "sweep",
     "sync_spool",
     "use_artifact",
 ]
-__version__ = "0.1.0a1"
+__version__ = "0.1.0a2"
 
 
 def __getattr__(name: str) -> Any:

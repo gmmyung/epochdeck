@@ -63,10 +63,6 @@ def test_export_project_streams_all_current_resources_and_deduplicates_blobs(
         path = request.url.path
         if path == "/api/v1/projects/demo":
             return httpx.Response(200, json={"name": "demo", "mutation_token": "7"})
-        if path.endswith("/reports"):
-            return httpx.Response(200, json={"reports": [], "next_before": None})
-        if path.endswith("/sweeps"):
-            return httpx.Response(200, json={"sweeps": [], "next_before": None})
         if path == "/api/v1/projects/demo/artifacts":
             return httpx.Response(
                 200,
@@ -181,11 +177,8 @@ def test_export_project_streams_all_current_resources_and_deduplicates_blobs(
         "artifacts": 1,
         "blobs": 1,
         "metric_pages": 1,
-        "reports": 0,
         "rich_values": 1,
         "runs": 1,
-        "sweep_trials": 0,
-        "sweeps": 0,
     }
     assert json.loads((destination / "manifest.json").read_text()) == manifest
     assert manifest["format"] == "epochdeck-export"
@@ -201,10 +194,6 @@ def test_export_rejects_a_live_project_before_writing_a_partial_bundle(tmp_path)
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v1/projects/demo":
             return httpx.Response(200, json={"name": "demo", "mutation_token": "1"})
-        if request.url.path.endswith("/reports"):
-            return httpx.Response(200, json={"reports": [], "next_before": None})
-        if request.url.path.endswith("/sweeps"):
-            return httpx.Response(200, json={"sweeps": [], "next_before": None})
         if request.url.path == "/api/v1/projects/demo/artifacts":
             return httpx.Response(200, json={"artifacts": [], "next_before": None})
         if request.url.path == "/api/v1/query/runs":
@@ -224,74 +213,6 @@ def test_export_rejects_a_live_project_before_writing_a_partial_bundle(tmp_path)
     ):
         export_project(client, "demo", destination)
     assert not destination.exists()
-
-
-def test_export_hydrates_lightweight_sweep_and_trial_pages(tmp_path) -> None:
-    sweep_summary = {
-        "id": "sweep-1",
-        "project": "demo",
-        "name": "grid",
-        "parameter_count": 1,
-    }
-    sweep = {
-        "id": "sweep-1",
-        "project": "demo",
-        "name": "grid",
-        "parameters": {"seed": {"values": [1, 2]}},
-        "early_terminate": {"min_step": 10, "min_trials": 2},
-    }
-    trial_summary = {
-        "id": "trial-1",
-        "sweep_id": "sweep-1",
-        "state": "completed",
-    }
-    trial = {
-        "id": "trial-1",
-        "sweep_id": "sweep-1",
-        "state": "completed",
-        "config": {"seed": 1},
-    }
-    detail_requests: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == "/api/v1/projects/demo":
-            return httpx.Response(200, json={"name": "demo", "mutation_token": "4"})
-        if path == "/api/v1/projects/demo/reports":
-            return httpx.Response(200, json={"reports": [], "next_before": None})
-        if path == "/api/v1/projects/demo/sweeps":
-            return httpx.Response(
-                200,
-                json={"sweeps": [sweep_summary], "next_before": None},
-            )
-        if path == "/api/v1/sweeps/sweep-1":
-            detail_requests.append(path)
-            return httpx.Response(200, json=sweep)
-        if path == "/api/v1/sweeps/sweep-1/trials":
-            return httpx.Response(
-                200,
-                json={"trials": [trial_summary], "next_before": None},
-            )
-        if path == "/api/v1/sweep-trials/trial-1":
-            detail_requests.append(path)
-            return httpx.Response(200, json=trial)
-        if path == "/api/v1/projects/demo/artifacts":
-            return httpx.Response(200, json={"artifacts": [], "next_before": None})
-        if path == "/api/v1/query/runs":
-            return httpx.Response(200, json={"runs": [], "next_before": None})
-        raise AssertionError(f"unexpected request: {request.method} {request.url}")
-
-    destination = tmp_path / "bundle"
-    with EpochDeckClient(transport=httpx.MockTransport(handler)) as client:
-        export_project(client, "demo", destination)
-
-    exported_sweep = json.loads((destination / "sweeps.jsonl").read_text())
-    exported_trial = json.loads((destination / "sweep-trials.jsonl").read_text())
-    assert exported_sweep["parameters"] == sweep["parameters"]
-    assert exported_sweep["early_terminate"] == sweep["early_terminate"]
-    assert exported_trial == {"sweep_id": "sweep-1", "trial": trial}
-    assert detail_requests.count("/api/v1/sweeps/sweep-1") == 1
-    assert detail_requests.count("/api/v1/sweep-trials/trial-1") == 1
 
 
 def test_export_rejects_a_changed_project_mutation_token(tmp_path) -> None:
@@ -327,10 +248,6 @@ def test_export_rejects_a_changed_project_mutation_token(tmp_path) -> None:
                     "mutation_token": "11" if project_detail_calls == 1 else "12",
                 },
             )
-        if path == "/api/v1/projects/demo/reports":
-            return httpx.Response(200, json={"reports": [], "next_before": None})
-        if path == "/api/v1/projects/demo/sweeps":
-            return httpx.Response(200, json={"sweeps": [], "next_before": None})
         if path == "/api/v1/projects/demo/artifacts":
             return httpx.Response(200, json={"artifacts": [], "next_before": None})
         if path == "/api/v1/query/runs":
@@ -397,10 +314,10 @@ def test_export_rejects_a_changed_project_mutation_token(tmp_path) -> None:
 
 def test_export_mutation_token_rejects_transient_create_delete_aba(tmp_path) -> None:
     project_calls = 0
-    report_detail_calls = 0
+    artifact_detail_calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal project_calls, report_detail_calls
+        nonlocal artifact_detail_calls, project_calls
         path = request.url.path
         if path == "/api/v1/projects/demo":
             project_calls += 1
@@ -411,26 +328,24 @@ def test_export_mutation_token_rejects_transient_create_delete_aba(tmp_path) -> 
                     "mutation_token": "20" if project_calls == 1 else "22",
                 },
             )
-        if path == "/api/v1/projects/demo/reports":
+        if path == "/api/v1/projects/demo/artifacts":
             return httpx.Response(
                 200,
-                json={"reports": [{"id": "transient-report"}], "next_before": None},
+                json={"artifacts": [{"id": "transient-artifact"}], "next_before": None},
             )
-        if path == "/api/v1/reports/transient-report":
-            report_detail_calls += 1
+        if path == "/api/v1/artifacts/transient-artifact":
+            artifact_detail_calls += 1
             return httpx.Response(
                 200,
                 json={
-                    "id": "transient-report",
+                    "id": "transient-artifact",
                     "project": "demo",
                     "name": "created then deleted",
-                    "layout": {"columns": 1, "panels": []},
+                    "type": "dataset",
+                    "version": 0,
+                    "entries": [],
                 },
             )
-        if path == "/api/v1/projects/demo/sweeps":
-            return httpx.Response(200, json={"sweeps": [], "next_before": None})
-        if path == "/api/v1/projects/demo/artifacts":
-            return httpx.Response(200, json={"artifacts": [], "next_before": None})
         if path == "/api/v1/query/runs":
             return httpx.Response(200, json={"runs": [], "next_before": None})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
@@ -443,7 +358,7 @@ def test_export_mutation_token_rejects_transient_create_delete_aba(tmp_path) -> 
         export_project(client, "demo", destination)
 
     assert project_calls == 2
-    assert report_detail_calls == 1
+    assert artifact_detail_calls == 1
     assert not destination.exists()
 
 

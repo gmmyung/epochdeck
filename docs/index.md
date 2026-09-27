@@ -14,6 +14,7 @@ Start with the page that matches your task.
 - [Self-hosting](deployment.md): install, configure, and expose the server.
 - [Operations](operations.md): back up, restore, upgrade, and diagnose it.
 - [Security policy](../SECURITY.md): understand the current trust boundary.
+- [Production readiness](readiness.md): review tested behavior and remaining release gates.
 
 ## Develop EpochDeck
 

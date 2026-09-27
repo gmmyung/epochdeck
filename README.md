@@ -16,8 +16,8 @@ histories.
 
 > [!WARNING]
 > EpochDeck is pre-alpha. Scalar metrics, host telemetry, alerts, rich media,
-> versioned artifacts, finite sweeps, persisted reports, and streaming
-> W&B import/export are usable end to end. Authentication, multi-user
+> versioned artifacts, and streaming W&B import/export are usable end to end.
+> Authentication, multi-user
 > authorization, and the wider compatibility surface are still in development.
 > For remote access, place the server behind an authenticated HTTPS reverse
 > proxy and review [SECURITY.md](SECURITY.md).
@@ -65,7 +65,7 @@ metrics, media, artifacts, configuration, and summaries.
 - Durable, nonblocking online and offline logging.
 - Scalar and system metrics with bounded, spike-preserving chart queries.
 - Native images, audio, video, tables, histograms, and alerts.
-- Versioned artifacts, lineage, reports, sweeps, and multi-run comparison.
+- Versioned artifacts, lineage, and multi-run comparison.
 - Resumable W&B imports and lossless EpochDeck project exports.
 - One self-contained server binary with no hosted service dependency.
 
