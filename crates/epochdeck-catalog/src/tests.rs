@@ -1049,6 +1049,14 @@ async fn compaction_and_ingest_wait_for_the_bounded_sqlite_writer()
         byte_size: 100,
     };
 
+    // Exercise a fully grown pool: an unused fourth connection may remain idle
+    // while the blocker, ingestion, and compaction occupy the other three.
+    let mut connections = Vec::new();
+    for _ in 0..catalog.pool.options().get_max_connections() {
+        connections.push(catalog.pool.acquire().await?);
+    }
+    drop(connections);
+
     let mut blocker = catalog.pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("UPDATE projects SET mutation_revision = mutation_revision + 1 WHERE name = ?")
         .bind("writer-concurrency")
@@ -1070,7 +1078,8 @@ async fn compaction_and_ingest_wait_for_the_bounded_sqlite_writer()
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if catalog.pool.size() >= 3 && catalog.pool.num_idle() == 0 {
+            let occupied = (catalog.pool.size() as usize).saturating_sub(catalog.pool.num_idle());
+            if occupied == 3 {
                 break;
             }
             tokio::task::yield_now().await;
