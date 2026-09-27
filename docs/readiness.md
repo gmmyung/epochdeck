@@ -32,8 +32,12 @@ definition, and SDK delivery scheduling now have separate source files.
 | Client disk usage | Journals and copied media remain local for the lifetime of active runs | Monitor disk usage and define safe reclamation/backpressure behavior for long runs |
 | Compatibility | Several public Python, query, table, and import behaviors remain partial | Expand boundary contracts for supported workflows; preserve explicit exclusions |
 
+The JavaScript dependency audit reported no known vulnerabilities after
+updating Vitest to 4.1.11. This does not establish that every dependency is free
+of vulnerabilities.
+
 The assessment is based on source review and local checks, not a penetration
-test, dependency vulnerability audit, multi-day soak, or independent validation
+test, comprehensive cross-ecosystem vulnerability audit, multi-day soak, or independent validation
 of every supported operating system. Native prerelease jobs validate their own
 builds and packaged binaries.
 

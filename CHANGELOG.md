@@ -12,7 +12,8 @@ so storage and APIs may change without migration or compatibility shims.
 - Exclusive SDK spool ownership, bounded recovery of interrupted journal appends,
   and `Run.close()` for stopping local delivery before resuming.
 - A real SDK/server contract gate covering rich logging, abrupt server restart,
-  and physical backup/restore.
+  and physical backup/restore, also run against the packaged Linux server and
+  installed wheel together in a clean Debian/Python 3.11 release container.
 
 - The metrics toolbar now has a persistent one-to-four-column density selector.
 - A minimal stacked-epoch logo now serves as the default dashboard mark and
@@ -79,6 +80,8 @@ so storage and APIs may change without migration or compatibility shims.
 
 ### Fixed
 
+- Updated the development test runner to Vitest 4.1.11, resolving the Vitest
+  redirect-mock file-read advisory (GHSA-82fw-gwwq-j7x9).
 - Overlapping SDK processes can no longer allocate duplicate sequence numbers
   in one spool, and interrupted final appends no longer block recovery.
 - Cancelled run-detail requests no longer suppress fresh requests for the same

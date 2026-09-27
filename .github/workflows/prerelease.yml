@@ -536,6 +536,24 @@ jobs:
           python3 scripts/release-candidate.py create
           --directory release-dist --version "$VERSION"
 
+      - name: Test the packaged server and wheel together on clean Debian
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" --workdir /workspace --env VERSION \
+            python:3.11-slim-bookworm bash -euo pipefail -c '
+              archive="release-dist/epochdeck-server-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+              python scripts/smoke-release-server.py \
+                --archive "$archive" --version "$VERSION" --target x86_64-unknown-linux-musl
+              python -m venv /tmp/epochdeck-wheel
+              /tmp/epochdeck-wheel/bin/pip install --disable-pip-version-check \
+                release-dist/epochdeck-*.whl pytest
+              mkdir /tmp/epochdeck-server
+              tar -xzf "$archive" -C /tmp/epochdeck-server
+              export EPOCHDECK_TEST_SERVER="/tmp/epochdeck-server/epochdeck-server-${VERSION}-x86_64-unknown-linux-musl/epochdeck-server"
+              /tmp/epochdeck-wheel/bin/python -m pytest \
+                -p no:cacheprovider python/tests/contracts/test_server_contract.py
+            '
+
       - name: Upload complete release candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
