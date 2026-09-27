@@ -65,6 +65,14 @@ These are product decisions, not unfinished compatibility work.
 Native authentication and multi-user authorization remain planned work; they
 are not part of these exclusions. See the [roadmap](roadmap.md).
 
+## Native Python coverage
+
+The SDK and installed release wheel are tested on Python 3.11 and 3.13 on
+Windows and macOS. Linux checks cover the minimum Python version and the Nix
+development interpreter, and both Python versions smoke-test the installed
+wheel. Windows spool verification supports Python 3.13's descriptor-based
+permission updates.
+
 ## Contract rules
 
 - Unsupported compatibility arguments fail or warn instead of doing nothing.

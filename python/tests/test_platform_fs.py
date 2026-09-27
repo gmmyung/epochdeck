@@ -142,6 +142,17 @@ def test_native_regular_file_sync_flushes_a_file(tmp_path) -> None:
     assert path.read_bytes() == b"payload"
 
 
+def test_native_private_file_can_be_verified_through_a_read_handle(tmp_path) -> None:
+    path = tmp_path / "metadata.json"
+    path.write_bytes(b'{"run": "complete"}')
+
+    descriptor = platform_fs.open_regular_file_descriptor(path, os.O_RDONLY, private_mode=0o600)
+    try:
+        assert os.read(descriptor, 64) == b'{"run": "complete"}'
+    finally:
+        os.close(descriptor)
+
+
 def test_windows_regular_file_sync_requests_write_access(monkeypatch, tmp_path) -> None:
     path = tmp_path / "payload.bin"
     path.write_bytes(b"payload")

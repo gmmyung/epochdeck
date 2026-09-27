@@ -37,7 +37,7 @@ Locked input fingerprints:
 - web/pnpm-lock.yaml: ffad8da01512eb4e596a6956d5ff045d74dc18c6e070372f45d93119f27b3e42
 - web/svelte.config.js: 26cd0f1e700b93a5a07bb8a6e61da361ac8a3b19eb34a8e4eafbd9f8fcf9a2f6
 - web/vite.config.ts: 60cd1c65988dc6621f265b9d04c71e504228ccdfbea415dcd6f1689286e93f27
-- .github/workflows/prerelease.yml: d72ab8fe4c503a58bb4ef2c8288a26811083ad108dd88275a68a4d03f8488d9a
+- .github/workflows/prerelease.yml: 726d4d928d16deafa3104c1b6a8630a9c5eb8a1e6a00c9d8aed9f41de3d6c28f
 - third_party/license-overrides.json: b541d5747f63855112c788b5bdb6564d273f7b780ab78f476727f06c55c28eee
 - third_party/release-toolchain.json: e8c9b4722cc49df6bf803b3493e03ec6a2596769d748f61ea38c799c42ebfb04
 

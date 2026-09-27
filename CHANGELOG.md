@@ -80,6 +80,12 @@ so storage and APIs may change without migration or compatibility shims.
 
 ### Fixed
 
+- Python 3.13 on Windows can verify private spool files without attempting
+  permission updates through a read-only handle. Native SDK CI now tests both
+  Python 3.11 and 3.13, and wheel smoke fixtures close their SQLite handles.
+- The SQLite writer concurrency test accounts for unused connections in a
+  fully grown pool instead of depending on pool allocation timing.
+
 - Updated the development test runner to Vitest 4.1.11, resolving the Vitest
   redirect-mock file-read advisory (GHSA-82fw-gwwq-j7x9).
 - Overlapping SDK processes can no longer allocate duplicate sequence numbers
